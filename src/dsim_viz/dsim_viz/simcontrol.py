@@ -126,7 +126,16 @@ class SimControl:
     is how a viewer ends up lying about the thing it exists to show.
     """
 
-    def __init__(self, world, enabled=True, runner=subprocess.run):
+    def __init__(self, world, enabled=True, runner=subprocess.run, gz_path=None):
+        """gz_path overrides discovery.
+
+        Injectable because the two tests that check BEHAVIOUR rather than
+        string shapes -- that state reports observation not request, and that a
+        hung simulator becomes an error -- used to consult the real
+        environment through find_gz() even with a fake runner. On a machine
+        without the gz CLI they skipped themselves, silently, which is the
+        opposite of what this module's docstring promises.
+        """
         self.world = world
         self.enabled = enabled
         self._runner = runner
@@ -134,7 +143,7 @@ class SimControl:
         self._state = {"paused": False, "measured_rtf": None,
                        "target_rtf": 1.0, "enabled": enabled,
                        "error": None if enabled else "control disabled"}
-        self._gz = find_gz()
+        self._gz = gz_path if gz_path is not None else find_gz()
         if enabled and self._gz is None:
             self._state["enabled"] = False
             self._state["error"] = "gz CLI not found; controls unavailable"

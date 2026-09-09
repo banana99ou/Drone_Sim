@@ -18,7 +18,8 @@ INC="-I src/dsim_control/include -I /usr/include/eigen3"
 
 build_and_run() {   # $1 = source dir
   g++ -std=c++17 -O1 -I "$1/include" -I /usr/include/eigen3 \
-      "$1/src/mixer.cpp" "$1/src/se3_controller.cpp" "$1/test/test_control.cpp" \
+      "$1/src/mixer.cpp" "$1/src/se3_controller.cpp" \
+      "$1/src/body_rate_source.cpp" "$1/test/test_control.cpp" \
       -lgtest -pthread -o "$WORK/t" 2>"$WORK/build.log" || { echo "BUILD_FAIL"; return; }
   "$WORK/t" >"$WORK/run.log" 2>&1 && echo "ALL_PASS" || echo "SOME_FAIL"
 }
@@ -54,7 +55,17 @@ PY
 skipped=0
 
 echo "baseline (unmutated):"
-echo "  $(build_and_run src/dsim_control)  (expected: ALL_PASS)"
+baseline="$(build_and_run src/dsim_control)"
+echo "  $baseline  (expected: ALL_PASS)"
+if [ "$baseline" != "ALL_PASS" ]; then
+  # Without this guard every mutation below is "caught" by the same build
+  # failure, and the script reports teeth it does not have. That happened the
+  # moment a new source file was added to the package and not to the compile
+  # line above.
+  echo "  BASELINE IS NOT GREEN -- every result below would be meaningless."
+  tail -20 "$WORK/build.log" 2>/dev/null
+  exit 1
+fi
 echo
 echo "injected bugs:"
 survivors=0
@@ -204,6 +215,125 @@ run_py_mutation "hover deviation loses its sign" \
 run_py_mutation "quaternion transposed (body and world swapped)" \
   "        (1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w))," \
   "        (1 - 2 * (y * y + z * z), 2 * (x * y + z * w), 2 * (x * z - y * w)),"
+
+echo
+
+# ---------------------------------------------------------------------------
+# The sensor models get the same treatment, and for a specific reason: a cold
+# review found that the optical-flow model generated its reading from the
+# MEASURED range and gyro and then reported those same values, so the
+# consumer's documented reconstruction cancelled them algebraically. A
+# rangefinder reading 2.5 m instead of 1.5 m still recovered the velocity to
+# twelve decimal places. Every test passed, because the tests asserted an
+# algebraic identity of the model rather than a property of a sensor.
+#
+# The first two mutations below reintroduce exactly that bug. If either
+# survives, the tests have gone back to testing nothing.
+# ---------------------------------------------------------------------------
+build_and_run_sensors() {   # $1 = source dir
+  g++ -std=c++17 -O1 -I "$1/include" -I /usr/include/eigen3 \
+      "$1/test/test_sensors.cpp" \
+      -lgtest -lgtest_main -pthread -o "$WORK/ts" 2>"$WORK/build.log" \
+      || { echo "BUILD_FAIL"; return; }
+  "$WORK/ts" >"$WORK/run.log" 2>&1 && echo "ALL_PASS" || echo "SOME_FAIL"
+}
+
+mutate_sensors() {  # $1 = name, $2 = file (relative), $3 = from, $4 = to
+  local name="$1" file="$2" from="$3" to="$4"
+  rm -rf "$WORK/sens"; cp -r src/dsim_sensors "$WORK/sens"
+  if ! grep -qF -- "$from" "$WORK/sens/$file"; then
+    echo "  [SKIP]     $name  (pattern not found -- code changed, update this script)"
+    return 1
+  fi
+  python3 -c '
+import sys
+p, a, b = sys.argv[1], sys.argv[2], sys.argv[3]
+t = open(p).read()
+open(p, "w").write(t.replace(a, b, 1))
+' "$WORK/sens/$file" "$from" "$to"
+  local result; result="$(build_and_run_sensors "$WORK/sens")"
+  if [ "$result" = "SOME_FAIL" ]; then
+    local caught; caught="$(grep -c '^\[  FAILED  \] [A-Za-z]' "$WORK/run.log")"
+    echo "  [CAUGHT]   $name  -> $caught test(s) failed"
+    return 0
+  elif [ "$result" = "BUILD_FAIL" ]; then
+    echo "  [CAUGHT]   $name  -> did not compile"
+    return 0
+  fi
+  echo "  [SURVIVED] $name  <-- BUG: this error would pass the test suite"
+  return 2
+}
+
+run_sensor_mutation() {
+  mutate_sensors "$@"
+  local rc=$?
+  [ $rc -eq 2 ] && survivors=$((survivors+1))
+  [ $rc -eq 1 ] && skipped=$((skipped+1))
+  return 0
+}
+
+echo
+echo "baseline (unmutated sensor models):"
+echo "  $(build_and_run_sensors src/dsim_sensors)  (expected: ALL_PASS)"
+echo
+echo "injected sensor bugs:"
+
+run_sensor_mutation "flow driven by the MEASURED range (the original bug)" \
+  "include/dsim_sensors/optical_flow.hpp" \
+  "  const double flow_rate_x = -in.v_body.y() / in.true_range_m + in.omega_true.x();
+  const double flow_rate_y = in.v_body.x() / in.true_range_m + in.omega_true.y();" \
+  "  const double flow_rate_x = -in.v_body.y() / in.measured_range_m + in.omega_true.x();
+  const double flow_rate_y = in.v_body.x() / in.measured_range_m + in.omega_true.y();"
+
+run_sensor_mutation "flow driven by the MEASURED gyro, x axis" \
+  "include/dsim_sensors/optical_flow.hpp" \
+  "+ in.omega_true.x();" \
+  "+ in.omega_measured.x();"
+
+run_sensor_mutation "flow driven by the MEASURED gyro, y axis" \
+  "include/dsim_sensors/optical_flow.hpp" \
+  "+ in.omega_true.y();" \
+  "+ in.omega_measured.y();"
+
+run_sensor_mutation "flow x sign flipped" \
+  "include/dsim_sensors/optical_flow.hpp" \
+  "const double flow_rate_x = -in.v_body.y() / in.true_range_m" \
+  "const double flow_rate_x = in.v_body.y() / in.true_range_m"
+
+run_sensor_mutation "flow not divided by height" \
+  "include/dsim_sensors/optical_flow.hpp" \
+  "const double flow_rate_y = in.v_body.x() / in.true_range_m" \
+  "const double flow_rate_y = in.v_body.x()"
+
+run_sensor_mutation "unusable reading keeps a confident quality" \
+  "include/dsim_sensors/optical_flow.hpp" \
+  "    s.quality = 0;
+  }
+  if (s.quality == 0) {" \
+  "    s.quality = s.quality;
+  }
+  if (s.quality == 0) {"
+
+run_sensor_mutation "rangefinder reports altitude, not slant range" \
+  "include/dsim_sensors/tof.hpp" \
+  "  return altitude_m / cos_tilt;" \
+  "  return altitude_m;"
+
+run_sensor_mutation "rangefinder error stops growing with distance" \
+  "include/dsim_sensors/tof.hpp" \
+  "  const double sigma = c.noise_m + c.noise_frac * true_range;" \
+  "  const double sigma = c.noise_m;"
+
+run_sensor_mutation "rangefinder saturation clamped instead of infinite" \
+  "include/dsim_sensors/tof.hpp" \
+  "  if (measured > c.max_range_m) {return kTooFar;}" \
+  "  if (measured > c.max_range_m) {return c.max_range_m;}"
+
+run_sensor_mutation "body rate uses the naive, sheet-sensitive formulation" \
+  "include/dsim_sensors/rates.hpp" \
+  "  const Eigen::AngleAxisd aa(dq);
+  return aa.axis() * (aa.angle() / dt);" \
+  "  return 2.0 * dq.vec() / dt;"
 
 echo
 if [ "$skipped" -ne 0 ]; then

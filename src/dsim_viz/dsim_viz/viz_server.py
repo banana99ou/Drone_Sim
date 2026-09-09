@@ -44,8 +44,9 @@ Endpoints, all on one port and one origin:
 Almost read-only. Every GET is; /control is the single write path, and it can
 express exactly two things -- paused, and a range-checked real-time factor.
 It cannot arm a vehicle, retune a controller, move the drone or run a command.
-That narrowness is the point: this port is reachable from the whole tailnet,
-and `control:=false` in the launch removes the endpoint entirely.
+That narrowness is the point: this port is reachable from the whole tailnet.
+With `control:=false` the endpoint still exists and answers 403 -- it is
+disabled, not removed -- and no gz command can be issued.
 """
 import json
 import math
@@ -169,6 +170,11 @@ def _status_of(m):
         "collision_count": int(m.collision_count),
         "tracking_error_m": m.tracking_error_m,
         "tracking_rmse_m": m.tracking_rmse_m,
+        # Centimetres computed here, not in the page. The browser only draws:
+        # converting a measured physical quantity is exactly the boundary this
+        # project keeps, and tilt_deg is already converted for the same reason.
+        "tracking_error_cm": 100.0 * m.tracking_error_m,
+        "tracking_rmse_cm": 100.0 * m.tracking_rmse_m,
         "tracking_max_m": m.tracking_max_m,
         # JSON has no NaN; send null so the page shows "n/a" rather than a
         # fake number.
@@ -293,6 +299,25 @@ class Handler(SimpleHTTPRequestHandler):
         pass              # a 30 Hz stream would drown the launch output
 
     def _json(self, obj, code=200):
+        # Drain the request body if it has not already been consumed. Replying
+        # without reading it leaves those bytes in the socket, where the next
+        # keep-alive request parses them as a request line -- so one rejected
+        # POST corrupts every later request on the connection.
+        #
+        # The `_body_read` flag matters: draining a body that do_POST already
+        # read would block waiting for bytes that will never come, which turned
+        # every SUCCESSFUL control request into an empty reply.
+        if self.command == "POST" and not getattr(self, "_body_read", False):
+            try:
+                pending = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                pending = 0
+            if 0 < pending <= self.max_body:
+                try:
+                    self.rfile.read(pending)
+                    self._body_read = True
+                except OSError:
+                    pass
         body = json.dumps(obj).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
@@ -314,16 +339,33 @@ class Handler(SimpleHTTPRequestHandler):
         if self.sim_control is None or not self.sim_control.enabled:
             self._json({"error": "simulation control is disabled"}, 403)
             return
+
+        # Require a JSON content type. This is not pedantry: without it the
+        # request qualifies as a CORS "simple request", so any web page the
+        # user happens to visit could pause their simulator with a form POST.
+        # Demanding application/json forces a preflight, which this server
+        # never answers, so a cross-origin page cannot reach the endpoint.
+        ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip()
+        if ctype != "application/json":
+            self._json({"error": "Content-Type must be application/json"}, 415)
+            return
+
         try:
             length = int(self.headers.get("Content-Length") or 0)
         except ValueError:
             self._json({"error": "bad Content-Length"}, 400)
             return
-        if length > self.max_body:
-            self._json({"error": "request too large"}, 413)
+        # Both ends of the range. A NEGATIVE length passed the old
+        # `length > max_body` test and then reached read(-1), which reads to
+        # EOF -- an unbounded read that parks a server thread until the client
+        # closes, from an endpoint reachable across the whole tailnet.
+        if not 0 <= length <= self.max_body:
+            self._json({"error": "bad or oversized body"}, 413)
             return
         try:
-            body = json.loads(self.rfile.read(length).decode() or "{}")
+            raw = self.rfile.read(length)
+            self._body_read = True
+            body = json.loads(raw.decode() or "{}")
             if not isinstance(body, dict):
                 raise ValueError("expected an object")
         except (ValueError, UnicodeDecodeError) as exc:
@@ -370,7 +412,6 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_header("X-Accel-Buffering", "no")
         self.end_headers()
         period = 1.0 / self.rate_hz
-        last_seq = -1
         try:
             while True:
                 snap = self.state.snapshot()
@@ -379,7 +420,6 @@ class Handler(SimpleHTTPRequestHandler):
                 payload = json.dumps(snap)
                 self.wfile.write(f"data: {payload}\n\n".encode())
                 self.wfile.flush()
-                last_seq = snap["seq"]
                 time.sleep(period)
         except (BrokenPipeError, ConnectionResetError):
             pass          # the tab was closed; entirely normal

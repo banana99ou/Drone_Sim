@@ -44,10 +44,12 @@ sim:
 
 # Three suites, three languages, one command. They cover different things:
 #   dsim_control  the control maths and the mixer geometry           (C++)
+#   dsim_sensors  the rangefinder and optical-flow error models       (C++)
 #   dsim_viz      the overlay geometry the browser is handed         (Python)
 #   web/js        the drawing maths and colour mapping in the page   (JS)
 test: test-overlay test-viewer
-	$(COMPOSE) exec sim bash -lc "colcon test --packages-select dsim_control && \
+	$(COMPOSE) exec sim bash -lc \
+		"colcon test --packages-select dsim_control dsim_sensors && \
 		colcon test-result --verbose"
 
 # All overlay LOGIC lives on the ROS side, so this is where an arrow pointing

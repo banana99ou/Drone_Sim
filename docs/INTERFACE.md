@@ -13,6 +13,8 @@ publish trajectories, it flies them and scores the result.**
 | sim → you | `/drone/imu` | `sensor_msgs/msg/Imu` | 250 Hz |
 | sim → you | `/drone/control_debug` | `dsim_msgs/msg/ControlDebug` | 250 Hz |
 | sim → you | `/drone/setpoint` | `dsim_msgs/msg/TrajectorySetpoint` | 250 Hz |
+| sim → you | `/drone/tof` | `sensor_msgs/msg/Range` | 30 Hz |
+| sim → you | `/drone/optical_flow` | `dsim_msgs/msg/OpticalFlow` | 50 Hz |
 
 **Renamed:** this topic was `/drone/odom` until it was pointed out that nothing
 here is odometry — it is ground truth straight out of the simulator, with no
@@ -61,6 +63,50 @@ it: `sum(rotor_thrust_n) == realised_thrust_n`, and
 `|velocity_world| == |odom twist|` (a rotation cannot change a length). Both
 sides are computed separately on purpose, so a disagreement is visible rather
 than silent. `scripts/check_telemetry.py` asserts them against a live run.
+
+### The onboard sensors
+
+Both are simplified, and the simplifications are stated so you know where the
+model stops being usable.
+
+**`/drone/tof`** — a downward single-beam rangefinder, VL53L1X class. It
+reports the **slant range**, not the altitude: a tilted vehicle's downward beam
+travels `1/cos(tilt)` further. Error is `0.01 m + 1% of range`, quantised to
+whole millimetres. Out of range follows REP 117 — `+inf` for too far, `-inf`
+for too close, never a clamped limit, so saturation cannot be mistaken for a
+real reading. It sees only the flat ground plane, so it would report the floor
+straight through a pillar; the vehicle flies at 1.5 m and the pillars are 3 m,
+so that case does not arise in the shipped course.
+
+**`/drone/optical_flow`** — a PMW3901-class module. It reports how far the
+image moved as an **angle**, not a velocity, because that is what the hardware
+measures: turning it into a velocity needs a range, which is why
+`ground_distance_m` travels with it and why that field carries the
+rangefinder's noisy measurement rather than the true altitude. Raw flow and the
+gyro integral over the same interval are both published so you can subtract
+them, exactly as the real part expects; a pre-compensated value would hide the
+timing mismatch that pairing is famous for. `quality == 0` means **no
+measurement**, not a weak one.
+
+```
+v_body_x ≈ (integrated_y - integrated_ygyro) / integration_time_s * ground_distance_m
+v_body_y ≈ -(integrated_x - integrated_xgyro) / integration_time_s * ground_distance_m
+```
+
+On the 1.7 m/s demo lap that reconstruction matches ground truth to a median
+**0.027 m/s in body x and 0.021 m/s in body y**. `scripts/check_sensors.py`
+asserts it against a limit derived from the error model —
+`3 × 0.674 × noise_rad_s × height`, about 0.064 m/s — not against a fraction of
+the speed, because the reconstruction error does not depend on speed.
+
+That check also covers the range: a wrong `ground_distance_m` scales the
+reconstructed velocity proportionally, so reporting twice the true height fails
+it.
+
+`noise_seed:=1` by default gives a repeatable starting point and a fixed noise
+distribution. It does **not** promise bit-identical streams between runs: one
+generator feeds both sensor timers, so which draw lands in which reading
+depends on callback interleaving. Use `noise_seed:=0` for a fresh sequence.
 
 ## Publishing a trajectory
 

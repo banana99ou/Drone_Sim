@@ -144,6 +144,16 @@ python3 "$(dirname "$0")/check_telemetry.py" "http://127.0.0.1:${WEB_PORT}" \
   || { echo "FAIL: telemetry cross-checks disagree (see above)"; fail=1; }
 echo
 
+# ---- and do the simulated sensors agree with ground truth? ----------------
+# The vehicle is flying a circle here, so this runs the sensors' ground-truth
+# cross-checks: the rangefinder against altitude and attitude, and the optical
+# flow against the velocity it should reconstruct. A sign error or a missing
+# division by height fails these and nothing else.
+echo "== cross-checking the simulated sensors =="
+python3 "$(dirname "$0")/check_sensors.py" 12 \
+  || { echo "FAIL: sensor cross-checks disagree (see above)"; fail=1; }
+echo
+
 if [ "$fail" -eq 0 ]; then
   echo "PASS: took off, tracked the reference, no collision, telemetry consistent."
   echo "  (this would have failed on: no takeoff, drift, oscillation, a crash,"

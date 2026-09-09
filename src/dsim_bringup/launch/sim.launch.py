@@ -50,6 +50,22 @@ def _vehicle_params():
     }, cfg
 
 
+def _sensor_params(raw_cfg):
+    """Flatten config/drone.yaml's drone.sensors block for the sensors node.
+
+    Same single-source rule as the vehicle parameters: the IMU noise in
+    model.sdf, these figures, and scripts/check_sensors.py all come from PARAMS
+    in scripts/gen_assets.py, so a sensor cannot be configured one way and
+    checked against another.
+    """
+    s = raw_cfg['sensors']
+    out = {}
+    for group in ('tof', 'optical_flow'):
+        for key, value in s[group].items():
+            out[f'{group}.{key}'] = float(value)
+    return out
+
+
 def launch_setup(context, *args, **kwargs):
     world = LaunchConfiguration('world').perform(context)
     gui = LaunchConfiguration('gui').perform(context)
@@ -75,6 +91,8 @@ def launch_setup(context, *args, **kwargs):
     # assume it. Guessing here produces a bridge that silently carries nothing.
     import xml.etree.ElementTree as ET
     world_name = ET.parse(world_file).getroot().find('world').get('name')
+    sensors = LaunchConfiguration('sensors').perform(context)
+    noise_seed = LaunchConfiguration('noise_seed').perform(context)
 
     vehicle, raw_cfg = _vehicle_params()
     gains = _load_yaml(
@@ -156,6 +174,18 @@ def launch_setup(context, *args, **kwargs):
     )
 
     nodes = [gz, bridge, controller, referee]
+
+    # ---- simulated onboard sensors ----------------------------------------
+    # Derived from ground truth with a configured error model. Separate from
+    # the referee on purpose: these are allowed to be wrong, and the referee
+    # never is.
+    if sensors == 'true':
+        sensor_params = {'use_sim_time': True, 'noise_seed': int(noise_seed)}
+        sensor_params.update(_sensor_params(raw_cfg))
+        nodes.append(Node(
+            package='dsim_sensors', executable='sensors_node', name='dsim_sensors',
+            output='screen', parameters=[sensor_params],
+        ))
 
     # ---- optional built-in reference --------------------------------------
     if reference != 'none':
@@ -254,6 +284,20 @@ def generate_launch_description():
                               'A 2 m circle collides with pillar_c in the '
                               'pillars world; 1.0 clears the whole course.'),
         DeclareLaunchArgument('altitude', default_value='1.5'),
+        DeclareLaunchArgument('sensors', default_value='true',
+                              description='publish the simulated downward '
+                              'rangefinder (/drone/tof) and optical-flow '
+                              'sensor (/drone/optical_flow). Both are derived '
+                              'from ground truth with the noise model in '
+                              'config/drone.yaml.'),
+        DeclareLaunchArgument('noise_seed', default_value='1',
+                              description='RNG seed for the sensor noise. '
+                              'Fixed by default, which gives a repeatable '
+                              'starting point and a fixed noise distribution '
+                              '-- not bit-identical streams, since one '
+                              'generator feeds two timers and the interleaving '
+                              'depends on callback order. Set 0 for a fresh '
+                              'sequence every run.'),
         DeclareLaunchArgument('period', default_value='12.0',
                               description='seconds per lap of the built-in '
                               'trajectory. This is the knob that decides how '

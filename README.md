@@ -56,6 +56,7 @@ src/dsim_msgs/              the planner interface
 src/dsim_description/       generated — the Gazebo model
 src/dsim_control/           SE(3) geometric controller, mixer, test trajectories
 src/dsim_eval/              the referee: collision, clearance, tracking, energy
+src/dsim_sensors/           simulated rangefinder + optical flow, with noise
 src/dsim_bringup/           launch, bridge, RViz
 scripts/flight_check.sh     headless "does it actually fly" gate
 scripts/plot_run.py         CSV -> SVG, no dependencies
@@ -188,10 +189,16 @@ world, and it fires in the pillar field at the geometrically predicted moment
   do not notice. A green suite is only evidence if it would have gone red on a
   wrong implementation.
 
-  Currently **24 C++ + 17 overlay + 10 viewer tests pass, 17/17 injected bugs
-  caught, 0 skipped.** A mutation whose pattern no longer matches the source is
-  counted as a failure, not a pass: it means that bug went untested, and
-  reporting it green would make this script the very thing it exists to catch.
+  Currently **50 C++ + 45 Python + 10 viewer tests pass, 27/27 injected bugs
+  caught, 0 skipped.**
+
+  Two rules keep the harness honest, both added after it lied. A mutation whose
+  pattern no longer matches the source counts as a **failure**, not a pass:
+  that bug went untested, and reporting it green would make this script the
+  very thing it exists to catch. And a baseline that does not compile **aborts
+  the run**, because every mutation is then "caught" by the same build error —
+  which is exactly what happened the moment a new source file was added to the
+  package and not to the harness's compile line.
 - **`gen_assets.py --check`** — fails if any generated file drifted from source.
 
 ## Scope
@@ -199,13 +206,26 @@ world, and it fires in the pillar field at the geometrically predicted moment
 **In:** geometric path planning, obstacle clearance, trajectory feasibility,
 replanning behaviour, collision counting, comparing planners fairly.
 
-**Sensors:** the IMU carries noise derived from a consumer MEMS data sheet
-(gyro 1.0e-3 rad/s, accel 4.4e-2 m/s^2 at 250 Hz), plus a startup bias and a
-slow thermal drift. `make sensors` measures the live signal against the config,
-because two files agreeing that noise exists is not evidence that the simulator
-is applying it -- zeroing the noise makes that check fail 6/6, which is what
-makes a pass mean something. Ground truth on `/drone/truth` stays clean, so a
-planner can be developed against either.
+**Sensors:** an IMU with noise derived from a consumer MEMS data sheet (gyro
+1.0e-3 rad/s, accel 4.4e-2 m/s² at 250 Hz) plus startup bias and slow thermal
+drift; a downward rangefinder (`/drone/tof`, slant range, 1 cm + 1% error,
+millimetre quantised, REP 117 out-of-range); and an optical-flow sensor
+(`/drone/optical_flow`, integrated angle plus gyro terms, PMW3901 style).
+Ground truth on `/drone/truth` stays clean, so a planner can be developed
+against either.
+
+`make sensors` checks them. The IMU noise checks run in **every** regime: they
+estimate σ from consecutive-sample differences (`std(diff)/√2` for white noise,
+while real motion is smooth at 250 Hz), so they are not confined to hover — an
+earlier version only ran them when nearly still, which silently removed the
+gate from `make fly`. Two files agreeing that noise exists is not evidence the
+simulator applies it; zeroing the stddev fields makes these fail at ratio 0.01.
+
+In flight it also checks the sensors against ground truth: the rangefinder's
+excess over altitude against the geometric `alt·(sec θ − 1)` (71.8 mm measured
+vs 71.3 mm predicted at 17.3° of bank — a sensor returning plain altitude fails
+this), and the flow sensor's reconstructed velocity to a median **0.027 m/s at
+1.70 m/s** against a limit derived from the noise model.
 
 **Out:** state estimation, motor identification, matching a real airframe's
 numbers. The controller's model of the vehicle is exactly right, which is why

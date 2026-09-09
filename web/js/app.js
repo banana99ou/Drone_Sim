@@ -264,8 +264,10 @@ function updateHudOnce() {
 
   const st = S.status;
   if (st) {
-    el("err").textContent = fmt(st.tracking_error_m * 100, " cm", 1);
-    el("rmse").textContent = fmt(st.tracking_rmse_m * 100, " cm", 1);
+    // Already in centimetres when it arrives: the page does not convert
+    // physical quantities. See _status_of() in viz_server.py.
+    el("err").textContent = fmt(st.tracking_error_cm, " cm", 1);
+    el("rmse").textContent = fmt(st.tracking_rmse_cm, " cm", 1);
     const clr = st.min_obstacle_clearance_m;
     el("clr").textContent = clr === null ? "n/a" : fmt(clr, " m");
     el("clr").className = clr !== null && clr < 0 ? "bad" : "";
