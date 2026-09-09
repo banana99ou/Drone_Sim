@@ -1,0 +1,247 @@
+"""Ready-to-draw overlay geometry for the browser viewer.
+
+THE RULE THIS FILE EXISTS TO HONOUR: all logic lives in the ROS simulator and
+its scripts. The browser only draws.
+
+So every physical decision is made here -- what the aerodynamic force is, which
+frame a vector is in, how many metres of arrow one newton is worth -- and what
+crosses the wire is a list of line segments in world coordinates with a
+semantic label. The page projects them and strokes them. It never multiplies a
+mass by an acceleration, never rotates a body vector into the world, and never
+decides what a force is.
+
+That split is not tidiness. A browser doing physics is physics you cannot test:
+it needs a headless browser harness to inspect, it duplicates constants that
+live in config/drone.yaml, and when a viewer disagrees with the simulator you
+have two candidate culprits instead of one. Here it is a pure function of three
+messages, and test_overlay.py asserts its output against hand-computed values.
+
+Every number used comes off the wire (ControlDebug carries the vehicle's mass,
+gravity and rotor positions for exactly this reason). Nothing in this file
+knows anything about the vehicle that the simulator did not tell it.
+"""
+import math
+
+# Arrow lengths. ONE scale for every force, so lengths are directly
+# comparable: a thrust arrow twice as long as the weight arrow means twice the
+# weight. Deliberately not auto-normalised to the biggest value on screen --
+# that would draw hover and a hard bank identically, destroying the one thing
+# these overlays exist to show. The viewer may multiply everything by a display
+# gain, which changes all lengths together and never the ratios.
+SCALE = {
+    'force_m_per_n': 0.05,      # hover is 14.7 N total -> a 0.74 m arrow
+    'vel_m_per_mps': 0.25,
+    'torque_m_per_nm': 3.0,     # torques are small; this makes them visible
+    'axis_m': 0.5,              # length of the unit attitude axes
+}
+
+# Which toggle each arrow belongs to. Sent with the arrow so the page's
+# checkboxes are a pure filter that needs no idea what a torque is.
+GROUPS = ('motors', 'forces', 'velocity', 'attitude', 'torque')
+
+
+def quat_matrix(q):
+    """Hamilton quaternion [w, x, y, z] -> rotation matrix as three rows.
+
+    Rotates BODY vectors into WORLD, matching the odometry convention.
+    """
+    w, x, y, z = q
+    return (
+        (1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)),
+        (2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)),
+        (2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)),
+    )
+
+
+def rotate(m, v):
+    """m * v, with m as rows."""
+    return [sum(row[i] * v[i] for i in range(3)) for row in m]
+
+
+def body_z(m):
+    """The body +z axis in world coordinates: the third column of m."""
+    return [m[0][2], m[1][2], m[2][2]]
+
+
+def body_x(m):
+    return [m[0][0], m[1][0], m[2][0]]
+
+
+def _add(a, b):
+    return [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
+
+
+def _sub(a, b):
+    return [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+
+
+def _mul(a, s):
+    return [a[0] * s, a[1] * s, a[2] * s]
+
+
+def _norm(a):
+    return math.sqrt(a[0] * a[0] + a[1] * a[1] + a[2] * a[2])
+
+
+def _unit(a):
+    n = _norm(a)
+    # A legitimately zero vector (no torque demanded while hovering) must not
+    # become a NaN: one NaN endpoint poisons a whole projected polygon.
+    return [0.0, 0.0, 0.0] if n < 1e-12 else _mul(a, 1.0 / n)
+
+
+# Wire precision for every coordinate this module emits. One micrometre is
+# absurdly finer than anything a screen can show, and rounding still strips the
+# float noise that bloats the JSON -- repr(0.14000000000000001) is 19 characters
+# of nothing. It is stated as a constant, and tested to, because "how exact is
+# this number" is part of the contract with the page: test_overlay.py asserts
+# geometry to exactly this tolerance.
+WIRE_DECIMALS = 6
+WIRE_TOLERANCE = 10.0 ** -WIRE_DECIMALS
+
+
+def _round(v):
+    return [round(x, WIRE_DECIMALS) for x in v]
+
+
+def _arrow(group, kind, origin, vector, label, **extra):
+    a = {
+        'group': group,
+        'kind': kind,
+        # `from` doubles as the anchor the page scales the arrow about when the
+        # user turns up the display gain: to' = from + (to - from) * gain. That
+        # is a display zoom, the same kind of operation as the camera's, and it
+        # cannot change a ratio between two arrows.
+        'from': _round(origin),
+        'to': _round(_add(origin, vector)),
+        'label': label,
+    }
+    a.update(extra)
+    return a
+
+
+def aero_force_body(control, imu):
+    """MEASURED aerodynamic force on the airframe, in the body frame.
+
+    An accelerometer reads proper acceleration: total non-gravitational force
+    over mass, in the body frame. So mass * accel is thrust plus everything
+    else acting on the airframe, and subtracting the thrust the rotors are
+    actually producing leaves rotor drag, rolling moments, and any effect the
+    plant has that the controller does not model.
+
+    This is a measurement, not a model. The alternative was to re-evaluate
+    Gazebo's drag coefficient, which would have meant holding a second opinion
+    about the vehicle's physics and drawing a guess in the same style as a
+    measurement.
+
+    Returns None when there is no IMU sample yet, so a consumer can tell
+    "no data" from "zero drag".
+    """
+    if not imu or not imu.get('accel_body'):
+        return None
+    measured = _mul(imu['accel_body'], control['mass_kg'])
+    return _sub(measured, [0.0, 0.0, control['realised_thrust_n']])
+
+
+def build(pose, control, imu):
+    """Overlay for one frame, or None when there is nothing to draw yet.
+
+    Returns {'arrows': [...], 'ticks': [...], 'readout': {...}, 'scale': {...}}
+    with every position already in WORLD metres.
+    """
+    if not pose or not control:
+        return None
+
+    m = quat_matrix(pose['q'])
+    p = list(pose['p'])
+    scale_f = SCALE['force_m_per_n']
+    arrows = []
+    ticks = []
+
+    thrust_body = [0.0, 0.0, control['realised_thrust_n']]
+    aero_body = aero_force_body(control, imu)
+
+    readout = {
+        'speed_mps': _norm(control['velocity_world']),
+        'tilt_deg': math.degrees(control['commanded_tilt_rad']),
+        'torque_nm': _norm(control['realised_torque_nm']),
+        'aero_n': None if aero_body is None else _norm(aero_body),
+        'hover_thrust_n': control['mass_kg'] * control['gravity_m_s2'],
+    }
+
+    # Disarmed means every demand is zero. Four zero-length arrows and a torque
+    # of nothing is not information; the readout still says why.
+    if not control['armed']:
+        return {'arrows': [], 'ticks': [], 'readout': readout, 'scale': SCALE}
+
+    # ---- one arrow per rotor, along body +z, length proportional to thrust --
+    hubs = control['rotor_position']
+    thrusts = control['rotor_thrust_n']
+    hover_each = readout['hover_thrust_n'] / max(len(hubs), 1)
+    up = body_z(m)
+    across = _mul(body_x(m), 0.05)
+    for i, hub in enumerate(hubs):
+        base = _add(p, rotate(m, hub))
+        f = thrusts[i]
+        arrows.append(_arrow(
+            'motors', 'rotor', base, _mul(up, f * scale_f), f'{f:.1f}',
+            # Deviation from hover in [-1, 1]. A quadrotor holds a bank by
+            # splitting thrust across a diagonal, so this is the number that
+            # makes the control action readable: two rotors go one way, two the
+            # other, and the split grows with the manoeuvre. The page maps it
+            # to a colour; it does not compute it.
+            norm=round(max(-1.0, min(1.0, (f - hover_each) / hover_each)),
+                      WIRE_DECIMALS)
+            if hover_each > 0 else 0.0,
+            rotor=i))
+        # Reference mark at exactly hover thrust, so an arrow is not merely a
+        # length: you can see which rotors are above weight and which below.
+        at = _add(base, _mul(up, hover_each * scale_f))
+        ticks.append({'anchor': _round(base),
+                      'a': _round(_sub(at, across)),
+                      'b': _round(_add(at, across))})
+
+    # ---- forces at the centre of mass --------------------------------------
+    arrows.append(_arrow(
+        'forces', 'thrust', p, _mul(rotate(m, thrust_body), scale_f),
+        f'thrust {control["realised_thrust_n"]:.1f} N'))
+    weight = readout['hover_thrust_n']
+    arrows.append(_arrow(
+        'forces', 'weight', p, [0.0, 0.0, -weight * scale_f],
+        f'weight {weight:.1f} N'))
+    if aero_body is not None:
+        arrows.append(_arrow(
+            'forces', 'aero', p, _mul(rotate(m, aero_body), scale_f),
+            f'aero {_norm(aero_body):.2f} N'))
+
+    # ---- velocity ----------------------------------------------------------
+    # control['velocity_world'] is already resolved into the world frame by the
+    # controller. Using the raw odometry twist would be wrong: it is body-frame
+    # by REP-145, and drawing it as world-frame looks right at hover and is
+    # quietly wrong in every turn.
+    v = control['velocity_world']
+    arrows.append(_arrow(
+        'velocity', 'velocity', p, _mul(v, SCALE['vel_m_per_mps']),
+        f'{_norm(v):.2f} m/s'))
+
+    # ---- attitude: what the vehicle is doing vs what was demanded ----------
+    # Unit directions, so these carry no magnitude to exaggerate. The gap
+    # between them IS the attitude error the inner loop is working on -- if
+    # they separate visibly and the torque arrow is zero, something is broken.
+    axis = SCALE['axis_m']
+    arrows.append(_arrow('attitude', 'body_axis', p, _mul(up, axis), 'body z'))
+    cmd = _unit(control['desired_force'])
+    if _norm(cmd) > 0:
+        arrows.append(_arrow(
+            'attitude', 'cmd_axis', p, _mul(cmd, axis * 1.2),
+            f'cmd {readout["tilt_deg"]:.0f} deg', dashed=True))
+
+    # ---- torque ------------------------------------------------------------
+    tau = control['realised_torque_nm']
+    if _norm(tau) > 1e-9:
+        arrows.append(_arrow(
+            'torque', 'torque', p,
+            _mul(rotate(m, tau), SCALE['torque_m_per_nm']),
+            f'{_norm(tau):.3f} N.m'))
+
+    return {'arrows': arrows, 'ticks': ticks, 'readout': readout, 'scale': SCALE}

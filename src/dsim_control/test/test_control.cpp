@@ -262,3 +262,167 @@ int main(int argc, char ** argv)
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
 }
+
+// ---------------------------------------------------------------------------
+// Invariants behind /drone/control_debug.
+//
+// The viewer draws force arrows straight from that message. A field wired to
+// the wrong quantity, or a sign flip, would draw a confident picture of
+// something that is not happening -- worse than drawing nothing, because it
+// sends you looking for the bug in the wrong place. These are the checks that
+// would catch it.
+// ---------------------------------------------------------------------------
+
+// FAILS IF: the per-rotor thrusts stop summing to the thrust that was asked
+// for. ControlDebug publishes both numbers; this is the identity a consumer is
+// invited to assert, so it had better hold.
+TEST(Mixer, RotorThrustsSumToDemandedThrust)
+{
+  const auto m = makeMixer();
+  const std::vector<Eigen::Vector4d> probes = {
+    {kMass * kG, 0.0, 0.0, 0.0},
+    {kMass * kG, 0.4, -0.3, 0.05},
+    {1.6 * kMass * kG, -0.2, 0.2, -0.04},
+  };
+  for (const auto & w : probes) {
+    const Eigen::Vector4d f = m.rotorThrusts(w);
+    EXPECT_NEAR(f.sum(), w(0), 1e-9) << "wrench " << w.transpose();
+  }
+}
+
+// FAILS IF: an unsaturated demand comes back changed. This is what makes the
+// `saturated` flag meaningful -- it is defined as "realised differs from
+// demanded", so if the round trip were lossy the flag would be stuck true and
+// the viewer would permanently claim the vehicle is out of authority.
+TEST(Mixer, RealisedWrenchEqualsDemandWhenUnsaturated)
+{
+  const auto m = makeMixer();
+  const Eigen::Vector4d w(kMass * kG, 0.3, -0.2, 0.03);
+  const Eigen::Vector4d realised = m.wrenchFromThrusts(m.rotorThrusts(w));
+  EXPECT_LT((realised - w).cwiseAbs().maxCoeff(), 1e-9);
+}
+
+// FAILS IF: an impossible demand is reported as delivered. Asking for more
+// thrust than four rotors can produce MUST show up as a shortfall, otherwise
+// the saturation flag can never fire and the HUD would show a vehicle happily
+// tracking a trajectory it cannot fly.
+TEST(Mixer, SaturationIsVisibleInTheRealisedWrench)
+{
+  const auto m = makeMixer();
+  const double beyond_max = 8.0 * m.maxThrustPerRotor();
+  const Eigen::Vector4d w(beyond_max, 0.0, 0.0, 0.0);
+  const Eigen::Vector4d realised = m.wrenchFromThrusts(m.rotorThrusts(w));
+  EXPECT_LT(realised(0), w(0) - 1.0);
+  EXPECT_NEAR(realised(0), 4.0 * m.maxThrustPerRotor(), 1e-9);
+}
+
+// FAILS IF: the debug errors are wired backwards (reference - state instead of
+// state - reference), or to the wrong axis. A sign flip here would draw every
+// force arrow pointing the wrong way while the numbers still looked plausible.
+TEST(SE3Controller, DebugErrorsHaveTheDocumentedSign)
+{
+  Gains g;
+  g.mass = kMass;
+  g.gravity = kG;
+  SE3Controller c(g);
+
+  State s = hoverState();
+  s.position = Eigen::Vector3d(0.0, 0.0, 2.0);      // one metre ABOVE the ref
+  s.velocity = Eigen::Vector3d(0.5, 0.0, 0.0);      // moving +x, ref is still
+
+  Reference ref;
+  ref.position = Eigen::Vector3d(0.0, 0.0, 1.0);
+
+  ControlDebug dbg;
+  c.compute(s, ref, &dbg);
+
+  EXPECT_NEAR(dbg.position_error.z(), +1.0, 1e-12);   // state - reference
+  EXPECT_NEAR(dbg.velocity_error.x(), +0.5, 1e-12);
+}
+
+// FAILS IF: perfect hover reports a non-zero error anywhere, or a desired force
+// that is not straight up at exactly one weight. This is the anchor for every
+// overlay: at rest on the setpoint the four rotor arrows must be equal, the
+// thrust arrow must exactly cancel the gravity arrow, and the attitude ghost
+// must sit on top of the actual axis. If this test passes and the picture still
+// looks wrong, the bug is in the viewer, not the controller.
+TEST(SE3Controller, PerfectHoverProducesZeroErrorsAndVerticalForce)
+{
+  Gains g;
+  g.mass = kMass;
+  g.gravity = kG;
+  SE3Controller c(g);
+
+  const State s = hoverState();
+  Reference ref;
+  ref.position = s.position;
+
+  ControlDebug dbg;
+  const Eigen::Vector4d wrench = c.compute(s, ref, &dbg);
+
+  EXPECT_LT(dbg.position_error.norm(), 1e-12);
+  EXPECT_LT(dbg.velocity_error.norm(), 1e-12);
+  EXPECT_LT(dbg.attitude_error.norm(), 1e-12);
+  EXPECT_LT(dbg.body_rate_error.norm(), 1e-12);
+  EXPECT_NEAR(dbg.desired_force.x(), 0.0, 1e-12);
+  EXPECT_NEAR(dbg.desired_force.y(), 0.0, 1e-12);
+  EXPECT_NEAR(dbg.desired_force.z(), kMass * kG, 1e-9);
+  EXPECT_NEAR(dbg.commanded_tilt_rad, 0.0, 1e-12);
+  EXPECT_FALSE(dbg.tilt_clamped);
+  EXPECT_NEAR(wrench(0), kMass * kG, 1e-9);
+}
+
+// FAILS IF: the yaw-rate feedforward is dropped or double-counted. A vehicle
+// already yawing at exactly the commanded yaw rate has NO rate error to
+// correct; if it reported one, the torque arrow would show the controller
+// fighting a manoeuvre it asked for.
+TEST(SE3Controller, MatchedYawRateLeavesNoBodyRateError)
+{
+  Gains g;
+  g.mass = kMass;
+  g.gravity = kG;
+  SE3Controller c(g);
+
+  State s = hoverState();
+  s.angular_rate = Eigen::Vector3d(0.0, 0.0, 0.7);   // yawing, level
+
+  Reference ref;
+  ref.position = s.position;
+  ref.yaw_rate = 0.7;                                // ...exactly as commanded
+
+  ControlDebug dbg;
+  c.compute(s, ref, &dbg);
+  EXPECT_NEAR(dbg.body_rate_error.z(), 0.0, 1e-12);
+
+  // ...and the control must notice when they DISagree, or the test above would
+  // pass for a controller that always reports zero.
+  ref.yaw_rate = 0.0;
+  c.compute(s, ref, &dbg);
+  EXPECT_NEAR(dbg.body_rate_error.z(), 0.7, 1e-12);
+}
+
+// FAILS IF: the rotor positions the mixer reports stop matching the allocation
+// matrix it actually uses. Telemetry says "rotor i sits here and is producing
+// this much thrust", and a viewer draws an arrow from that position; if the two
+// were derived separately, the arrow could land on the wrong arm and make a
+// correct controller look broken.
+TEST(Mixer, RotorPositionsGenerateTheAllocationMatrix)
+{
+  const auto m = makeMixer();
+  const Eigen::Matrix4d & A = m.allocation();
+  for (int i = 0; i < Mixer::rotorCount(); ++i) {
+    const Eigen::Vector3d r = m.rotorPosition(i);
+    // Roll torque is +y * f, pitch torque is -x * f. Those ARE the columns.
+    EXPECT_NEAR(A(1, i), r.y(), 1e-12) << "rotor " << i;
+    EXPECT_NEAR(A(2, i), -r.x(), 1e-12) << "rotor " << i;
+    // ...and every hub is one arm length from the centre.
+    EXPECT_NEAR(r.norm(), kArm, 1e-6) << "rotor " << i;
+  }
+  // The four hubs must be distinct, or two arrows would stack on one arm.
+  for (int i = 0; i < 4; ++i) {
+    for (int j = i + 1; j < 4; ++j) {
+      EXPECT_GT((m.rotorPosition(i) - m.rotorPosition(j)).norm(), 1e-6)
+        << "rotors " << i << " and " << j << " are in the same place";
+    }
+  }
+}

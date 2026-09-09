@@ -1,0 +1,12 @@
+{
+  "name": "dsim-viewer",
+  "private": true,
+  "type": "module",
+  "_comment": [
+    "NOT an npm project: there are no dependencies and nothing is installed.",
+    "This file exists only so `node --test web/js/test` treats the .js files",
+    "in js/ as ES modules, which is exactly how the browser loads them. Same",
+    "files, same semantics, so a passing node test says something about the",
+    "code the browser actually runs."
+  ]
+}

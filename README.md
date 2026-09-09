@@ -61,7 +61,9 @@ scripts/flight_check.sh     headless "does it actually fly" gate
 scripts/plot_run.py         CSV -> SVG, no dependencies
 scripts/kill_sim.sh         clear leftover sim processes
 scripts/run_sim.sh          make viz -- start sim + viewer, verify it is up
-web/index.html              the browser viewer (dependency-free)
+scripts/check_telemetry.py  cross-check a running sim's telemetry against physics
+src/dsim_viz/               one-port viewer server + the overlay geometry it sends
+web/                        the browser viewer (dependency-free, draw-only)
 docs/VIEWER.md              how to watch from any tailnet device
 docs/reference/             a collaborator's hardware brief. Not used by this sim.
 ```
@@ -116,11 +118,34 @@ For the GUI to render at full speed it also needs GPU passthrough, which is
 opt-in — see `docker/compose.gpu.yaml`. Without it Gazebo falls back to
 software rendering (llvmpipe): visible, but slow. Headless runs never need it.
 
+## Seeing that it is being controlled
+
+Position alone cannot tell you whether the controller is working: a drone
+coasting through a gentle arc and one fighting for it trace the same line. The
+viewer draws the control action itself — one thrust arrow per rotor with a tick
+at hover thrust, coloured blue below and orange above, plus thrust, weight,
+**measured** aerodynamic force, velocity, torque and the commanded attitude axis
+next to the actual one. In a turn the thrust visibly splits across the diagonal;
+that split *is* the control action. See [docs/VIEWER.md](docs/VIEWER.md).
+
+One thing worth knowing before deciding the stack looks idle: a circle needs
+`bank = atan(4·pi²·r / (T²·g))`, so a 12 s lap on a 1 m circle is **1.6 degrees**
+of bank. Nothing looked like it was happening because nothing was being asked
+for. `make viz PERIOD=3.5` asks for 18 degrees, and prints the figure at launch.
+
+All the arithmetic behind those arrows runs on the ROS side
+(`src/dsim_viz/dsim_viz/overlay.py`) and reaches the page as line segments in
+world metres. The browser only draws. Physics in a browser is physics you
+cannot test, and when the viewer disagreed with the simulator you would have two
+suspects instead of one.
+
 ## Verification
 
 ```bash
-make verify                       # host-side, no container needed
-colcon test --packages-select dsim_control    # in the container
+make test                         # C++ invariants + overlay geometry + viewer maths
+make verify                       # mutation check + generated-asset drift (host)
+make fly                          # headless: proves it flies AND reports honestly
+make telemetry                    # cross-check a sim that is already running
 ```
 
 Measured on this machine, empty world, 42 s runs:
@@ -135,6 +160,20 @@ mean rotor speed in hover measured **638.4 rad/s** against the generator's
 predicted **639**; flown speed 1.037 m/s against the circle's implied
 1.047 m/s; flown radius 1.987 m against the commanded 2.0 m.
 
+Cross-checks on the live telemetry, from `scripts/check_telemetry.py` — each
+compares numbers produced by *different* paths, so agreement is evidence:
+
+| check | why it is not self-report |
+|---|---|
+| `sum(rotor_thrust_n) == realised_thrust_n` | one side is the mixer's inverse, the other its forward map |
+| `\|velocity_world\| == \|odom twist\|` | same vector, two frames; a rotation cannot change a length |
+| `thrust == weight / cos(tilt)` in a steady turn | pure physics — thrust comes from rotor speeds, tilt from the commanded force direction |
+| aero residual is small but non-zero | exactly zero would mean the IMU path is dead, not that drag is |
+| rotor thrusts are split while turning | four equal rotors in a turn is not quiet, it is impossible |
+
+On a 13° banked lap those agree to 0.15%, and dropping the `cos(tilt)` term
+makes the third one fail — so it is not vacuous.
+
 The collision detector is checked in both directions — silent in the empty
 world, and it fires in the pillar field at the geometrically predicted moment
 (0.489 m from `pillar_c`'s centre, needing 0.60 m).
@@ -143,9 +182,16 @@ world, and it fires in the pillar field at the geometrically predicted moment
 
 - **`scripts/mutation_check.sh`** — deliberately breaks the mixer and controller
   (flipped yaw torque, swapped roll/pitch, dropped feedforward, inverted
-  position error, faked arm length) and fails if the tests do not notice.
-  A green suite is only evidence if it would have gone red on a wrong
-  implementation. Currently 17 tests pass, 7/7 injected bugs caught.
+  position error, faked arm length, a rotor swapped in the layout table) and the
+  overlay geometry (unrotated body vectors, a flipped aero residual, an arrow
+  decoupled from its rotor, a doubly-rotated velocity), then fails if the tests
+  do not notice. A green suite is only evidence if it would have gone red on a
+  wrong implementation.
+
+  Currently **24 C++ + 17 overlay + 10 viewer tests pass, 17/17 injected bugs
+  caught, 0 skipped.** A mutation whose pattern no longer matches the source is
+  counted as a failure, not a pass: it means that bug went untested, and
+  reporting it green would make this script the very thing it exists to catch.
 - **`gen_assets.py --check`** — fails if any generated file drifted from source.
 
 ## Scope
@@ -155,7 +201,12 @@ replanning behaviour, collision counting, comparing planners fairly.
 
 **Out:** sensor noise, state estimation, motor identification, matching a real
 airframe's numbers. There is no noise model — the controller and the referee
-both see ground truth.
+both see ground truth. The controller's model of the vehicle is also exactly
+right, which is why tracking is as good as it is: with perfect state, an exact
+model and acceleration feedforward, the feedback terms have little left to do.
+The stack is a two-level cascade (position/velocity → attitude/body-rate →
+mixer) and it is **PD, not PID** — there are no integrators, because with no
+model error there is no steady-state error for one to remove.
 
 Getting a planner onto real hardware later is a **nice-to-have, low priority**,
 and the seam is deliberately shallow: your planner emits world-frame

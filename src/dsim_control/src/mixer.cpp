@@ -14,21 +14,32 @@ Mixer::Mixer(
     throw std::invalid_argument("Mixer: arm length, motor constant and max rotor speed must be > 0");
   }
 
-  const double d = arm_length_m / std::sqrt(2.0);
+  arm_offset_ = arm_length_m / std::sqrt(2.0);
   const double c = moment_constant_m;
 
-  // Columns are rotors 0..3; rows are [T, tau_x, tau_y, tau_z].
-  //                     r0    r1    r2    r3
-  alloc_ <<  1.0,  1.0,  1.0,  1.0,      // T     = sum f
-             d,   -d,   -d,    d,        // tau_x = sum  y_i f_i
-            -d,    d,   -d,    d,        // tau_y = -sum x_i f_i
-            -c,   -c,    c,    c;        // tau_z = -sum s_i c f_i
+  // Built column by column from the geometry table rather than written out as
+  // a literal matrix. The equations in the header are the definition; this is
+  // them, transcribed once. A hand-written matrix is a second copy of the
+  // layout, and the version that drifts is always the one nobody tests.
+  for (int i = 0; i < rotorCount(); ++i) {
+    const Eigen::Vector3d r = rotorPosition(i);
+    alloc_(0, i) = 1.0;                        // T     = sum f_i
+    alloc_(1, i) = r.y();                      // tau_x = sum  y_i f_i
+    alloc_(2, i) = -r.x();                     // tau_y = -sum x_i f_i
+    alloc_(3, i) = -kLayout[i].spin * c;       // tau_z = -sum s_i c f_i
+  }
 
   const Eigen::FullPivLU<Eigen::Matrix4d> lu(alloc_);
   if (!lu.isInvertible()) {
     throw std::runtime_error("Mixer: allocation matrix is singular — check rotor geometry");
   }
   alloc_inv_ = lu.inverse();
+}
+
+Eigen::Vector3d Mixer::rotorPosition(int i) const
+{
+  const auto & g = kLayout[i];
+  return Eigen::Vector3d(g.sx * arm_offset_, g.sy * arm_offset_, 0.0);
 }
 
 Eigen::Vector4d Mixer::rotorThrusts(const Eigen::Vector4d & wrench) const

@@ -52,14 +52,42 @@ public:
   double conditionNumber() const;
   const Eigen::Matrix4d & allocation() const {return alloc_;}
 
+  /// Rotor i's hub position in the body frame, in metres, z at the body plane.
+  ///
+  /// Comes from the same geometry table the allocation matrix is built from, so
+  /// telemetry that reports "rotor i is at (x, y) and is producing f newtons"
+  /// cannot put the thrust on the wrong arm. A viewer drawing arrows from these
+  /// positions will show them visibly off the rotor discs if the mixer and the
+  /// SDF ever disagree about the layout -- a loud failure instead of a silent
+  /// one.
+  Eigen::Vector3d rotorPosition(int i) const;
+  static int rotorCount() {return 4;}
+
   double thrustToSpeed(double thrust_n) const;
   double speedToThrust(double omega) const;
   double maxRotVelocity() const {return max_rot_velocity_;}
   double maxThrustPerRotor() const {return speedToThrust(max_rot_velocity_);}
 
 private:
+  /// The one place the rotor layout is written down in this package.
+  ///   sx, sy  hub position as a multiple of arm_length / sqrt(2)
+  ///   spin    +1 counter-clockwise, -1 clockwise; the reaction torque on the
+  ///           airframe opposes the rotor's own spin, hence the sign on tau_z
+  /// Must match scripts/gen_assets.py rotor_layout(), which writes the SDF.
+  struct RotorGeometry
+  {
+    double sx, sy, spin;
+  };
+  static constexpr RotorGeometry kLayout[4] = {
+    {+1.0, +1.0, +1.0},        // 0  front-left,  ccw
+    {-1.0, -1.0, +1.0},        // 1  back-right,  ccw
+    {+1.0, -1.0, -1.0},        // 2  front-right, cw
+    {-1.0, +1.0, -1.0},        // 3  back-left,   cw
+  };
+
   Eigen::Matrix4d alloc_;      ///< wrench = alloc_ * thrusts
   Eigen::Matrix4d alloc_inv_;
+  double arm_offset_ {0.0};    ///< arm_length / sqrt(2), the per-axis offset
   double motor_constant_;
   double max_rot_velocity_;
 };

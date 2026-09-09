@@ -96,6 +96,7 @@ Eigen::Vector4d SE3Controller::compute(
     debug->position_error = e_p;
     debug->velocity_error = e_v;
     debug->attitude_error = e_R;
+    debug->body_rate_error = e_omega;
     debug->desired_force  = f_des;
     debug->commanded_tilt_rad = tilt;
     debug->tilt_clamped = clamped;

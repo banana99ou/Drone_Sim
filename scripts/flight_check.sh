@@ -6,8 +6,15 @@
 # FAILS if the drone never takes off, drifts, crashes, or oscillates, because
 # all of those show up as tracking error or a collision.
 #
+# It then runs scripts/check_telemetry.py, which cross-checks the live control
+# telemetry against itself and against physics. That part would catch a sim
+# that flies correctly while REPORTING nonsense -- a broken force
+# decomposition, a frame mix-up, a mixer that stopped inverting. Flying well
+# and describing itself correctly are two different claims.
+#
 #   bash scripts/flight_check.sh            # default thresholds
 #   RMSE_LIMIT=0.15 bash scripts/flight_check.sh
+#   PERIOD=3.5 bash scripts/flight_check.sh # a lap that demands real bank
 # NOT `set -u`: ROS 2's setup.bash references unbound variables and dies under it.
 set -o pipefail
 
@@ -16,6 +23,12 @@ MIN_ALT="${MIN_ALT:-1.0}"            # must actually leave the ground
 SETTLE_S="${SETTLE_S:-35}"           # 4 s takeoff + 6 s RMSE warmup + ~2 laps
 WORLD="${WORLD:-empty}"
 REFERENCE="${REFERENCE:-circle}"
+RADIUS="${RADIUS:-2.0}"
+# A 12 s lap on a 2 m circle is 3 degrees of bank: the rotor thrusts barely
+# split, so the telemetry cross-checks below would have almost nothing to bite
+# on. 6 s is 13 degrees -- enough that a mixer or frame error shows up.
+PERIOD="${PERIOD:-6.0}"
+WEB_PORT="${WEB_PORT:-8080}"
 
 source /opt/ros/jazzy/setup.bash
 source /ws/install/setup.bash
@@ -48,6 +61,7 @@ echo "== launching ($WORLD, $REFERENCE, headless) =="
 # setsid so the whole launch tree is one process group we can signal as a unit.
 setsid ros2 launch dsim_bringup sim.launch.py \
     world:="$WORLD" reference:="$REFERENCE" gui:=false \
+    radius:="$RADIUS" period:="$PERIOD" web_port:="$WEB_PORT" \
     >/tmp/flight_check.log 2>&1 &
 LAUNCH_PID=$!
 
@@ -124,8 +138,15 @@ awk -v v="${ALT:-0}" -v l="$MIN_ALT" 'BEGIN{exit !(v+0 >= l+0)}' \
 awk -v v="${ELAPSED:-0}" -v l="$((SETTLE_S + 30))" 'BEGIN{exit !(v+0 <= l+0)}' \
   || { echo "FAIL: elapsed ${ELAPSED}s implies a stale sim (flew only ${SETTLE_S}s)"; fail=1; }
 
+# ---- does the sim describe itself correctly, as well as fly? --------------
+echo "== cross-checking the live telemetry =="
+python3 "$(dirname "$0")/check_telemetry.py" "http://127.0.0.1:${WEB_PORT}" \
+  || { echo "FAIL: telemetry cross-checks disagree (see above)"; fail=1; }
+echo
+
 if [ "$fail" -eq 0 ]; then
-  echo "PASS: took off, tracked the reference, no collision."
-  echo "  (this would have failed on: no takeoff, drift, oscillation, or a crash)"
+  echo "PASS: took off, tracked the reference, no collision, telemetry consistent."
+  echo "  (this would have failed on: no takeoff, drift, oscillation, a crash,"
+  echo "   or a vehicle that flies fine while reporting wrong forces)"
 fi
 exit "$fail"

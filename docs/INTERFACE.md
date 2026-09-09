@@ -11,9 +11,35 @@ publish trajectories, it flies them and scores the result.**
 | sim → you | `/drone/eval/status` | `dsim_msgs/msg/FlightStatus` | 20 Hz |
 | **you → sim** | `/drone/trajectory` | `dsim_msgs/msg/Trajectory` | your replan rate |
 | sim → you | `/drone/imu` | `sensor_msgs/msg/Imu` | 250 Hz |
+| sim → you | `/drone/control_debug` | `dsim_msgs/msg/ControlDebug` | 250 Hz |
+| sim → you | `/drone/setpoint` | `dsim_msgs/msg/TrajectorySetpoint` | 250 Hz |
 
 There is no sensor-noise model, so `/drone/odom` is ground truth. Your planner
 sees the true state.
+
+### Reading back what the controller did
+
+`/drone/control_debug` reports one control step exactly as the controller saw
+it: the wrench each loop demanded, the wrench the rotors could actually
+deliver, the four per-rotor thrusts and speeds, and every loop's error term.
+Best-effort QoS — it is telemetry, and a slow subscriber must never be able to
+back-pressure the control loop.
+
+It is worth subscribing to from a planner for two reasons:
+
+* **`saturated` and `tilt_clamped` tell you your trajectory was infeasible.**
+  Without them, an over-aggressive plan looks like a tracking failure, and you
+  would tune the wrong thing. If `tilt_clamped` is true, the controller gave up
+  before the vehicle did.
+* **It is self-describing.** `mass_kg`, `gravity_m_s2`, `max_rotor_thrust_n`
+  and the four `rotor_position` entries travel with the data, so nothing
+  downstream needs its own copy of `config/drone.yaml` to interpret it.
+
+Two identities hold on every message, and are worth asserting if you consume
+it: `sum(rotor_thrust_n) == realised_thrust_n`, and
+`|velocity_world| == |odom twist|` (a rotation cannot change a length). Both
+sides are computed separately on purpose, so a disagreement is visible rather
+than silent. `scripts/check_telemetry.py` asserts them against a live run.
 
 ## Publishing a trajectory
 

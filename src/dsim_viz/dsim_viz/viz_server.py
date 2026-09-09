@@ -14,6 +14,16 @@ Replaces rosbridge + a separate static file server. The reason is not taste:
     loop at all. A transport you can debug with curl is worth a lot more than
     one that needs a headless-browser harness to inspect.
 
+What is streamed is not only the pose. The control step (/drone/control_debug)
+and the IMU come along too, because position alone cannot tell you whether the
+stack is working: a drone coasting through a gentle arc and a drone fighting for
+it trace the same line. The per-rotor thrusts, the demanded wrench and the
+measured proper acceleration are what let the viewer draw the difference.
+
+Those raw messages are turned into ready-to-draw geometry HERE, by overlay.py,
+not in the page. All logic lives on the ROS side; the browser only draws. See
+the module docstring in overlay.py for why that boundary is where it is.
+
 Endpoints, all on one port and one origin:
 
     /              web/index.html and friends (static)
@@ -34,8 +44,16 @@ import rclpy
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
+from sensor_msgs.msg import Imu
 
-from dsim_msgs.msg import FlightStatus, TrajectorySetpoint
+from dsim_msgs.msg import ControlDebug, FlightStatus, TrajectorySetpoint
+
+from . import overlay
+
+
+def _v3(v):
+    """geometry_msgs/Vector3 (or anything with x/y/z) -> [x, y, z]."""
+    return [v.x, v.y, v.z]
 
 
 class State:
@@ -48,18 +66,27 @@ class State:
         self.vel = None
         self.setpoint = None
         self.status = None
+        self.control = None
+        self.imu = None
         self.stamp = 0.0
 
     def snapshot(self):
+        # Copy under the lock, then compute outside it: overlay.build() is pure
+        # arithmetic and holding the lock through it would stall the 250 Hz
+        # subscriptions for every connected browser.
         with self.lock:
-            return {
+            snap = {
                 "seq": self.seq,
                 "t": self.stamp,
                 "pose": self.pose,
                 "vel": self.vel,
                 "setpoint": self.setpoint,
                 "status": self.status,
+                "control": self.control,
+                "imu": self.imu,
             }
+        snap["overlay"] = overlay.build(snap["pose"], snap["control"], snap["imu"])
+        return snap
 
 
 class VizNode(Node):
@@ -72,6 +99,15 @@ class VizNode(Node):
                                  self.on_setpoint, 10)
         self.create_subscription(FlightStatus, "/drone/eval/status",
                                  self.on_status, 10)
+        # Both of these publish at 250 Hz while the stream goes out at 30, so
+        # most frames are overwritten before anyone sees them. That is the
+        # intent: keep the LATEST, never a backlog. Best-effort QoS
+        # (qos_profile_sensor_data) is what makes a slow viewer harmless to the
+        # control loop.
+        self.create_subscription(ControlDebug, "/drone/control_debug",
+                                 self.on_control, qos_profile_sensor_data)
+        self.create_subscription(Imu, "/drone/imu",
+                                 self.on_imu, qos_profile_sensor_data)
 
     def on_odom(self, m):
         p, q = m.pose.pose.position, m.pose.pose.orientation
@@ -102,6 +138,49 @@ class VizNode(Node):
                 "path_length_m": m.path_length_m,
                 "elapsed_s": m.elapsed_s,
                 "energy_wh": m.energy_wh,
+            }
+
+    def on_control(self, m):
+        # Passed through field for field, with no arithmetic. Any force the
+        # viewer draws should be traceable to one number the controller
+        # published; a "helpful" conversion here would be a second, silent
+        # opinion about the vehicle's physics.
+        with self.state.lock:
+            self.state.control = {
+                "armed": bool(m.armed),
+                "mass_kg": m.mass_kg,
+                "gravity_m_s2": m.gravity_m_s2,
+                "max_rotor_thrust_n": m.max_rotor_thrust_n,
+                "thrust_n": m.thrust_n,
+                "torque_nm": _v3(m.torque_nm),
+                "realised_thrust_n": m.realised_thrust_n,
+                "realised_torque_nm": _v3(m.realised_torque_nm),
+                "saturated": bool(m.saturated),
+                "rotor_position": [_v3(v) for v in m.rotor_position],
+                "rotor_thrust_n": list(m.rotor_thrust_n),
+                "rotor_speed_rad_s": list(m.rotor_speed_rad_s),
+                "velocity_world": _v3(m.velocity_world),
+                "position_error": _v3(m.position_error),
+                "velocity_error": _v3(m.velocity_error),
+                "attitude_error": _v3(m.attitude_error),
+                "body_rate_error": _v3(m.body_rate_error),
+                "desired_force": _v3(m.desired_force),
+                "commanded_tilt_rad": m.commanded_tilt_rad,
+                "tilt_clamped": bool(m.tilt_clamped),
+            }
+
+    def on_imu(self, m):
+        # Proper acceleration in the BODY frame: what an accelerometer feels,
+        # so it includes the reaction to gravity (a resting vehicle reads
+        # +9.81 on z) and excludes gravity itself. Multiplied by mass it is the
+        # total non-gravitational force on the airframe -- thrust plus
+        # everything aerodynamic -- which is how the viewer gets a MEASURED
+        # drag arrow instead of one recomputed from a drag coefficient it would
+        # have had to duplicate.
+        with self.state.lock:
+            self.state.imu = {
+                "accel_body": _v3(m.linear_acceleration),
+                "rate_body": _v3(m.angular_velocity),
             }
 
 

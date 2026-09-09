@@ -5,10 +5,16 @@
 //        |
 //        v  SE(3) geometric control + mixer
 //   /drone/command/motor_speed (actuator_msgs/Actuators) -> bridged to Gazebo
+//   /drone/control_debug       (dsim_msgs/ControlDebug)   telemetry
 //
 // Also republishes the currently-tracked setpoint on /drone/setpoint so that
 // tracking error is measured against what the controller actually chased, not
 // against a re-interpolation done elsewhere.
+//
+// /drone/control_debug carries what every loop of the cascade demanded and what
+// the rotors could deliver. It is what lets the viewer draw the control action
+// instead of only the resulting motion -- those look identical from position
+// alone, whether the stack is working hard or coasting.
 
 #include <chrono>
 #include <memory>
@@ -17,7 +23,9 @@
 #include <rclcpp/rclcpp.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <actuator_msgs/msg/actuators.hpp>
+#include <geometry_msgs/msg/vector3.hpp>
 #include <std_srvs/srv/set_bool.hpp>
+#include <dsim_msgs/msg/control_debug.hpp>
 #include <dsim_msgs/msg/trajectory.hpp>
 #include <dsim_msgs/msg/trajectory_setpoint.hpp>
 
@@ -100,6 +108,11 @@ public:
       "/drone/command/motor_speed", rclcpp::QoS(1));
     setpoint_pub_ = create_publisher<dsim_msgs::msg::TrajectorySetpoint>(
       "/drone/setpoint", rclcpp::QoS(10));
+    // Best-effort, shallow queue: telemetry must never be able to back-pressure
+    // the control loop, and a viewer that misses a frame at 250 Hz loses
+    // nothing it could have drawn anyway.
+    debug_pub_ = create_publisher<dsim_msgs::msg::ControlDebug>(
+      "/drone/control_debug", rclcpp::SensorDataQoS());
 
     arm_srv_ = create_service<std_srvs::srv::SetBool>(
       "/drone/arm",
@@ -250,7 +263,15 @@ private:
 
     ControlDebug dbg;
     const Eigen::Vector4d wrench = controller_->compute(state, ref, &dbg);
-    const Eigen::Vector4d speeds = mixer_->rotorSpeeds(wrench);
+    // Per-rotor thrusts first, then the speeds derived from them. Calling
+    // rotorSpeeds() as well would compute the same clamp a second time and let
+    // the commanded speeds and the reported thrusts drift apart under a future
+    // edit; this way they are the same numbers by construction.
+    const Eigen::Vector4d thrusts = mixer_->rotorThrusts(wrench);
+    Eigen::Vector4d speeds;
+    for (int i = 0; i < 4; ++i) {
+      speeds(i) = mixer_->thrustToSpeed(thrusts(i));
+    }
 
     if (dbg.tilt_clamped) {
       RCLCPP_WARN_THROTTLE(
@@ -263,6 +284,8 @@ private:
     cmd.header.stamp = get_clock()->now();
     cmd.velocity = {speeds(0), speeds(1), speeds(2), speeds(3)};
     cmd_pub_->publish(cmd);
+
+    publishDebug(true, wrench, thrusts, dbg, state.velocity);
 
     dsim_msgs::msg::TrajectorySetpoint sp;
     sp.position.x = ref.position.x();
@@ -285,6 +308,74 @@ private:
     cmd.header.stamp = get_clock()->now();
     cmd.velocity = {0.0, 0.0, 0.0, 0.0};
     cmd_pub_->publish(cmd);
+    // Publish the debug frame here too, with armed=false. A viewer that kept
+    // showing the last commanded thrust after the motors were cut would be
+    // drawing a vehicle that no longer exists.
+    publishDebug(
+      false, Eigen::Vector4d::Zero(), Eigen::Vector4d::Zero(), ControlDebug{},
+      Eigen::Vector3d::Zero());
+  }
+
+  static geometry_msgs::msg::Vector3 toVec3(const Eigen::Vector3d & v)
+  {
+    geometry_msgs::msg::Vector3 m;
+    m.x = v.x();
+    m.y = v.y();
+    m.z = v.z();
+    return m;
+  }
+
+  /// Telemetry for one control step: the demand, what the rotors could actually
+  /// deliver, and what each loop was reacting to.
+  ///
+  /// The realised wrench is recomputed here from the per-rotor thrusts rather
+  /// than tracked alongside them, so the two cannot disagree. Consumers may
+  /// assert sum(rotor_thrust_n) == realised_thrust_n; that identity is exactly
+  /// what breaks if the allocation matrix ever stops inverting.
+  void publishDebug(
+    bool armed, const Eigen::Vector4d & wrench,
+    const Eigen::Vector4d & thrusts, const ControlDebug & dbg,
+    const Eigen::Vector3d & state_velocity)
+  {
+    const Eigen::Vector4d realised = mixer_->wrenchFromThrusts(thrusts);
+
+    dsim_msgs::msg::ControlDebug m;
+    m.header.stamp = get_clock()->now();
+    m.header.frame_id = "drone/base_link";
+    m.armed = armed;
+
+    // Sent on the wire so no consumer needs its own copy of config/drone.yaml.
+    // A viewer that hardcoded the mass would draw wrong forces the moment the
+    // vehicle changed, and would do it silently.
+    m.mass_kg = controller_->gains().mass;
+    m.gravity_m_s2 = controller_->gains().gravity;
+    m.max_rotor_thrust_n = mixer_->maxThrustPerRotor();
+
+    m.thrust_n = wrench(0);
+    m.torque_nm = toVec3(Eigen::Vector3d(wrench.tail<3>()));
+    m.realised_thrust_n = realised(0);
+    m.realised_torque_nm = toVec3(Eigen::Vector3d(realised.tail<3>()));
+    // Saturation is defined by its observable consequence -- the rotors could
+    // not deliver what was asked -- not by bookkeeping inside the clamp. That
+    // keeps the flag true even for a saturation route added later.
+    m.saturated = (realised - wrench).cwiseAbs().maxCoeff() > kWrenchTol;
+
+    for (int i = 0; i < 4; ++i) {
+      m.rotor_position[i] = toVec3(mixer_->rotorPosition(i));
+      m.rotor_thrust_n[i] = thrusts(i);
+      m.rotor_speed_rad_s[i] = mixer_->thrustToSpeed(thrusts(i));
+    }
+
+    m.velocity_world = toVec3(state_velocity);
+    m.position_error = toVec3(dbg.position_error);
+    m.velocity_error = toVec3(dbg.velocity_error);
+    m.attitude_error = toVec3(dbg.attitude_error);
+    m.body_rate_error = toVec3(dbg.body_rate_error);
+    m.desired_force = toVec3(dbg.desired_force);
+    m.commanded_tilt_rad = dbg.commanded_tilt_rad;
+    m.tilt_clamped = dbg.tilt_clamped;
+
+    debug_pub_->publish(m);
   }
 
   static double yawFromQuat(const Eigen::Quaterniond & q)
@@ -308,6 +399,11 @@ private:
   double control_rate_hz_ {250.0};
   double odom_timeout_s_ {0.5};
 
+  /// Below this, a demanded-vs-realised difference is numerical noise from the
+  /// mixer inverse, not saturation. The self-test asserts the round-trip
+  /// residual is under 1e-9, so this sits an order of magnitude above it.
+  static constexpr double kWrenchTol = 1e-8;
+
   bool hold_valid_ {false};
   Eigen::Vector3d hold_position_ {Eigen::Vector3d::Zero()};
   double hold_yaw_ {0.0};
@@ -316,6 +412,7 @@ private:
   rclcpp::Subscription<dsim_msgs::msg::Trajectory>::SharedPtr traj_sub_;
   rclcpp::Publisher<actuator_msgs::msg::Actuators>::SharedPtr cmd_pub_;
   rclcpp::Publisher<dsim_msgs::msg::TrajectorySetpoint>::SharedPtr setpoint_pub_;
+  rclcpp::Publisher<dsim_msgs::msg::ControlDebug>::SharedPtr debug_pub_;
   rclcpp::Service<std_srvs::srv::SetBool>::SharedPtr arm_srv_;
   rclcpp::TimerBase::SharedPtr timer_;
 };

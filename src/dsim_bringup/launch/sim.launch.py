@@ -61,6 +61,7 @@ def launch_setup(context, *args, **kwargs):
     web_port = LaunchConfiguration('web_port').perform(context)
     radius = LaunchConfiguration('radius').perform(context)
     altitude = LaunchConfiguration('altitude').perform(context)
+    period = LaunchConfiguration('period').perform(context)
 
     world_file = os.path.join(WORLD_DIR, f'{world}.sdf')
     if not os.path.exists(world_file):
@@ -158,7 +159,8 @@ def launch_setup(context, *args, **kwargs):
             package='dsim_control', executable='reference_generator_node',
             name='drone_reference_generator', output='screen',
             parameters=[{'use_sim_time': True, 'mode': reference,
-                         'radius_m': float(radius), 'altitude_m': float(altitude)}],
+                         'radius_m': float(radius), 'altitude_m': float(altitude),
+                         'period_s': float(period)}],
         ))
 
     # Tell the viewer which world is actually running. Without this its world
@@ -223,6 +225,15 @@ def generate_launch_description():
                               'A 2 m circle collides with pillar_c in the '
                               'pillars world; 1.0 clears the whole course.'),
         DeclareLaunchArgument('altitude', default_value='1.5'),
+        DeclareLaunchArgument('period', default_value='12.0',
+                              description='seconds per lap of the built-in '
+                              'trajectory. This is the knob that decides how '
+                              'hard the vehicle has to work: a circle needs '
+                              'bank = atan(4*pi^2*r / (T^2*g)), so r=1 m at '
+                              'T=12 s is 6 deg of bank -- almost nothing, and '
+                              'it LOOKS like nothing on screen. r=2 m at '
+                              'T=4.5 s is 39 deg, right at the tilt clamp, '
+                              'with the rotor thrusts visibly split.'),
         DeclareLaunchArgument('csv', default_value='',
                               description='path to write per-step metrics, e.g. /ws/logs/run.csv'),
         SetEnvironmentVariable('GZ_SIM_RESOURCE_PATH',

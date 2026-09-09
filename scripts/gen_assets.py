@@ -33,6 +33,7 @@ PARAMS = {
     "mass_kg":          1.5,
     "gravity_m_s2":     9.80665,
     "arm_length_m":     0.20,     # rotor hub to centre, X configuration
+    "rotor_z_m":        0.02,     # rotor hub height above the body origin
     "body_box_m":       (0.16, 0.16, 0.08),
     "radius_m":         0.30,     # collision + planner clearance envelope
     "ixx":              0.015,
@@ -93,25 +94,44 @@ def check_flyable():
 # ---------------------------------------------------------------------------
 # drone model SDF
 # ---------------------------------------------------------------------------
-def model_sdf():
-    p = PARAMS
-    d = round(p["arm_length_m"] / math.sqrt(2.0), 6)
-    bx, by, bz = p["body_box_m"]
-    body_mass = round(p["mass_kg"] - 4 * p["rotor_mass_kg"], 6)
+def rotor_layout():
+    """Rotor hubs and spin directions, in MIXER INDEX ORDER.
 
-    rotors = [
+    One definition, consumed by everything that has an opinion about which
+    rotor is which:
+
+      * model.sdf       where Gazebo puts each link and its thrust plugin
+      * web/scene.json  where the viewer draws each rotor's thrust arrow
+      * dsim_control/mixer.hpp documents this same table, and
+        test_control.cpp asserts the allocation matrix that follows from it
+
+    Retyping it somewhere would let a viewer draw rotor 1's thrust on rotor 3,
+    which makes a correct controller look broken -- the most expensive kind of
+    bug, because you go looking in the wrong place.
+    """
+    d = round(PARAMS["arm_length_m"] / math.sqrt(2.0), 6)
+    return [
         ("rotor_0",  d,  d, "ccw", 0),   # front-left
         ("rotor_1", -d, -d, "ccw", 1),   # back-right
         ("rotor_2",  d, -d, "cw",  2),   # front-right
         ("rotor_3", -d,  d, "cw",  3),   # back-left
     ]
 
+
+def model_sdf():
+    p = PARAMS
+    d = round(p["arm_length_m"] / math.sqrt(2.0), 6)
+    bx, by, bz = p["body_box_m"]
+    body_mass = round(p["mass_kg"] - 4 * p["rotor_mass_kg"], 6)
+
+    rotors = rotor_layout()
+
     links, plugins = [], []
     for name, x, y, dirn, num in rotors:
         colour = "0.9 0.3 0.1" if x > 0 else "0.2 0.2 0.25"
         links.append(f"""
     <link name="{name}">
-      <pose>{x} {y} 0.02 0 0 0</pose>
+      <pose>{x} {y} {p["rotor_z_m"]} 0 0 0</pose>
       <inertial>
         <mass>{p["rotor_mass_kg"]}</mass>
         <inertia>
@@ -373,6 +393,12 @@ def scene_json():
             "arm": p["arm_length_m"],
             "body": [bx, by, bz],
             "rotor_radius": 0.09,
+            # Hub positions in mixer index order (0 FL, 1 BR, 2 FR, 3 BL) and
+            # the matching spin directions. The viewer draws one thrust arrow
+            # per entry, indexed by the same number the mixer commands, so an
+            # arrow cannot end up on the wrong arm. See rotor_layout().
+            "rotors": [[x, y, p["rotor_z_m"]] for _, x, y, _, _ in rotor_layout()],
+            "rotor_spin": [spin for _, _, _, spin, _ in rotor_layout()],
         },
         "worlds": {
             "empty": {"obstacles": []},

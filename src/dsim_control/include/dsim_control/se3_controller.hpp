@@ -43,6 +43,7 @@ struct ControlDebug
   Eigen::Vector3d position_error {Eigen::Vector3d::Zero()};
   Eigen::Vector3d velocity_error {Eigen::Vector3d::Zero()};
   Eigen::Vector3d attitude_error {Eigen::Vector3d::Zero()};
+  Eigen::Vector3d body_rate_error {Eigen::Vector3d::Zero()};
   Eigen::Vector3d desired_force  {Eigen::Vector3d::Zero()};
   double commanded_tilt_rad {0.0};
   bool   tilt_clamped {false};

@@ -7,6 +7,8 @@
   <license>MIT</license>
   <depend>rclpy</depend>
   <depend>nav_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <test_depend>python3-pytest</test_depend>
   <depend>dsim_msgs</depend>
   <export><build_type>ament_python</build_type></export>
 </package>
