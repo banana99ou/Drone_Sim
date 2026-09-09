@@ -27,7 +27,15 @@ the reported body rate jumps to 626 rad/s while the pose stays perfectly
 smooth. Take angular rates from `/drone/imu`, which is a gyro and measures
 them. The controller does.
 
-There is no sensor-noise model, so `/drone/truth` is ground truth. Your planner
+`/drone/truth` is exactly that -- ground truth, with no noise and no drift. The
+SENSORS are a different matter: `/drone/imu`, `/drone/tof` and
+`/drone/optical_flow` all carry configured noise (see `config/drone.yaml` under
+`drone.sensors`, and `scripts/check_sensors.py`, which measures the live signal
+rather than trusting the config). So a planner can be written against perfect
+state, against realistic sensors, or against both to compare -- but it should
+say which.
+
+Your planner
 sees the true state.
 
 ### Reading back what the controller did

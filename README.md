@@ -199,6 +199,14 @@ world, and it fires in the pillar field at the geometrically predicted moment
 **In:** geometric path planning, obstacle clearance, trajectory feasibility,
 replanning behaviour, collision counting, comparing planners fairly.
 
+**Sensors:** the IMU carries noise derived from a consumer MEMS data sheet
+(gyro 1.0e-3 rad/s, accel 4.4e-2 m/s^2 at 250 Hz), plus a startup bias and a
+slow thermal drift. `make sensors` measures the live signal against the config,
+because two files agreeing that noise exists is not evidence that the simulator
+is applying it -- zeroing the noise makes that check fail 6/6, which is what
+makes a pass mean something. Ground truth on `/drone/truth` stays clean, so a
+planner can be developed against either.
+
 **Out:** state estimation, motor identification, matching a real airframe's
 numbers. The controller's model of the vehicle is exactly right, which is why
 tracking is as good as it is: with perfect state, an exact model and

@@ -4,7 +4,7 @@ export UID := $(shell id -u)
 export GID := $(shell id -g)
 
 .PHONY: help setup build up down shell sim viz stop status test test-overlay \
-        test-viewer verify assets fly telemetry plot clean
+        test-viewer verify assets fly telemetry sensors plot clean
 
 help:
 	@echo "make setup    one-time host setup (sudo: docker group + nvidia toolkit)"
@@ -16,6 +16,7 @@ help:
 	@echo "make verify   mutation check + generated-asset drift check (host, no docker)"
 	@echo "make fly      headless flight check: proves it actually flies"
 	@echo "make telemetry  cross-check a RUNNING sim's control telemetry"
+	@echo "make sensors  measure a RUNNING sim's sensor noise vs its config"
 	@echo "make viz      start the sim + browser viewer, print the URL"
 	@echo "make stop     stop the sim and the viewer"
 	@echo "make status   is it up and publishing?"
@@ -90,6 +91,13 @@ assets:
 # different paths, so agreement is evidence rather than self-report.
 telemetry:
 	python3 scripts/check_telemetry.py
+
+# Measures the live sensor noise against config/drone.yaml. Needs a HOVERING
+# sim: on a still vehicle the spread around zero rate and one g is the noise,
+# where on a moving one the real motion would swamp it.
+#   make viz REFERENCE=hover WORLD=empty
+sensors:
+	$(COMPOSE) exec sim bash -lc "cd /ws && python3 scripts/check_sensors.py"
 
 clean:
 	$(COMPOSE) down -v

@@ -49,6 +49,52 @@ PARAMS = {
     "rolling_moment_coefficient": 1.0e-06,
     "physics_step_s":   0.001,
     "control_rate_hz":  250.0,
+
+    # --- IMU noise ---------------------------------------------------------
+    # Modelled on a decent consumer MEMS IMU (MPU-6000 class) at this sensor
+    # rate, from the data sheet's noise DENSITY integrated over the bandwidth:
+    #   gyro   0.005 deg/s/sqrt(Hz) over 125 Hz  ->  sigma ~= 1.0e-3 rad/s
+    #   accel  400 ug/sqrt(Hz)      over 125 Hz  ->  sigma ~= 4.4e-2 m/s^2
+    # Derived rather than picked, so the numbers mean something and can be
+    # argued with. Set them all to 0.0 and regenerate for clean sensors.
+    #
+    # The gyro figure matters more than it looks: the controller's rotational
+    # loop reads this sensor directly, so gyro noise becomes torque noise at
+    # k_omega times its magnitude. 1e-3 rad/s against body rates of ~1.8 rad/s
+    # is 0.06% -- verified in scripts/check_sensors.py rather than assumed.
+    "imu_gyro_noise_rad_s":    0.001,
+    "imu_gyro_bias_rad_s":     0.0002,
+    "imu_gyro_bias_stddev":    5.0e-05,
+    "imu_accel_noise_m_s2":    0.044,
+    "imu_accel_bias_m_s2":     0.02,
+    "imu_accel_bias_stddev":   0.005,
+    # Bias wanders with temperature; 300 s is plausible for a small airframe
+    # warming up. Gazebo random-walks the bias with this correlation time.
+    "imu_bias_correlation_s":  300.0,
+    "imu_gyro_dynamic_bias":   1.0e-05,
+    "imu_accel_dynamic_bias":  1.0e-03,
+
+    # --- downward rangefinder (ToF) ----------------------------------------
+    # A VL53L1X-class single-beam time-of-flight sensor: a few metres of
+    # useful range, millimetre reporting resolution, and accuracy that
+    # degrades with distance.
+    "tof_min_range_m":         0.03,
+    "tof_max_range_m":         4.0,
+    "tof_fov_rad":             0.47,      # ~27 deg cone
+    "tof_noise_m":             0.01,      # fixed part of the error
+    "tof_noise_frac":          0.01,      # plus 1% of the measured range
+    "tof_resolution_m":        0.001,     # reports whole millimetres
+    "tof_rate_hz":             30.0,
+
+    # --- optical flow ------------------------------------------------------
+    # A PMW3901-class sensor: integrated angular flow plus a quality figure,
+    # only usable within a height band and while roughly level.
+    "flow_rate_hz":            50.0,
+    "flow_noise_rad_s":        0.02,
+    "flow_min_height_m":       0.10,
+    "flow_max_height_m":       3.00,
+    "flow_max_tilt_rad":       0.52,      # 30 deg; past this the ground
+                                          # leaves the field of view
 }
 
 # name, type, x, y, z, sx, sy, sz     (cylinder: sx=radius, sz=length)
@@ -116,6 +162,49 @@ def rotor_layout():
         ("rotor_2",  d, -d, "cw",  2),   # front-right
         ("rotor_3", -d,  d, "cw",  3),   # back-left
     ]
+
+
+def imu_noise():
+    """Per-axis Gaussian noise for the IMU, from PARAMS.
+
+    Written out per axis because that is the shape sdformat wants -- there is
+    no way to say "the same on all three". Generated rather than hand-written
+    so the six identical blocks cannot drift apart, which is exactly the sort
+    of difference nobody notices: a vehicle with noise on two axes and not the
+    third flies subtly differently and looks like a tuning problem.
+    """
+    p = PARAMS
+
+    def axes(indent, stddev, bias_mean, bias_stddev, dyn_bias):
+        pad = " " * indent
+        out = []
+        for axis in ("x", "y", "z"):
+            out.append(
+                f"{pad}<{axis}>\n"
+                f"{pad}  <noise type=\"gaussian\">\n"
+                f"{pad}    <mean>0.0</mean>\n"
+                f"{pad}    <stddev>{stddev}</stddev>\n"
+                f"{pad}    <bias_mean>{bias_mean}</bias_mean>\n"
+                f"{pad}    <bias_stddev>{bias_stddev}</bias_stddev>\n"
+                f"{pad}    <dynamic_bias_stddev>{dyn_bias}</dynamic_bias_stddev>\n"
+                f"{pad}    <dynamic_bias_correlation_time>"
+                f"{p['imu_bias_correlation_s']}"
+                f"</dynamic_bias_correlation_time>\n"
+                f"{pad}  </noise>\n"
+                f"{pad}</{axis}>\n")
+        return "".join(out)
+
+    return (
+        "        <imu>\n"
+        "          <angular_velocity>\n"
+        + axes(12, p["imu_gyro_noise_rad_s"], p["imu_gyro_bias_rad_s"],
+               p["imu_gyro_bias_stddev"], p["imu_gyro_dynamic_bias"])
+        + "          </angular_velocity>\n"
+        "          <linear_acceleration>\n"
+        + axes(12, p["imu_accel_noise_m_s2"], p["imu_accel_bias_m_s2"],
+               p["imu_accel_bias_stddev"], p["imu_accel_dynamic_bias"])
+        + "          </linear_acceleration>\n"
+        "        </imu>\n")
 
 
 def model_sdf():
@@ -222,9 +311,9 @@ def model_sdf():
 
       <sensor name="imu_sensor" type="imu">
         <always_on>1</always_on>
-        <update_rate>250</update_rate>
+        <update_rate>{p["control_rate_hz"]:.0f}</update_rate>
         <topic>drone/imu</topic>
-      </sensor>
+{imu_noise()}      </sensor>
     </link>
 {"".join(links)}
 {"".join(plugins)}
@@ -274,6 +363,31 @@ drone:
     motor_constant: {p["motor_constant"]:.4e}
     moment_constant: {p["moment_constant"]}
     max_rot_velocity: {p["max_rot_velocity"]}
+
+  # Sensors. The IMU noise here MUST match what model.sdf gives the Gazebo
+  # sensor -- both come from the same PARAMS, and scripts/check_sensors.py
+  # measures the live data against these numbers rather than trusting them.
+  sensors:
+    imu:
+      rate_hz: {p["control_rate_hz"]}
+      gyro_noise_rad_s: {p["imu_gyro_noise_rad_s"]:.4e}
+      gyro_bias_rad_s: {p["imu_gyro_bias_rad_s"]:.4e}
+      accel_noise_m_s2: {p["imu_accel_noise_m_s2"]:.4e}
+      accel_bias_m_s2: {p["imu_accel_bias_m_s2"]:.4e}
+    tof:
+      min_range_m: {p["tof_min_range_m"]}
+      max_range_m: {p["tof_max_range_m"]}
+      fov_rad: {p["tof_fov_rad"]}
+      noise_m: {p["tof_noise_m"]:.4e}
+      noise_frac: {p["tof_noise_frac"]:.4e}
+      resolution_m: {p["tof_resolution_m"]:.4e}
+      rate_hz: {p["tof_rate_hz"]}
+    optical_flow:
+      rate_hz: {p["flow_rate_hz"]}
+      noise_rad_s: {p["flow_noise_rad_s"]:.4e}
+      min_height_m: {p["flow_min_height_m"]}
+      max_height_m: {p["flow_max_height_m"]}
+      max_tilt_rad: {p["flow_max_tilt_rad"]}
 """
 
 
