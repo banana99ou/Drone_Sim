@@ -1,0 +1,12 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>dsim_viz</name>
+  <version>0.1.0</version>
+  <description>One-port viewer server: static files plus live state over SSE.</description>
+  <maintainer email="banana99ou@kookmin.ac.kr">JHY</maintainer>
+  <license>MIT</license>
+  <depend>rclpy</depend>
+  <depend>nav_msgs</depend>
+  <depend>dsim_msgs</depend>
+  <export><build_type>ament_python</build_type></export>
+</package>

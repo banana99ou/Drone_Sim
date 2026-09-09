@@ -1,0 +1,20 @@
+# Controller tuning. Separate from config/drone.yaml on purpose: that file
+# describes the VEHICLE (facts about hardware), this one describes the
+# CONTROLLER (choices about how to fly it). Mixing them makes it impossible to
+# tell whether a change altered the plant or the pilot.
+#
+# Starting point only. These were chosen for stable tracking of the built-in
+# reference trajectories, NOT tuned against real quadrotor flight data.
+controller:
+  gains:
+    kp: [6.0, 6.0, 8.0]        # position   -> larger = stiffer, more overshoot
+    kv: [4.0, 4.0, 5.0]        # velocity   -> damping on the position loop
+    kR: [3.0, 3.0, 0.5]        # attitude   -> yaw is deliberately softer
+    komega: [0.5, 0.5, 0.1]    # body rate  -> damping on the attitude loop
+    max_tilt_rad: 0.7          # ~40 deg
+    min_thrust_n: 0.5
+  control_rate_hz: 250.0
+  odom_timeout_s: 0.5
+  start_armed: true
+  odom:
+    twist_in_body_frame: true  # REP-145; verify with scripts/check_twist_frame.py

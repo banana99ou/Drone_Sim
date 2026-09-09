@@ -1,0 +1,7 @@
+# Teleport the vehicle back to a start pose and zero all eval metrics.
+# Use this between planner trials so runs are independent.
+geometry_msgs/Pose start_pose
+bool use_default_start      # true -> ignore start_pose, use the world's default
+---
+bool success
+string message

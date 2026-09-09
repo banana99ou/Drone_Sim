@@ -1,0 +1,25 @@
+# GPU override -- opt in with:
+#   docker compose -f compose.yaml -f compose.gpu.yaml up -d
+#
+# Only worth it for the Gazebo GUI. Headless physics does no rendering, so
+# `make fly` and batch planner trials do not need this.
+#
+# PREREQUISITE on this machine: the NVIDIA CDI spec at /var/run/cdi/nvidia.yaml
+# mounts /run/nvidia-persistenced/socket, but nvidia-persistenced is a `static`
+# systemd unit that never starts, so the socket does not exist and the
+# container refuses to start. Fix with either:
+#
+#   sudo systemctl start nvidia-persistenced          # creates the socket
+#   sudo nvidia-ctk cdi generate --output=/var/run/cdi/nvidia.yaml   # drops it
+#
+# The second is more durable; the first must be repeated after every reboot
+# unless the unit is enabled.
+services:
+  sim:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

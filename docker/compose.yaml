@@ -1,0 +1,53 @@
+services:
+  sim:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        UID: "${UID:-1000}"
+        GID: "${GID:-1000}"
+    image: drone_sim:jazzy-harmonic
+    container_name: drone_sim
+    stdin_open: true
+    tty: true
+    network_mode: host          # ROS 2 DDS discovery + gz transport, no port juggling
+    ipc: host                   # required for X shared memory
+    privileged: false
+    environment:
+      DISPLAY: "${DISPLAY:-:0}"
+      QT_X11_NO_MITSHM: "1"
+      NVIDIA_VISIBLE_DEVICES: all
+      # NOT "all": that makes the runtime mount /run/nvidia-persistenced/socket,
+      # which does not exist unless nvidia-persistenced is running, and the
+      # container then refuses to start. These three are what Gazebo needs.
+      NVIDIA_DRIVER_CAPABILITIES: graphics,compute,utility
+    # GPU passthrough is OPT-IN: add -f compose.gpu.yaml. The physics, IMU and
+    # contact sensing need no rendering at all, so headless runs (and the whole
+    # planner-trial workflow) work with no GPU. See compose.gpu.yaml.
+      ROS_DOMAIN_ID: "${ROS_DOMAIN_ID:-42}"
+      # Gazebo Harmonic + NVIDIA: force the discrete GPU for rendering.
+      __NV_PRIME_RENDER_OFFLOAD: "1"
+      __GLX_VENDOR_LIBRARY_NAME: "nvidia"
+    volumes:
+      # Source lives on the host so you can edit it with your normal tools.
+      - ../src:/ws/src:rw
+      - ../worlds:/ws/worlds:rw
+      - ../config:/ws/config:rw
+      - ../logs:/ws/logs:rw
+      - ../scripts:/ws/scripts:rw
+      - ../web:/ws/web:rw
+      # Your planner repo gets mounted here — see docs/INTERFACE.md
+      # Defaults to an empty placeholder, NOT ../src -- mounting the workspace
+      # twice makes colcon fail on duplicate package names.
+      - "${PLANNER_REPO:-./planner_placeholder}:/ws/planner_src:rw"
+      # Build artifacts stay in fast container-native volumes, NOT on NTFS.
+      - build_cache:/ws/build
+      - install_cache:/ws/install
+      - log_cache:/ws/log
+      # GUI
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      - ${XAUTHORITY:-/home/${USER:-work}/.Xauthority}:/home/dev/.Xauthority:rw
+volumes:
+  build_cache:
+  install_cache:
+  log_cache:

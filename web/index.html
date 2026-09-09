@@ -1,0 +1,543 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<title>Drone_Sim viewer</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; overflow: hidden;
+    background: #0d0f14; color: #e6e8ef;
+    font: 13px/1.45 ui-sans-serif, -apple-system, "SF Pro Text", system-ui, sans-serif; }
+  #view { display: block; width: 100vw; height: 100vh; touch-action: none; cursor: grab; }
+  #view.dragging { cursor: grabbing; }
+  .panel { position: fixed; background: rgba(18,21,28,.86); border: 1px solid #2a2f3d;
+    border-radius: 10px; padding: 10px 12px; backdrop-filter: blur(8px); }
+  #hud { top: 12px; left: 12px; min-width: 208px; }
+  #hud h1 { margin: 0 0 8px; font-size: 13px; letter-spacing: .02em; font-weight: 650; }
+  #hud table { border-collapse: collapse; width: 100%; }
+  #hud td { padding: 2px 0; font-variant-numeric: tabular-nums; }
+  #hud td:first-child { color: #8b93a7; padding-right: 14px; }
+  #hud td:last-child { text-align: right; font-weight: 600; }
+  #ctl { top: 12px; right: 12px; }
+  #ctl label { display: block; color: #8b93a7; margin-bottom: 4px; font-size: 11px;
+    text-transform: uppercase; letter-spacing: .06em; }
+  #ctl select, #ctl button { background: #1b1f2a; color: #e6e8ef; border: 1px solid #333a4a;
+    border-radius: 6px; padding: 5px 8px; font: inherit; width: 100%; }
+  #ctl button { margin-top: 6px; cursor: pointer; }
+  #ctl button:hover { background: #232837; }
+  #help { bottom: 12px; left: 12px; color: #7b8398; font-size: 11px; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+    margin-right: 6px; vertical-align: 1px; }
+  .up { background: #34d399; } .down { background: #f87171; }
+  .bad { color: #f87171 !important; }
+  .good { color: #34d399 !important; }
+</style>
+
+<canvas id="view"></canvas>
+
+<div id="hud" class="panel">
+  <h1><span id="link" class="dot down"></span><span id="linktext">connecting…</span></h1>
+  <table>
+    <tr><td>altitude</td><td id="alt">—</td></tr>
+    <tr><td>speed</td><td id="spd">—</td></tr>
+    <tr><td>tracking err</td><td id="err">—</td></tr>
+    <tr><td>RMSE</td><td id="rmse">—</td></tr>
+    <tr><td>clearance</td><td id="clr">—</td></tr>
+    <tr><td>collision</td><td id="col">—</td></tr>
+    <tr><td>elapsed</td><td id="ela">—</td></tr>
+  </table>
+</div>
+
+<div id="ctl" class="panel">
+  <label for="world">obstacle course</label>
+  <select id="world"></select>
+  <button id="reset">reset view</button>
+  <button id="clear">clear trails</button>
+</div>
+
+<div id="help" class="panel">drag orbit · wheel/pinch zoom · shift-drag pan</div>
+
+<script>
+"use strict";
+// ---------------------------------------------------------------------------
+// Drone_Sim remote viewer.
+//
+// Streams STATE (a pose is 7 floats) over a same-origin Server-Sent Events
+// stream and renders it here, instead of streaming video of a Gazebo GUI.
+// That choice matters: video
+// would need a virtual display, a software GL rasteriser and an H.264 encoder
+// on the sim host for a blurry, laggy result, where this is a few KB/s and
+// renders crisply at whatever resolution the viewing device has.
+//
+// Deliberately dependency-free: no three.js, no CDN, no ES-module loader. The
+// scene is a grid, some boxes and cylinders, a drone and two polylines, which
+// is little enough that hand-rolled projection beats carrying a 3D engine --
+// and it works in Safari and on an iPad with nothing installed.
+//
+// World frame is ROS convention: +z up, +x forward, +y left.
+// ---------------------------------------------------------------------------
+
+const POLL_HZ = 10;              // only used if the event-stream fails
+const TRAIL_MAX = 4000;          // ~2 min of trail at 30 Hz
+// The server already throttles the stream to ~30 Hz.
+
+const canvas = document.getElementById("view");
+const ctx = canvas.getContext("2d");
+
+// ---- state ---------------------------------------------------------------
+const S = {
+  scene: null,
+  world: "pillars",
+  pose: null,            // {p:[x,y,z], q:[w,x,y,z]}
+  vel: [0, 0, 0],
+  setpoint: null,
+  flown: [],
+  planned: [],
+  status: null,
+  connected: false,
+};
+
+// ---- camera --------------------------------------------------------------
+const CAM_HOME = { az: -0.9, el: 0.42, dist: 11, target: [0, 0, 1.0] };
+let cam = Object.assign({}, CAM_HOME, { target: CAM_HOME.target.slice() });
+
+// ---- small vector / matrix helpers ---------------------------------------
+const sub = (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+const add = (a, b) => [a[0] + b[0], a[1] + b[1], a[2] + b[2]];
+const scale = (a, s) => [a[0] * s, a[1] * s, a[2] * s];
+const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+const cross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2],
+                         a[0] * b[1] - a[1] * b[0]];
+const norm = (a) => { const l = Math.hypot(a[0], a[1], a[2]) || 1; return scale(a, 1 / l); };
+
+/// Hamilton quaternion (w,x,y,z) -> rotation matrix, rows as basis vectors.
+function quatMat(q) {
+  const [w, x, y, z] = q;
+  return [
+    [1 - 2 * (y * y + z * z), 2 * (x * y - z * w),     2 * (x * z + y * w)],
+    [2 * (x * y + z * w),     1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+    [2 * (x * z - y * w),     2 * (y * z + x * w),     1 - 2 * (x * x + y * y)],
+  ];
+}
+const applyMat = (M, v) => [dot(M[0], v), dot(M[1], v), dot(M[2], v)];
+
+// ---- projection ----------------------------------------------------------
+let VIEW = null;
+function buildView() {
+  const ce = Math.cos(cam.el), se = Math.sin(cam.el);
+  const eye = add(cam.target, [cam.dist * ce * Math.cos(cam.az),
+                               cam.dist * ce * Math.sin(cam.az),
+                               cam.dist * se]);
+  const fwd = norm(sub(cam.target, eye));
+  const worldUp = [0, 0, 1];
+  let right = cross(fwd, worldUp);
+  if (Math.hypot(right[0], right[1], right[2]) < 1e-6) right = [1, 0, 0];
+  right = norm(right);
+  const up = cross(right, fwd);
+  const w = canvas.width, h = canvas.height;
+  VIEW = { eye, right, up, fwd, w, h, f: 0.5 * h / Math.tan(0.5 * 0.9) };
+}
+
+/// world point -> {x, y, depth}. depth <= 0 means behind the camera.
+function project(p) {
+  const d = sub(p, VIEW.eye);
+  const z = dot(d, VIEW.fwd);
+  if (z <= 0.02) return { x: 0, y: 0, depth: z };
+  const inv = VIEW.f / z;
+  return { x: VIEW.w * 0.5 + dot(d, VIEW.right) * inv,
+           y: VIEW.h * 0.5 - dot(d, VIEW.up) * inv,
+           depth: z };
+}
+
+// ---- geometry ------------------------------------------------------------
+/// Faces are {pts:[world...], fill, stroke, alpha}; drawn back-to-front.
+function boxFaces(cx, cy, cz, sx, sy, sz, fill) {
+  const hx = sx / 2, hy = sy / 2, hz = sz / 2;
+  const v = [
+    [cx - hx, cy - hy, cz - hz], [cx + hx, cy - hy, cz - hz],
+    [cx + hx, cy + hy, cz - hz], [cx - hx, cy + hy, cz - hz],
+    [cx - hx, cy - hy, cz + hz], [cx + hx, cy - hy, cz + hz],
+    [cx + hx, cy + hy, cz + hz], [cx - hx, cy + hy, cz + hz],
+  ];
+  const quads = [[0,1,2,3],[4,5,6,7],[0,1,5,4],[1,2,6,5],[2,3,7,6],[3,0,4,7]];
+  // crude flat shading: top brightest, sides by orientation
+  const shade = [0.55, 1.0, 0.78, 0.68, 0.78, 0.68];
+  return quads.map((q, i) => ({
+    pts: q.map((k) => v[k]), fill: shadeHex(fill, shade[i]), stroke: null, alpha: 1,
+  }));
+}
+
+function cylinderFaces(cx, cy, cz, r, hgt, fill, seg = 20) {
+  const hz = hgt / 2, faces = [], ring = [];
+  for (let i = 0; i < seg; i++) {
+    const a = (i / seg) * Math.PI * 2;
+    ring.push([cx + r * Math.cos(a), cy + r * Math.sin(a)]);
+  }
+  for (let i = 0; i < seg; i++) {
+    const a = ring[i], b = ring[(i + 1) % seg];
+    // shade by how much the wall faces the camera's azimuth
+    const mid = (i + 0.5) / seg * Math.PI * 2;
+    const s = 0.55 + 0.45 * Math.max(0, Math.cos(mid - cam.az - Math.PI));
+    faces.push({ pts: [[a[0], a[1], cz - hz], [b[0], b[1], cz - hz],
+                       [b[0], b[1], cz + hz], [a[0], a[1], cz + hz]],
+                 fill: shadeHex(fill, s), stroke: null, alpha: 1 });
+  }
+  faces.push({ pts: ring.map((a) => [a[0], a[1], cz + hz]),
+               fill: shadeHex(fill, 1.05), stroke: null, alpha: 1 });
+  return faces;
+}
+
+function shadeHex(hex, k) {
+  const n = parseInt(hex.slice(1), 16);
+  const r = Math.min(255, Math.round(((n >> 16) & 255) * k));
+  const g = Math.min(255, Math.round(((n >> 8) & 255) * k));
+  const b = Math.min(255, Math.round((n & 255) * k));
+  return `rgb(${r},${g},${b})`;
+}
+
+function droneFaces() {
+  if (!S.pose) return [];
+  const M = quatMat(S.pose.q), p = S.pose.p;
+  const g = S.scene.drone;
+  const [bx, by, bz] = g.body;
+  const d = g.arm / Math.SQRT2;
+  const toWorld = (local) => add(p, applyMat(M, local));
+  const faces = [];
+
+  // body, as an oriented box
+  const hx = bx / 2, hy = by / 2, hz = bz / 2;
+  const local = [
+    [-hx,-hy,-hz],[hx,-hy,-hz],[hx,hy,-hz],[-hx,hy,-hz],
+    [-hx,-hy,hz],[hx,-hy,hz],[hx,hy,hz],[-hx,hy,hz]];
+  const v = local.map(toWorld);
+  const quads = [[0,1,2,3],[4,5,6,7],[0,1,5,4],[1,2,6,5],[2,3,7,6],[3,0,4,7]];
+  const shade = [0.5,1.0,0.75,0.65,0.75,0.65];
+  quads.forEach((q, i) => faces.push({
+    pts: q.map((k) => v[k]), fill: shadeHex("#3d4655", shade[i]), stroke: null, alpha: 1 }));
+
+  // rotors: front pair red so heading is readable at a glance
+  const rotors = [[ d,  d, "#ef4444"], [-d, -d, "#94a3b8"],
+                  [ d, -d, "#ef4444"], [-d,  d, "#94a3b8"]];
+  for (const [rx, ry, col] of rotors) {
+    const ring = [];
+    for (let i = 0; i < 14; i++) {
+      const a = (i / 14) * Math.PI * 2;
+      ring.push(toWorld([rx + g.rotor_radius * Math.cos(a),
+                         ry + g.rotor_radius * Math.sin(a), 0.02]));
+    }
+    faces.push({ pts: ring, fill: col, stroke: null, alpha: 0.92 });
+    // arm
+    faces.push({ pts: [toWorld([0, 0, 0.0]), toWorld([rx, ry, 0.012]),
+                       toWorld([rx, ry, -0.012])],
+                 fill: "#2b3240", stroke: null, alpha: 1 });
+  }
+  return faces;
+}
+
+// ---- drawing -------------------------------------------------------------
+function drawFaces(faces) {
+  const drawable = [];
+  for (const f of faces) {
+    const ps = f.pts.map(project);
+    if (ps.some((q) => q.depth <= 0.02)) continue;      // clip anything behind us
+    let z = 0; for (const q of ps) z += q.depth;
+    drawable.push({ ps, z: z / ps.length, f });
+  }
+  drawable.sort((a, b) => b.z - a.z);                   // painter's algorithm
+  for (const d of drawable) {
+    ctx.beginPath();
+    ctx.moveTo(d.ps[0].x, d.ps[0].y);
+    for (let i = 1; i < d.ps.length; i++) ctx.lineTo(d.ps[i].x, d.ps[i].y);
+    ctx.closePath();
+    ctx.globalAlpha = d.f.alpha;
+    ctx.fillStyle = d.f.fill;
+    ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+}
+
+function drawPolyline(pts, colour, width, dashed) {
+  if (pts.length < 2) return;
+  ctx.save();
+  ctx.strokeStyle = colour;
+  ctx.lineWidth = width;
+  ctx.lineJoin = "round";
+  if (dashed) ctx.setLineDash([7, 6]);
+  ctx.beginPath();
+  let pen = false;
+  for (const p of pts) {
+    const q = project(p);
+    if (q.depth <= 0.02) { pen = false; continue; }
+    if (!pen) { ctx.moveTo(q.x, q.y); pen = true; } else { ctx.lineTo(q.x, q.y); }
+  }
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawGrid() {
+  const N = 8, step = 1;
+  ctx.save();
+  ctx.lineWidth = 1;
+  for (let i = -N; i <= N; i++) {
+    const major = i === 0;
+    ctx.strokeStyle = major ? "#3d4763" : "#20242f";
+    for (const seg of [[[i * step, -N * step, 0], [i * step, N * step, 0]],
+                       [[-N * step, i * step, 0], [N * step, i * step, 0]]]) {
+      const a = project(seg[0]), b = project(seg[1]);
+      if (a.depth <= 0.02 || b.depth <= 0.02) continue;
+      ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+    }
+  }
+  ctx.restore();
+}
+
+/// The collision envelope, drawn as a ring on the ground under the vehicle.
+/// This is the radius a planner must keep clear, so it is worth seeing.
+function drawEnvelope() {
+  if (!S.pose) return;
+  const r = S.scene.drone.radius, p = S.pose.p, pts = [];
+  for (let i = 0; i <= 36; i++) {
+    const a = (i / 36) * Math.PI * 2;
+    pts.push([p[0] + r * Math.cos(a), p[1] + r * Math.sin(a), 0.005]);
+  }
+  drawPolyline(pts, "rgba(96,165,250,.5)", 1.5, false);
+  const g = project([p[0], p[1], 0.005]), t = project(p);
+  if (g.depth > 0.02 && t.depth > 0.02) {
+    ctx.save(); ctx.strokeStyle = "rgba(96,165,250,.28)"; ctx.setLineDash([3, 5]);
+    ctx.beginPath(); ctx.moveTo(g.x, g.y); ctx.lineTo(t.x, t.y); ctx.stroke(); ctx.restore();
+  }
+}
+
+function render() {
+  // Same reasoning as updateHud: keep the rAF chain alive across a bad frame.
+  try {
+    renderOnce();
+  } catch (e) {
+    hudError = "render: " + ((e && e.message) ? e.message : String(e));
+  }
+  requestAnimationFrame(render);
+}
+
+function renderOnce() {
+  buildView();
+  ctx.fillStyle = "#0d0f14";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  if (!S.scene) { return; }
+
+  drawGrid();
+
+  const faces = [];
+  for (const o of (S.scene.worlds[S.world] || { obstacles: [] }).obstacles) {
+    const [x, y, z] = o.pose, [sx, sy, sz] = o.size;
+    if (o.type === "cylinder") faces.push(...cylinderFaces(x, y, z, sx, sz, "#8d5a3c"));
+    else faces.push(...boxFaces(x, y, z, sx, sy, sz, "#8d5a3c"));
+  }
+  faces.push(...droneFaces());
+  drawFaces(faces);
+
+  drawPolyline(S.planned, "rgba(248,113,113,.85)", 2, true);
+  drawPolyline(S.flown, "rgba(96,165,250,.95)", 2, false);
+  drawEnvelope();
+}
+
+// ---- HUD -----------------------------------------------------------------
+const el = (id) => document.getElementById(id);
+function updateHud() {
+  // The body is wrapped and the reschedule sits OUTSIDE it on purpose: this
+  // loop re-arms itself with setTimeout, so a single exception on one frame
+  // would kill the HUD permanently while the render loop kept going -- which
+  // looks exactly like "the drone moves but the numbers are dead".
+  try {
+    updateHudOnce();
+  } catch (e) {
+    hudError = (e && e.message) ? e.message : String(e);
+  }
+  setTimeout(updateHud, 100);
+}
+
+let hudError = "";
+function updateHudOnce() {
+  el("link").className = "dot " + (S.connected ? "up" : "down");
+  el("linktext").textContent = hudError ? ("hud error: " + hudError)
+    : (S.connected ? "live" : ("disconnected" + (lastUrl ? " — " + lastUrl : "")));
+  if (S.pose) {
+    el("alt").textContent = S.pose.p[2].toFixed(2) + " m";
+    el("spd").textContent = Math.hypot(S.vel[0], S.vel[1], S.vel[2]).toFixed(2) + " m/s";
+  }
+  const st = S.status;
+  if (st) {
+    el("err").textContent = (st.tracking_error_m * 100).toFixed(1) + " cm";
+    el("rmse").textContent = (st.tracking_rmse_m * 100).toFixed(1) + " cm";
+    const c = st.min_obstacle_clearance_m;
+    el("clr").textContent = (c === null || Number.isNaN(c)) ? "n/a" : c.toFixed(2) + " m";
+    el("clr").className = (c !== null && !Number.isNaN(c) && c < 0) ? "bad" : "";
+    el("col").textContent = st.collided ? "HIT (" + st.collision_count + ")" : "clear";
+    el("col").className = st.collided ? "bad" : "good";
+    el("ela").textContent = st.elapsed_s.toFixed(1) + " s";
+  }
+}
+
+// ---- live state (Server-Sent Events, same origin) ------------------------
+// Plain HTTP on the same port as this page: no second origin, no upgrade
+// handshake, no mixed-content problem if served over HTTPS, and `curl /state`
+// shows exactly what the page sees.
+let lastUrl = "";
+let source = null;
+let pollTimer = null;
+let failures = 0;
+
+function ingest(snap) {
+  if (!snap) return;
+  if (snap.pose) {
+    const changed = !S.pose || S.pose.p[0] !== snap.pose.p[0] ||
+                    S.pose.p[1] !== snap.pose.p[1] || S.pose.p[2] !== snap.pose.p[2];
+    S.pose = snap.pose;
+    if (changed) {
+      S.flown.push(snap.pose.p);
+      if (S.flown.length > TRAIL_MAX) S.flown.shift();
+    }
+  }
+  if (snap.vel) S.vel = snap.vel;
+  if (snap.setpoint) {
+    const sp = snap.setpoint;
+    const prev = S.planned[S.planned.length - 1];
+    if (!prev || prev[0] !== sp[0] || prev[1] !== sp[1] || prev[2] !== sp[2]) {
+      S.planned.push(sp);
+      if (S.planned.length > TRAIL_MAX) S.planned.shift();
+    }
+  }
+  if (snap.status) S.status = snap.status;
+}
+
+function startPolling() {
+  if (pollTimer) return;
+  lastUrl = "/snapshot (polling)";
+  pollTimer = setInterval(() => {
+    fetch("/snapshot", { cache: "no-store" })
+      .then((r) => r.json())
+      .then((snap) => { S.connected = true; ingest(snap); })
+      .catch(() => { S.connected = false; });
+  }, 1000 / POLL_HZ);
+}
+
+function connect() {
+  lastUrl = "/state";
+  if (typeof EventSource === "undefined") { startPolling(); return; }
+  source = new EventSource("/state");
+  source.onopen = () => { S.connected = true; failures = 0; };
+  source.onmessage = (ev) => {
+    S.connected = true;
+    failures = 0;
+    try { ingest(JSON.parse(ev.data)); } catch (_) { /* partial frame */ }
+  };
+  source.onerror = () => {
+    S.connected = false;
+    // EventSource retries on its own, which is what we want while the sim is
+    // being restarted. Only if it keeps failing do we drop to polling, so a
+    // browser or proxy that dislikes event-streams still shows the drone.
+    if (++failures >= 4) {
+      source.close();
+      startPolling();
+    }
+  };
+}
+
+// ---- input ---------------------------------------------------------------
+function resize() {
+  const r = window.devicePixelRatio || 1;
+  canvas.width = Math.floor(window.innerWidth * r);
+  canvas.height = Math.floor(window.innerHeight * r);
+  canvas.style.width = window.innerWidth + "px";
+  canvas.style.height = window.innerHeight + "px";
+}
+window.addEventListener("resize", resize);
+
+let drag = null;
+canvas.addEventListener("pointerdown", (e) => {
+  drag = { x: e.clientX, y: e.clientY, pan: e.shiftKey };
+  canvas.classList.add("dragging");
+  canvas.setPointerCapture(e.pointerId);
+});
+canvas.addEventListener("pointermove", (e) => {
+  if (!drag) return;
+  const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
+  drag.x = e.clientX; drag.y = e.clientY;
+  if (drag.pan) {
+    const k = cam.dist * 0.0016;
+    const right = VIEW ? VIEW.right : [1, 0, 0];
+    const up = VIEW ? VIEW.up : [0, 0, 1];
+    cam.target = add(cam.target, add(scale(right, -dx * k), scale(up, dy * k)));
+  } else {
+    cam.az -= dx * 0.006;
+    cam.el = Math.max(-1.45, Math.min(1.45, cam.el + dy * 0.006));
+  }
+});
+const endDrag = () => { drag = null; canvas.classList.remove("dragging"); };
+canvas.addEventListener("pointerup", endDrag);
+canvas.addEventListener("pointercancel", endDrag);
+canvas.addEventListener("wheel", (e) => {
+  e.preventDefault();
+  cam.dist = Math.max(1.2, Math.min(60, cam.dist * Math.exp(e.deltaY * 0.0013)));
+}, { passive: false });
+
+// pinch zoom for trackpad / touch
+let pinch = null;
+canvas.addEventListener("touchstart", (e) => {
+  if (e.touches.length === 2) {
+    pinch = Math.hypot(e.touches[0].clientX - e.touches[1].clientX,
+                       e.touches[0].clientY - e.touches[1].clientY);
+  }
+});
+canvas.addEventListener("touchmove", (e) => {
+  if (e.touches.length === 2 && pinch) {
+    const d = Math.hypot(e.touches[0].clientX - e.touches[1].clientX,
+                         e.touches[0].clientY - e.touches[1].clientY);
+    cam.dist = Math.max(1.2, Math.min(60, cam.dist * pinch / d));
+    pinch = d;
+    e.preventDefault();
+  }
+}, { passive: false });
+canvas.addEventListener("touchend", () => { pinch = null; });
+
+el("reset").onclick = () => {
+  cam = Object.assign({}, CAM_HOME, { target: CAM_HOME.target.slice() });
+};
+el("clear").onclick = () => { S.flown = []; S.planned = []; };
+el("world").onchange = (e) => {
+  S.world = e.target.value;
+  localStorage.setItem("dsim.world", S.world);
+};
+
+// ---- boot ----------------------------------------------------------------
+resize();
+fetch("scene.json").then((r) => r.json()).then((scene) => {
+  S.scene = scene;
+  const sel = el("world");
+  for (const name of Object.keys(scene.worlds)) {
+    const o = document.createElement("option");
+    o.value = name; o.textContent = name;
+    sel.appendChild(o);
+  }
+  try {
+    const saved = localStorage.getItem("dsim.world");
+    if (saved && scene.worlds[saved]) S.world = saved;
+  } catch (_) { /* private browsing */ }
+  // What the sim is ACTUALLY running wins over the remembered choice: drawing
+  // obstacles that are not in the running world would be worse than useless.
+  fetch("current.json", { cache: "no-store" })
+    .then((r) => r.json())
+    .then((cur) => {
+      if (cur && cur.world && scene.worlds[cur.world]) {
+        S.world = cur.world;
+        sel.value = S.world;
+      }
+    })
+    .catch(() => { /* viz launched without it; dropdown stays manual */ });
+  sel.value = S.world;
+}).catch(() => {
+  document.getElementById("linktext").textContent = "scene.json missing";
+});
+connect();
+updateHud();
+render();
+</script>

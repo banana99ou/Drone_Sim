@@ -1,0 +1,10 @@
+build/
+install/
+log/
+logs/*.csv
+__pycache__/
+*.pyc
+logs/*.svg
+web/current.json
+logs/.sim.pid
+logs/sim.log

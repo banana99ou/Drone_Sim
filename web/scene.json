@@ -1,0 +1,120 @@
+{
+  "_generated_by": "scripts/gen_assets.py -- do not edit",
+  "drone": {
+    "radius": 0.3,
+    "arm": 0.2,
+    "body": [
+      0.16,
+      0.16,
+      0.08
+    ],
+    "rotor_radius": 0.09
+  },
+  "worlds": {
+    "empty": {
+      "obstacles": []
+    },
+    "pillars": {
+      "obstacles": [
+        {
+          "name": "pillar_a",
+          "type": "cylinder",
+          "pose": [
+            -3.0,
+            1.2,
+            1.5
+          ],
+          "size": [
+            0.3,
+            0.3,
+            3.0
+          ]
+        },
+        {
+          "name": "pillar_b",
+          "type": "cylinder",
+          "pose": [
+            -1.0,
+            -1.5,
+            1.5
+          ],
+          "size": [
+            0.3,
+            0.3,
+            3.0
+          ]
+        },
+        {
+          "name": "pillar_c",
+          "type": "cylinder",
+          "pose": [
+            1.2,
+            1.8,
+            1.5
+          ],
+          "size": [
+            0.3,
+            0.3,
+            3.0
+          ]
+        },
+        {
+          "name": "pillar_d",
+          "type": "cylinder",
+          "pose": [
+            3.2,
+            -1.0,
+            1.5
+          ],
+          "size": [
+            0.3,
+            0.3,
+            3.0
+          ]
+        },
+        {
+          "name": "wall_gap_l",
+          "type": "box",
+          "pose": [
+            0.0,
+            3.2,
+            1.2
+          ],
+          "size": [
+            0.3,
+            2.4,
+            2.4
+          ]
+        },
+        {
+          "name": "wall_gap_r",
+          "type": "box",
+          "pose": [
+            0.0,
+            -3.2,
+            1.2
+          ],
+          "size": [
+            0.3,
+            2.4,
+            2.4
+          ]
+        },
+        {
+          "name": "low_beam",
+          "type": "box",
+          "pose": [
+            5.0,
+            0.0,
+            2.2
+          ],
+          "size": [
+            0.4,
+            6.0,
+            0.4
+          ]
+        }
+      ]
+    }
+  }
+}

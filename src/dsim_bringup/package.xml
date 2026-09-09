@@ -1,0 +1,16 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>dsim_bringup</name>
+  <version>0.1.0</version>
+  <description>Launch files wiring Gazebo, the bridge, the controller and the referee together.</description>
+  <maintainer email="banana99ou@gmail.com">JHY</maintainer>
+  <license>MIT</license>
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <exec_depend>ros_gz_sim</exec_depend>
+  <exec_depend>ros_gz_bridge</exec_depend>
+  <exec_depend>dsim_control</exec_depend>
+  <exec_depend>dsim_eval</exec_depend>
+  <exec_depend>dsim_description</exec_depend>
+  <exec_depend>rviz2</exec_depend>
+  <export><build_type>ament_cmake</build_type></export>
+</package>
