@@ -104,7 +104,7 @@ fi
 
 echo "== sampling (1 publisher confirmed) =="
 STATUS="$(timeout 15 ros2 topic echo /drone/eval/status dsim_msgs/msg/FlightStatus --once 2>/dev/null)"
-ODOM="$(timeout 15 ros2 topic echo /drone/odom nav_msgs/msg/Odometry --once 2>/dev/null)"
+ODOM="$(timeout 15 ros2 topic echo /drone/truth nav_msgs/msg/Odometry --once 2>/dev/null)"
 
 if [ -z "$STATUS" ]; then
   echo "FAIL: no /drone/eval/status published. Last lines:"

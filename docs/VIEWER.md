@@ -72,7 +72,29 @@ To undo: `sudo tailscale serve reset`. To stop needing `sudo` for this:
 ## Controls
 
 drag to orbit · wheel or pinch to zoom · shift-drag to pan · **reset view** ·
-**clear trails**. The obstacle-course selector follows whatever world the sim
+**clear trails**.
+
+### Pausing and slowing the simulation
+
+**pause / resume** freezes the physics, and the **speed** slider sets the
+real-time factor from 0.05× to 4×. Useful for watching a manoeuvre frame by
+frame, and for running faster than real time when you only want the result.
+
+The speed applies on release, not on every drag pixel: each change is a service
+call into Gazebo, and forty of them while dragging would be forty subprocesses.
+The HUD's `simulator` row reports what the server **observed** afterwards, not
+what was requested — so if a command fails, or someone pauses from the Gazebo
+GUI, the number tells the truth rather than the intent.
+
+Above about 2× the 1 ms physics step stops keeping up on this machine, and the
+simulator quietly fails to reach the target instead of running faster. The
+observed factor is what to trust; that is why it is displayed.
+
+### Frame rate
+
+The HUD shows the page's own render rate. It exists because "it feels slower"
+is not something you can act on, and because the viewer's cost is the one thing
+a remote user can see directly. The obstacle-course selector follows whatever world the sim
 is actually running (written to `web/current.json` at launch) so it cannot draw
 a course that is not there; you can still override it manually.
 
@@ -220,13 +242,43 @@ project and has no dependencies.
 | `web/js/telemetry.js` | the event stream and its fallback | — |
 | `web/js/app.js` | state, HUD, input, the frame loop | — |
 
+## Cost: the viewer must never slow the physics
+
+It did, and by a lot. With **no browser connected at all**, `viz_server` was
+using 62% of a CPU core — more than Gazebo's own 55%. Two causes, both measured
+rather than guessed:
+
+| cause | cost | fix |
+|---|---|---|
+| `use_sim_time: True` on the viewer | ~50% of a core | It is now `False`. That parameter makes rclpy subscribe to `/clock`, which the bridge publishes at the 1 ms physics step — **1000 messages a second** into a Python process, for a clock the viewer never reads. |
+| four 250 Hz subscriptions | ~12% per topic | `dsim_eval`'s `viz_relay_node` decimates them to `/drone/viz/*` at 30 Hz in C++. The cost is inside rclpy's ingestion path, *before* any callback runs, so decimating in the viewer saves nothing. |
+
+Result: **62% → 5.3%**, and Gazebo itself dropped from 55% to 50% with the
+contention gone. Real-time factor stays at 0.9999.
+
+The full-rate topics are untouched. That matters: `/drone/control_debug` at
+250 Hz is what caught a 10 ms once-per-lap saturation event, and decimating the
+original would have hidden it. The relay adds a slow copy; it never slows the
+source.
+
 ## Security
 
 `bind` defaults to `0.0.0.0`, so the port is reachable from your LAN, not only
-the tailnet. What limits the damage is that the server is **read-only by
-construction**: `dsim_viz` exposes only `GET /`, `GET /snapshot` and
-`GET /state`. There is no endpoint that writes anything to ROS, so reaching
-this port cannot arm a vehicle or retune a controller.
+the tailnet.
+
+Every `GET` is read-only. The **one** write path is `POST /control`, and it can
+express exactly two things: paused, and a range-checked real-time factor. It
+cannot arm a vehicle, retune a controller, move the drone, or run a command —
+the world name comes from the launch file rather than the request, and the gz
+command is built as an argument list, never a shell string, so nothing from the
+network can be read as shell syntax. Validation lives in
+`dsim_viz/simcontrol.py` and is unit-tested.
+
+To remove the endpoint entirely and get the old read-only guarantee back:
+
+```bash
+ros2 launch dsim_bringup sim.launch.py control:=false
+```
 
 To keep it off the LAN entirely, bind it to the Tailscale interface:
 

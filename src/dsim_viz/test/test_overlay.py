@@ -202,14 +202,20 @@ def test_aero_is_zero_when_the_imu_sees_only_thrust():
 # FAILS IF: the residual is scaled or signed wrongly. An extra 0.2 m/s^2 of
 # measured acceleration on body x, at 1.5 kg, is 0.3 N of aerodynamic force
 # along body x -- computed by hand, not by the code under test.
+#
+# The READOUT must carry the true newtons: the drawn arrow is magnified for
+# legibility (see AERO_MAGNIFY), and if that exaggeration leaked into the
+# number the HUD shows, the viewer would be reporting a force five times
+# larger than the one being measured.
 def test_aero_equals_mass_times_the_unexplained_acceleration():
     extra = 0.2
     r = overlay.build(pose(), control(), imu([extra, 0.0, WEIGHT / MASS]))
     assert r['readout']['aero_n'] == pytest.approx(MASS * extra)
     aero = arrows_of(r, 'aero')[0]
     delta = [aero['to'][k] - aero['from'][k] for k in range(3)]
-    assert delta == pytest.approx(
-        [MASS * extra * overlay.SCALE['force_m_per_n'], 0.0, 0.0], abs=TOL)
+    drawn = MASS * extra * overlay.SCALE['force_m_per_n'] * overlay.AERO_MAGNIFY
+    assert delta == pytest.approx([drawn, 0.0, 0.0], abs=TOL)
+    assert delta[0] > 0, 'drag along +x must be drawn along +x'
 
 
 # FAILS IF: "no IMU yet" is reported as "no drag". Those are different claims
@@ -266,3 +272,53 @@ def test_every_arrow_belongs_to_a_known_group():
     assert r['arrows']
     for a in r['arrows']:
         assert a['group'] in overlay.GROUPS
+
+
+# FAILS IF: the aero arrow is drawn at the shared force scale again. At 0.35 N
+# that is 17 mm, which the renderer discards as shorter than its own 2 px
+# floor -- the arrow silently does not exist. It must be magnified, and by
+# exactly the factor its label advertises, or the label is a lie.
+def test_aero_arrow_is_magnified_by_the_factor_it_advertises():
+    r = overlay.build(pose(), control(), imu([0.2, 0.0, WEIGHT / MASS]))
+    aero = arrows_of(r, 'aero')[0]
+    plain = MASS * 0.2 * overlay.SCALE['force_m_per_n']
+    assert length(aero) == pytest.approx(plain * overlay.AERO_MAGNIFY, abs=TOL)
+    assert f'x{overlay.AERO_MAGNIFY:.0f}' in aero['label']
+    # The true value stays in the label; only the drawn length is exaggerated.
+    assert f'{MASS * 0.2:.2f} N' in aero['label']
+
+
+# FAILS IF: an arrow can grow without bound. One bad gyro sample used to demand
+# 2.55 N.m, which at the torque scale is a 51 m arrow -- 170x the collision
+# envelope, flashing across the whole scene. A clamp is what stops a broken
+# input from taking over the picture.
+def test_absurd_torque_is_clamped_and_says_so():
+    r = overlay.build(pose(), control(realised_torque_nm=[2.5456, 0.0, 0.0]),
+                      hover_imu())
+    tau = arrows_of(r, 'torque')[0]
+    assert length(tau) == pytest.approx(overlay.MAX_ARROW_M, abs=TOL)
+    assert tau['clamped'] is True
+    # ...and the label still reports what was really demanded, unclamped.
+    assert '2.546' in tau['label']
+
+
+# FAILS IF: ordinary arrows are marked clamped. The flag drives a different
+# stroke in the page, so a false positive would make every normal frame look
+# like a fault.
+def test_normal_arrows_are_not_clamped():
+    r = overlay.build(pose(), control(realised_torque_nm=[0.0175, 0.0, 0.0]),
+                      imu([0.2, 0.0, WEIGHT / MASS]))
+    assert r['arrows']
+    for a in r['arrows']:
+        assert a['clamped'] is False, f"{a['kind']} was clamped unexpectedly"
+
+
+# FAILS IF: the torque scale drifts back to something that draws a 4 px stub.
+# A steady turn on this airframe is about 0.017 N.m; at the default camera
+# distance the viewer needs roughly 0.3 m of arrow for that to be legible and
+# carry a label.
+def test_typical_torque_is_long_enough_to_read():
+    r = overlay.build(pose(), control(realised_torque_nm=[0.0, 0.0, 0.0175]),
+                      hover_imu())
+    tau = arrows_of(r, 'torque')[0]
+    assert 0.25 < length(tau) < overlay.MAX_ARROW_M

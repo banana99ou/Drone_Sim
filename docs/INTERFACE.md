@@ -7,14 +7,27 @@ publish trajectories, it flies them and scores the result.**
 
 | Direction | Topic | Type | Rate |
 |---|---|---|---|
-| sim → you | `/drone/odom` | `nav_msgs/msg/Odometry` | 250 Hz |
+| sim → you | `/drone/truth` | `nav_msgs/msg/Odometry` | 250 Hz |
 | sim → you | `/drone/eval/status` | `dsim_msgs/msg/FlightStatus` | 20 Hz |
 | **you → sim** | `/drone/trajectory` | `dsim_msgs/msg/Trajectory` | your replan rate |
 | sim → you | `/drone/imu` | `sensor_msgs/msg/Imu` | 250 Hz |
 | sim → you | `/drone/control_debug` | `dsim_msgs/msg/ControlDebug` | 250 Hz |
 | sim → you | `/drone/setpoint` | `dsim_msgs/msg/TrajectorySetpoint` | 250 Hz |
 
-There is no sensor-noise model, so `/drone/odom` is ground truth. Your planner
+**Renamed:** this topic was `/drone/odom` until it was pointed out that nothing
+here is odometry — it is ground truth straight out of the simulator, with no
+dead reckoning and no drift. Calling it odom invited exactly the wrong
+assumption. If your planner subscribes to `/drone/odom`, change it to
+`/drone/truth`.
+
+**Do not use its `twist.angular`.** It is differentiated from the pose by
+Gazebo's `OdometryPublisher`, which is a wheeled-robot plugin, and that
+differentiation is blind to the quaternion double cover: once per revolution
+the reported body rate jumps to 626 rad/s while the pose stays perfectly
+smooth. Take angular rates from `/drone/imu`, which is a gyro and measures
+them. The controller does.
+
+There is no sensor-noise model, so `/drone/truth` is ground truth. Your planner
 sees the true state.
 
 ### Reading back what the controller did

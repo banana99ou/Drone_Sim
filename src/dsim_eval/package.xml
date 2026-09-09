@@ -8,6 +8,7 @@
   <buildtool_depend>ament_cmake</buildtool_depend>
   <depend>rclcpp</depend>
   <depend>nav_msgs</depend>
+  <depend>sensor_msgs</depend>
   <depend>actuator_msgs</depend>
   <depend>ros_gz_interfaces</depend>
   <depend>dsim_msgs</depend>

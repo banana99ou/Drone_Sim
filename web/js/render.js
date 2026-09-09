@@ -162,6 +162,9 @@ export class Renderer {
       ctx.stroke();
       ctx.setLineDash([]);
 
+      // A clamped arrow is not the length of the thing it represents, so it
+      // must not look like one. A hollow head says "longer than this" instead
+      // of quietly asserting a magnitude that was cut off.
       const head = Math.min(11 * px, l * 0.45);
       const ux = dx / l;
       const uy = dy / l;
@@ -174,11 +177,13 @@ export class Renderer {
       ctx.lineTo(t.x - ux * head - nx * head * 0.42,
                  t.y - uy * head - ny * head * 0.42);
       ctx.closePath();
-      ctx.fill();
+      if (a.clamped) { ctx.lineWidth = 1.5 * px; ctx.stroke(); } else { ctx.fill(); }
 
       // Only label an arrow long enough that the text will not sit on top of
       // its neighbours. Below that the colour still carries the information.
-      if (a.label && l > 26 * px) {
+      // 26 px was too high: the rotor arrows sit at 15-17 px at the default
+      // camera, so their newton values never appeared at all.
+      if (a.label && l > 15 * px) {
         ctx.fillText(a.label, t.x + ux * 7 * px + 4 * px, t.y + uy * 7 * px);
       }
     }

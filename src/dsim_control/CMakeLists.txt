@@ -11,6 +11,7 @@ endif()
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(nav_msgs REQUIRED)
+find_package(sensor_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(std_srvs REQUIRED)
 find_package(actuator_msgs REQUIRED)
@@ -19,6 +20,7 @@ find_package(Eigen3 REQUIRED)
 
 # --- core library: no ROS, so it can be unit tested in isolation ------------
 add_library(dsim_control_core SHARED
+  src/body_rate_source.cpp
   src/mixer.cpp
   src/se3_controller.cpp
   src/trajectory_buffer.cpp
@@ -35,7 +37,7 @@ ament_target_dependencies(dsim_control_core PUBLIC dsim_msgs geometry_msgs)
 add_executable(controller_node src/controller_node.cpp)
 target_link_libraries(controller_node dsim_control_core)
 ament_target_dependencies(controller_node
-  rclcpp nav_msgs geometry_msgs std_srvs actuator_msgs dsim_msgs)
+  rclcpp nav_msgs sensor_msgs geometry_msgs std_srvs actuator_msgs dsim_msgs)
 
 add_executable(reference_generator_node src/reference_generator_node.cpp)
 ament_target_dependencies(reference_generator_node rclcpp dsim_msgs)

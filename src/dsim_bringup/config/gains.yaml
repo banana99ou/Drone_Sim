@@ -15,6 +15,25 @@ controller:
     min_thrust_n: 0.5
   control_rate_hz: 250.0
   odom_timeout_s: 0.5
+  imu_timeout_s: 0.5
   start_armed: true
   odom:
     twist_in_body_frame: true  # REP-145; verify with scripts/check_twist_frame.py
+  state:
+    # Body rates come from the GYRO (/drone/imu), never from the differentiated
+    # pose. Gazebo's OdometryPublisher is a wheeled-robot plugin: it reports
+    # velocity by differencing successive poses, and once per revolution the
+    # quaternion flipped sign -- same rotation, so the pose stayed smooth while
+    # its reported angular velocity jumped to 626 rad/s. The controller
+    # believed it and demanded 111 N.m against an airframe good for 2.55.
+    #
+    # This gate is the second line of defence: even a correct source must not
+    # be trusted to stay correct. Full roll authority is 2.55 N.m against
+    # Ixx = 0.015, so about 170 rad/s^2 -- reaching 30 rad/s would take most of
+    # a second at full deflection, which the tilt clamp prevents. Past this,
+    # the sensor is broken, not the vehicle aerobatic.
+    max_body_rate_rad_s: 30.0
+    # First-order low-pass on the gyro. 0 disables it, which is right while the
+    # IMU is noiseless: a filter that is not needed only adds phase lag to the
+    # fastest loop in the stack.
+    gyro_lowpass_tau_s: 0.0

@@ -16,7 +16,7 @@ set -o pipefail
 # first, survived a 'cleared' teardown, and the next run's rosbridge then
 # died with 'Address already in use' while the viewer silently showed data
 # from the previous sim.
-PATTERNS='gz sim|gz_tools_vendor|controller_node|eval_node|reference_generator_node|parameter_bridge|rosbridge_websocket|http.server|viz_server|ros2 launch dsim_bringup'
+PATTERNS='gz sim|gz_tools_vendor|controller_node|eval_node|reference_generator_node|parameter_bridge|rosbridge_websocket|http.server|viz_server|viz_relay_node|ros2 launch dsim_bringup'
 
 # self, parent, grandparent, ... up to init
 ancestors() {

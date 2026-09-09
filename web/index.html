@@ -41,8 +41,11 @@
     font-size: 12px; cursor: pointer; }
   .check input { margin: 0; accent-color: #60a5fa; }
   #gain { width: 100%; accent-color: #60a5fa; }
-  #gainrow { display: flex; justify-content: space-between; color: #8b93a7;
-    font-size: 10px; text-transform: uppercase; letter-spacing: .07em; }
+  #gainrow, #speedrow { display: flex; justify-content: space-between;
+    color: #8b93a7; font-size: 10px; text-transform: uppercase;
+    letter-spacing: .07em; margin-top: 6px; }
+  #speed { width: 100%; accent-color: #f59e0b; }
+  #ctl button:disabled { opacity: .45; cursor: not-allowed; }
   #legend { bottom: 12px; right: 12px; font-size: 11px; color: #a9b1c4; }
   #legend div { display: flex; align-items: center; gap: 7px; margin: 2px 0; }
   #legend i { width: 12px; height: 3px; border-radius: 2px; flex: none; }
@@ -74,6 +77,9 @@
     <tr><td>torque</td><td id="tau">—</td></tr>
     <tr><td>aero force</td><td id="aero">—</td></tr>
     <tr><td>authority</td><td id="sat">—</td></tr>
+    <tr class="sep"><td colspan="2">viewer</td></tr>
+    <tr><td>frame rate</td><td id="fps">—</td></tr>
+    <tr><td>simulator</td><td id="simstate">—</td></tr>
   </table>
 </div>
 
@@ -86,6 +92,11 @@
   <hr>
   <div id="gainrow"><span>arrow scale</span><span id="gainval">1.0x</span></div>
   <input type="range" id="gain" min="0.25" max="4" step="0.25" value="1">
+  <hr>
+  <label class="field">simulation</label>
+  <button id="pause">pause</button>
+  <div id="speedrow"><span>speed</span><span id="speedval">1.00x</span></div>
+  <input type="range" id="speed" min="0.05" max="4" step="0.05" value="1">
   <hr>
   <button id="reset">reset view</button>
   <button id="clear">clear trails</button>

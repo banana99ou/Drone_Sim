@@ -59,6 +59,7 @@ def launch_setup(context, *args, **kwargs):
     viz = LaunchConfiguration('viz').perform(context)
     bind = LaunchConfiguration('bind').perform(context)
     web_port = LaunchConfiguration('web_port').perform(context)
+    control = LaunchConfiguration('control').perform(context)
     radius = LaunchConfiguration('radius').perform(context)
     altitude = LaunchConfiguration('altitude').perform(context)
     period = LaunchConfiguration('period').perform(context)
@@ -105,7 +106,7 @@ def launch_setup(context, *args, **kwargs):
             '/drone/imu@sensor_msgs/msg/Imu[gz.msgs.IMU',
         ],
         remappings=[
-            ('/model/drone/odometry_truth', '/drone/odom'),
+            ('/model/drone/odometry_truth', '/drone/truth'),
             (contact_topic, '/drone/contacts'),
         ],
         parameters=[{'use_sim_time': True}],
@@ -123,8 +124,11 @@ def launch_setup(context, *args, **kwargs):
         'gains.min_thrust_n': float(gains['gains']['min_thrust_n']),
         'control_rate_hz': float(gains['control_rate_hz']),
         'odom_timeout_s': float(gains['odom_timeout_s']),
+        'imu_timeout_s': float(gains['imu_timeout_s']),
         'start_armed': bool(gains['start_armed']),
         'odom.twist_in_body_frame': bool(gains['odom']['twist_in_body_frame']),
+        'state.max_body_rate_rad_s': float(gains['state']['max_body_rate_rad_s']),
+        'state.gyro_lowpass_tau_s': float(gains['state']['gyro_lowpass_tau_s']),
     })
     controller = Node(
         package='dsim_control', executable='controller_node', name='dsim_controller',
@@ -180,12 +184,30 @@ def launch_setup(context, *args, **kwargs):
         # One process, one port, one origin: static files + an SSE state stream.
         # This replaced rosbridge plus a separate http.server -- see the module
         # docstring in dsim_viz/viz_server.py for why.
+        # Decimates the 250 Hz telemetry to ~30 Hz for the Python viewer.
+        # See the header of dsim_eval/src/viz_relay_node.cpp for the measured
+        # reason this is a separate C++ node and not a filter in the viewer.
+        nodes.append(Node(
+            package='dsim_eval', executable='viz_relay_node', name='dsim_viz_relay',
+            output='screen',
+            parameters=[{'use_sim_time': True, 'rate_hz': 30.0}],
+        ))
+        # use_sim_time is deliberately FALSE here, and it is the single biggest
+        # cost in this launch if you get it wrong. Setting it True makes rclpy
+        # subscribe to /clock, which the bridge publishes at the 1 ms physics
+        # step -- 1000 messages a second into a Python process, costing ~50% of
+        # a CPU core, for a clock this node never reads. Every timestamp the
+        # viewer shows comes out of a message header, and the only sleep is the
+        # stream's own pacing, which should be wall time anyway: a browser
+        # refreshing at sim time would stutter whenever the physics did.
         nodes.append(Node(
             package='dsim_viz', executable='viz_server', name='dsim_viz',
             output='screen',
-            parameters=[{'use_sim_time': True}],
-            arguments=['--port', web_port, '--bind', bind,
-                       '--directory', WEB_DIR],
+            parameters=[{'use_sim_time': False}],
+            arguments=(['--port', web_port, '--bind', bind,
+                        '--directory', WEB_DIR,
+                        '--world-name', world_name]
+                       + (['--allow-control'] if control == 'true' else [])),
         ))
 
     if use_rviz == 'true':
@@ -220,6 +242,13 @@ def generate_launch_description():
                                           'Set to your Tailscale IP to keep it off '
                                           'the local LAN.'),
         DeclareLaunchArgument('web_port', default_value='8080'),
+        DeclareLaunchArgument('control', default_value='true',
+                              description='expose the viewer\'s pause and '
+                              'playback-speed buttons (POST /control). This is '
+                              'the only write path into the simulator from the '
+                              'web port; set false to keep the server '
+                              'read-only. It can pause/resume and set a '
+                              'range-checked real-time factor, nothing else.'),
         DeclareLaunchArgument('radius', default_value='2.0',
                               description='built-in trajectory radius (m). '
                               'A 2 m circle collides with pillar_c in the '

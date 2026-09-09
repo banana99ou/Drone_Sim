@@ -47,7 +47,7 @@ class TwistFrameChecker(Node):
         self.n = 0
         self.skipped = 0
         self.create_subscription(
-            Odometry, '/drone/odom_truth', self.cb, qos_profile_sensor_data)
+            Odometry, '/drone/truth', self.cb, qos_profile_sensor_data)
         self.get_logger().info(
             f'measuring... need {NEEDED_SAMPLES} samples with tilt > '
             f'{math.degrees(MIN_TILT_RAD):.0f} deg and speed > {MIN_SPEED} m/s')

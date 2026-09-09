@@ -17,7 +17,7 @@ Visualization Manager:
       Name: Drone pose
       Enabled: true
       Topic:
-        Value: /drone/odom
+        Value: /drone/truth
         Depth: 50
         Reliability Policy: Best Effort
         Durability Policy: Volatile

@@ -1,6 +1,6 @@
 // Scoring node for planner trials.
 //
-// Measures against GROUND TRUTH (/drone/odom_truth), never against the
+// Measures against GROUND TRUTH (/drone/truth), never against the
 // degraded estimate the controller sees. Scoring off the noisy estimate would
 // hide exactly the errors the estimate causes, and a plan that flies into a
 // wall would still score well if the estimate said otherwise.
@@ -85,7 +85,7 @@ public:
     loadObstacles();
 
     truth_sub_ = create_subscription<nav_msgs::msg::Odometry>(
-      "/drone/odom", rclcpp::SensorDataQoS(),
+      "/drone/truth", rclcpp::SensorDataQoS(),
       [this](nav_msgs::msg::Odometry::SharedPtr m) {onTruth(*m);});
     sp_sub_ = create_subscription<dsim_msgs::msg::TrajectorySetpoint>(
       "/drone/setpoint", rclcpp::QoS(10),

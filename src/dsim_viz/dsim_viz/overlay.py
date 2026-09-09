@@ -31,9 +31,30 @@ import math
 SCALE = {
     'force_m_per_n': 0.05,      # hover is 14.7 N total -> a 0.74 m arrow
     'vel_m_per_mps': 0.25,
-    'torque_m_per_nm': 3.0,     # torques are small; this makes them visible
+    # Torques on this airframe run about 0.017 N.m in a steady turn, so 3.0
+    # drew a 5 cm stub -- 4 pixels at the default camera, too short even to
+    # earn a label. 20 puts it at 0.35 m / 30 px.
+    'torque_m_per_nm': 20.0,
     'axis_m': 0.5,              # length of the unit attitude axes
 }
+
+# Aerodynamic force is around 0.35 N at cruise against a 14.7 N weight -- a 44x
+# range. On the shared force scale that is 17 mm, which the renderer discards as
+# shorter than its own 2 px floor: the arrow was never drawn at all. Rather than
+# give it a private scale and pretend it is comparable to the others, it is
+# magnified by a declared factor and the factor is written into its label. An
+# exaggeration you can read is honest; a silent one is not.
+AERO_MAGNIFY = 20.0
+
+# No arrow may exceed this, however large the quantity behind it.
+#
+# Before the body-rate fix, one bad gyro sample per lap produced a 2.55 N.m
+# torque demand -- a 51 m arrow at the scale above, 170x the collision
+# envelope, flashing across the scene. Clamping keeps a broken input from
+# taking over the picture, and `clamped` lets the page draw it differently so
+# the clamp is visible rather than a quiet lie about magnitude. The label
+# always carries the true value.
+MAX_ARROW_M = 2.0
 
 # Which toggle each arrow belongs to. Sent with the arrow so the page's
 # checkboxes are a pure filter that needs no idea what a torque is.
@@ -105,9 +126,15 @@ def _round(v):
 
 
 def _arrow(group, kind, origin, vector, label, **extra):
+    clamped = False
+    length = _norm(vector)
+    if length > MAX_ARROW_M:
+        vector = _mul(vector, MAX_ARROW_M / length)
+        clamped = True
     a = {
         'group': group,
         'kind': kind,
+        'clamped': clamped,
         # `from` doubles as the anchor the page scales the arrow about when the
         # user turns up the display gain: to' = from + (to - from) * gain. That
         # is a display zoom, the same kind of operation as the camera's, and it
@@ -210,9 +237,11 @@ def build(pose, control, imu):
         'forces', 'weight', p, [0.0, 0.0, -weight * scale_f],
         f'weight {weight:.1f} N'))
     if aero_body is not None:
+        # Magnified, and the label says so -- see AERO_MAGNIFY.
         arrows.append(_arrow(
-            'forces', 'aero', p, _mul(rotate(m, aero_body), scale_f),
-            f'aero {_norm(aero_body):.2f} N'))
+            'forces', 'aero', p,
+            _mul(rotate(m, aero_body), scale_f * AERO_MAGNIFY),
+            f'aero {_norm(aero_body):.2f} N x{AERO_MAGNIFY:.0f}'))
 
     # ---- velocity ----------------------------------------------------------
     # control['velocity_world'] is already resolved into the world frame by the

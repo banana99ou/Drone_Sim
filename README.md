@@ -35,7 +35,7 @@ Full contract in [docs/INTERFACE.md](docs/INTERFACE.md). The short version:
 
 | Direction | Topic | Type |
 |---|---|---|
-| sim → you | `/drone/odom` | `nav_msgs/Odometry` |
+| sim → you | `/drone/truth` | `nav_msgs/Odometry` |
 | **you → sim** | `/drone/trajectory` | `dsim_msgs/Trajectory` |
 | sim → you | `/drone/eval/status` | `dsim_msgs/FlightStatus` |
 
@@ -199,14 +199,33 @@ world, and it fires in the pillar field at the geometrically predicted moment
 **In:** geometric path planning, obstacle clearance, trajectory feasibility,
 replanning behaviour, collision counting, comparing planners fairly.
 
-**Out:** sensor noise, state estimation, motor identification, matching a real
-airframe's numbers. There is no noise model — the controller and the referee
-both see ground truth. The controller's model of the vehicle is also exactly
-right, which is why tracking is as good as it is: with perfect state, an exact
-model and acceleration feedforward, the feedback terms have little left to do.
-The stack is a two-level cascade (position/velocity → attitude/body-rate →
-mixer) and it is **PD, not PID** — there are no integrators, because with no
-model error there is no steady-state error for one to remove.
+**Out:** state estimation, motor identification, matching a real airframe's
+numbers. The controller's model of the vehicle is exactly right, which is why
+tracking is as good as it is: with perfect state, an exact model and
+acceleration feedforward, the feedback terms have little left to do. The stack
+is a two-level cascade (position/velocity → attitude/body-rate → mixer) and it
+is **PD, not PID** — there are no integrators, because with no model error
+there is no steady-state error for one to remove.
+
+### A bug worth knowing about, because it was invisible
+
+The controller used to take its body rate from `/drone/truth`'s `twist.angular`,
+which Gazebo's `OdometryPublisher` produces by differentiating the pose. That
+plugin is built for wheeled robots. A quaternion and its negation are the same
+rotation, so once per revolution the representation flipped sign — pose and yaw
+stayed perfectly smooth — and the differentiated angular velocity jumped from
+1.8 to **626 rad/s**. The controller believed it, demanded **111 N·m** against
+an airframe that can produce 2.55, and slammed two rotors to full and two to
+zero for ~10 ms, once per lap.
+
+Nothing looked wrong. The flight was smooth, the referee's RMSE barely moved,
+and every test passed. It surfaced only because the force overlays put a number
+on the commanded torque and the number was exactly the arithmetic saturation
+limit.
+
+Body rates now come from the gyro, and `BodyRateSource` rejects any sample a
+1.5 kg quadrotor could not physically produce. Both are tested, and the
+saturation is gone: 0 events in 7500 control steps where there used to be 22.
 
 Getting a planner onto real hardware later is a **nice-to-have, low priority**,
 and the seam is deliberately shallow: your planner emits world-frame

@@ -1,6 +1,7 @@
 // Controller node: turns a planner's trajectory into rotor speeds.
 //
-//   /drone/odom        (nav_msgs/Odometry)      state feedback
+//   /drone/truth       (nav_msgs/Odometry)      pose + linear velocity
+//   /drone/imu         (sensor_msgs/Imu)        body angular rate (gyro)
 //   /drone/trajectory  (dsim_msgs/Trajectory) planner input  <-- YOUR PLANNER
 //        |
 //        v  SE(3) geometric control + mixer
@@ -10,6 +11,13 @@
 // Also republishes the currently-tracked setpoint on /drone/setpoint so that
 // tracking error is measured against what the controller actually chased, not
 // against a re-interpolation done elsewhere.
+//
+// The angular rate comes from the GYRO, not from the pose. Gazebo's
+// OdometryPublisher is a wheeled-robot plugin that reconstructs velocity by
+// differencing successive poses; a quaternion and its negation are the same
+// rotation, so once per revolution its reported angular velocity jumped from
+// 1.8 to 626 rad/s while the pose stayed perfectly smooth. See
+// body_rate_source.hpp for what that did to the torque demand.
 //
 // /drone/control_debug carries what every loop of the cascade demanded and what
 // the rotors could deliver. It is what lets the viewer draw the control action
@@ -22,6 +30,7 @@
 
 #include <rclcpp/rclcpp.hpp>
 #include <nav_msgs/msg/odometry.hpp>
+#include <sensor_msgs/msg/imu.hpp>
 #include <actuator_msgs/msg/actuators.hpp>
 #include <geometry_msgs/msg/vector3.hpp>
 #include <std_srvs/srv/set_bool.hpp>
@@ -29,6 +38,7 @@
 #include <dsim_msgs/msg/trajectory.hpp>
 #include <dsim_msgs/msg/trajectory_setpoint.hpp>
 
+#include "dsim_control/body_rate_source.hpp"
 #include "dsim_control/mixer.hpp"
 #include "dsim_control/se3_controller.hpp"
 #include "dsim_control/trajectory_buffer.hpp"
@@ -71,6 +81,19 @@ public:
 
     control_rate_hz_ = declare_parameter("control_rate_hz", 250.0);
     odom_timeout_s_  = declare_parameter("odom_timeout_s", 0.5);
+
+    // A quadrotor of this size cannot exceed a few rad/s under its own power:
+    // full roll authority is 2.55 N.m against Ixx = 0.015, so about 170 rad/s^2
+    // -- it would need most of a second at full deflection to reach 30 rad/s,
+    // and the tilt clamp prevents that. Anything past this is the state source
+    // malfunctioning, not the vehicle manoeuvring.
+    const double max_body_rate = declare_parameter("state.max_body_rate_rad_s", 30.0);
+    // Off by default: with a noiseless gyro there is nothing to filter, and a
+    // filter that is not needed only adds phase lag to the fastest loop.
+    // config/drone.yaml turns it on when the IMU has noise configured.
+    const double gyro_tau = declare_parameter("state.gyro_lowpass_tau_s", 0.0);
+    rate_source_ = std::make_unique<BodyRateSource>(max_body_rate, gyro_tau);
+    imu_timeout_s_ = declare_parameter("imu_timeout_s", 0.5);
     start_armed_     = declare_parameter("start_armed", true);
     armed_ = start_armed_;
 
@@ -88,8 +111,12 @@ public:
     // ---- interfaces -------------------------------------------------------
     const auto qos = rclcpp::SensorDataQoS();
     odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
-      "/drone/odom", qos,
+      "/drone/truth", qos,
       [this](nav_msgs::msg::Odometry::SharedPtr msg) {onOdom(*msg);});
+
+    imu_sub_ = create_subscription<sensor_msgs::msg::Imu>(
+      "/drone/imu", qos,
+      [this](sensor_msgs::msg::Imu::SharedPtr msg) {onImu(*msg);});
 
     traj_sub_ = create_subscription<dsim_msgs::msg::Trajectory>(
       "/drone/trajectory", rclcpp::QoS(4),
@@ -203,14 +230,40 @@ private:
       msg.twist.twist.linear.x, msg.twist.twist.linear.y, msg.twist.twist.linear.z);
     s.velocity = twist_in_body_frame_ ? (s.orientation * v_raw) : v_raw;
 
-    // Angular rate is body-frame in both conventions.
-    s.angular_rate = Eigen::Vector3d(
-      msg.twist.twist.angular.x, msg.twist.twist.angular.y, msg.twist.twist.angular.z);
+    // Angular rate deliberately NOT taken from here. This message's twist is
+    // differentiated from the pose, and that differentiation is blind to the
+    // quaternion double cover -- see onImu() and body_rate_source.hpp.
 
     std::lock_guard<std::mutex> lock(state_mutex_);
-    state_ = s;
+    state_.position = s.position;
+    state_.orientation = s.orientation;
+    state_.velocity = s.velocity;
     last_odom_s_ = nowSeconds();
     have_state_ = true;
+  }
+
+  /// Body angular rate, from the gyro. Everything about why is in
+  /// body_rate_source.hpp; the short version is that a gyro measures rate
+  /// while a differentiated attitude can jump without the attitude moving.
+  void onImu(const sensor_msgs::msg::Imu & msg)
+  {
+    const Eigen::Vector3d measured(
+      msg.angular_velocity.x, msg.angular_velocity.y, msg.angular_velocity.z);
+
+    const double now = nowSeconds();
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    const double dt = have_imu_ ? (now - last_imu_s_) : 0.0;
+    const std::size_t before = rate_source_->rejected();
+    state_.angular_rate = rate_source_->update(measured, dt);
+    if (rate_source_->rejected() != before) {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 2000,
+        "discarded an implausible body rate of %.1f rad/s (limit %.0f); "
+        "%zu rejected so far -- the state source is malfunctioning",
+        measured.norm(), rate_source_->maxRate(), rate_source_->rejected());
+    }
+    last_imu_s_ = now;
+    have_imu_ = true;
   }
 
   double nowSeconds() const
@@ -222,24 +275,38 @@ private:
   {
     State state;
     bool have_state;
+    bool have_rate;
     double last_odom;
+    double last_imu;
     {
       std::lock_guard<std::mutex> lock(state_mutex_);
       state = state_;
       have_state = have_state_;
+      have_rate = have_imu_ && rate_source_->valid();
       last_odom = last_odom_s_;
+      last_imu = last_imu_s_;
     }
 
     const double now = nowSeconds();
 
-    if (!armed_ || !have_state) {
+    // No rate feedback means no rotational loop. Commanding anyway would fly
+    // on a fabricated zero rate, which looks fine at hover and diverges the
+    // moment the vehicle is disturbed.
+    if (!armed_ || !have_state || !have_rate) {
       publishIdle();
       return;
     }
     if ((now - last_odom) > odom_timeout_s_) {
       RCLCPP_WARN_THROTTLE(
         get_logger(), *get_clock(), 2000,
-        "no odometry for %.2f s — cutting motors", now - last_odom);
+        "no state for %.2f s — cutting motors", now - last_odom);
+      publishIdle();
+      return;
+    }
+    if ((now - last_imu) > imu_timeout_s_) {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 2000,
+        "no gyro for %.2f s — cutting motors", now - last_imu);
       publishIdle();
       return;
     }
@@ -386,18 +453,22 @@ private:
 
   std::unique_ptr<SE3Controller> controller_;
   std::unique_ptr<Mixer> mixer_;
+  std::unique_ptr<BodyRateSource> rate_source_;
   TrajectoryBuffer buffer_;
 
   mutable std::mutex state_mutex_;
   State state_;
   bool have_state_ {false};
+  bool have_imu_ {false};
   double last_odom_s_ {0.0};
+  double last_imu_s_ {0.0};
 
   bool armed_ {true};
   bool start_armed_ {true};
   bool twist_in_body_frame_ {true};
   double control_rate_hz_ {250.0};
   double odom_timeout_s_ {0.5};
+  double imu_timeout_s_ {0.5};
 
   /// Below this, a demanded-vs-realised difference is numerical noise from the
   /// mixer inverse, not saturation. The self-test asserts the round-trip
@@ -409,6 +480,7 @@ private:
   double hold_yaw_ {0.0};
 
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
+  rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
   rclcpp::Subscription<dsim_msgs::msg::Trajectory>::SharedPtr traj_sub_;
   rclcpp::Publisher<actuator_msgs::msg::Actuators>::SharedPtr cmd_pub_;
   rclcpp::Publisher<dsim_msgs::msg::TrajectorySetpoint>::SharedPtr setpoint_pub_;

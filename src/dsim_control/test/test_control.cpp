@@ -3,6 +3,8 @@
 
 #include <gtest/gtest.h>
 #include <cmath>
+#include <limits>
+#include "dsim_control/body_rate_source.hpp"
 #include "dsim_control/mixer.hpp"
 #include "dsim_control/se3_controller.hpp"
 #include "dsim_control/angles.hpp"
@@ -425,4 +427,114 @@ TEST(Mixer, RotorPositionsGenerateTheAllocationMatrix)
         << "rotors " << i << " and " << j << " are in the same place";
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// BodyRateSource: the gate that would have caught the 626 rad/s.
+//
+// The simulator's OdometryPublisher reported a body rate of 626 rad/s once per
+// revolution -- a quaternion sign flip differentiated blind to the double
+// cover. The pose stayed smooth, the flight looked fine, and the controller
+// quietly demanded 111 N.m against an airframe good for 2.55. These are the
+// checks that make that impossible to repeat.
+// ---------------------------------------------------------------------------
+
+// FAILS IF: an impossible body rate is accepted. This is the exact number the
+// simulator produced, and the exact bug: 626 rad/s is 100 revolutions per
+// second, which this airframe cannot approach at 170 rad/s^2 of angular
+// authority.
+TEST(BodyRateSource, RejectsThePhysicallyImpossibleRateTheSimActuallyProduced)
+{
+  BodyRateSource src(30.0, 0.0);
+  const Eigen::Vector3d sane(0.1, -0.2, 1.795);
+  EXPECT_EQ(src.update(sane, 0.004), sane);
+  EXPECT_TRUE(src.valid());
+
+  // The real sample: (+9.9, +186.7, -598.0), magnitude 626.5.
+  const Eigen::Vector3d garbage(9.897, 186.709, -597.973);
+  ASSERT_GT(garbage.norm(), 600.0);
+  const Eigen::Vector3d out = src.update(garbage, 0.004);
+
+  EXPECT_EQ(src.rejected(), 1u);
+  // Holds the last good value: zeroing would claim the vehicle had stopped
+  // rotating, which is a different lie and provokes its own wrong correction.
+  EXPECT_EQ(out, sane);
+}
+
+// FAILS IF: a NaN slips through. NaN fails every comparison, so a bare
+// magnitude test would pass it straight into the rotational loop, and one NaN
+// in the torque poisons all four rotor commands with no error anywhere.
+TEST(BodyRateSource, RejectsNonFiniteSamples)
+{
+  BodyRateSource src(30.0, 0.0);
+  const Eigen::Vector3d sane(0.0, 0.0, 1.0);
+  src.update(sane, 0.004);
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  EXPECT_EQ(src.update(Eigen::Vector3d(nan, 0.0, 0.0), 0.004), sane);
+  EXPECT_EQ(
+    src.update(Eigen::Vector3d(std::numeric_limits<double>::infinity(), 0, 0), 0.004),
+    sane);
+  EXPECT_EQ(src.rejected(), 2u);
+}
+
+// FAILS IF: the gate is so tight it rejects real flight. A quadrotor tracking
+// an aggressive trajectory genuinely reaches several rad/s; a limit that
+// clipped those would silently degrade the rotational loop, which is a worse
+// bug than the one being fixed because it looks like poor tuning.
+TEST(BodyRateSource, AcceptsRatesARealVehicleActuallyReaches)
+{
+  BodyRateSource src(30.0, 0.0);
+  for (const double w : {0.5, 2.0, 5.0, 10.0, 25.0}) {
+    const Eigen::Vector3d r(0.0, 0.0, w);
+    EXPECT_EQ(src.update(r, 0.004), r) << "rejected a plausible " << w << " rad/s";
+  }
+  EXPECT_EQ(src.rejected(), 0u);
+}
+
+// FAILS IF: the very first sample is filtered instead of adopted. Ramping from
+// zero towards the true rate would fabricate a spin-up that never happened,
+// and on a vehicle already rotating at arming time that is a real transient.
+TEST(BodyRateSource, AdoptsTheFirstGoodSampleOutright)
+{
+  BodyRateSource src(30.0, 0.05);
+  const Eigen::Vector3d first(0.0, 0.0, 2.0);
+  EXPECT_EQ(src.update(first, 0.004), first);
+}
+
+// FAILS IF: the low-pass is not the time constant it claims. After one tau of
+// a unit step a first-order filter must have covered 1 - 1/e = 63.2%; a filter
+// whose alpha ignored dt would move at a rate that changed with the control
+// rate, so the same gains would behave differently at 250 Hz and 500 Hz.
+TEST(BodyRateSource, LowPassHonoursItsTimeConstant)
+{
+  const double tau = 0.05;
+  const double dt = 0.001;
+  BodyRateSource src(30.0, tau);
+  src.update(Eigen::Vector3d::Zero(), dt);              // establish the origin
+  const Eigen::Vector3d step(0.0, 0.0, 1.0);
+  for (int i = 0; i < static_cast<int>(tau / dt); ++i) {
+    src.update(step, dt);
+  }
+  EXPECT_NEAR(src.value().z(), 1.0 - std::exp(-1.0), 0.02);
+
+  // ...and with filtering disabled it must pass the sample through untouched,
+  // or the "off" setting would still add lag to the fastest loop.
+  BodyRateSource unfiltered(30.0, 0.0);
+  unfiltered.update(Eigen::Vector3d::Zero(), dt);
+  EXPECT_EQ(unfiltered.update(step, dt), step);
+}
+
+// FAILS IF: a run of bad samples ever produces a usable-looking output. If the
+// state source breaks permanently, the controller must keep seeing the same
+// stale value and the rejection count must keep climbing, so the log says what
+// happened instead of the vehicle silently flying on a frozen rate.
+TEST(BodyRateSource, KeepsCountingWhileTheSourceStaysBroken)
+{
+  BodyRateSource src(30.0, 0.0);
+  const Eigen::Vector3d sane(0.0, 0.0, 1.5);
+  src.update(sane, 0.004);
+  for (int i = 0; i < 50; ++i) {
+    EXPECT_EQ(src.update(Eigen::Vector3d(0.0, 0.0, 626.5), 0.004), sane);
+  }
+  EXPECT_EQ(src.rejected(), 50u);
 }

@@ -42,6 +42,7 @@ const S = {
   status: null,
   control: null,
   overlay: null,
+  sim: null,
   flown: [],
   planned: [],
 };
@@ -103,6 +104,23 @@ function ingest(snap) {
   if (snap.status) S.status = snap.status;
   if (snap.control) S.control = snap.control;
   if (snap.overlay !== undefined) S.overlay = snap.overlay;
+  if (snap.sim) S.sim = snap.sim;
+}
+
+// ---- frame rate ----------------------------------------------------------
+// Measured here rather than guessed. The viewer's own cost is the one thing a
+// remote user can see directly, and "it feels slower" is not something you can
+// act on -- a number is.
+const fps = { frames: 0, last: 0, value: 0 };
+function tickFps(now) {
+  fps.frames++;
+  if (!fps.last) { fps.last = now; return; }
+  const dt = now - fps.last;
+  if (dt >= 500) {
+    fps.value = (fps.frames * 1000) / dt;
+    fps.frames = 0;
+    fps.last = now;
+  }
 }
 
 // ---- overlay: filter, zoom, colour --------------------------------------
@@ -128,6 +146,7 @@ function overlayToDraw() {
       width: widthFor(a),
       label: a.label,
       dashed: a.dashed === true,
+      clamped: a.clamped === true,
     }));
   const ticks = (prefs.show.motors === false ? [] : S.overlay.ticks)
     .map((t) => ({
@@ -139,10 +158,11 @@ function overlayToDraw() {
 }
 
 // ---- frame ---------------------------------------------------------------
-function render() {
+function render(now) {
   // The reschedule sits OUTSIDE the try on purpose: this loop re-arms itself,
   // so one exception inside would stop the picture permanently.
   try {
+    tickFps(now || performance.now());
     renderOnce();
   } catch (e) {
     hudError = `render: ${e && e.message ? e.message : e}`;
@@ -217,6 +237,29 @@ function updateHudOnce() {
     el("tilt").className = c.tilt_clamped ? "bad" : "";
     el("sat").textContent = c.saturated ? "SATURATED" : (c.armed ? "ok" : "disarmed");
     el("sat").className = c.saturated || !c.armed ? "bad" : "good";
+  }
+
+  el("fps").textContent = fps.value ? `${fps.value.toFixed(0)} /s` : "—";
+
+  // Simulator pause and speed, as OBSERVED by the server, not as requested.
+  const sim = S.sim;
+  if (sim) {
+    if (!sim.enabled) {
+      el("simstate").textContent = "controls off";
+      el("simstate").className = "";
+    } else if (sim.error) {
+      el("simstate").textContent = sim.error;
+      el("simstate").className = "bad";
+    } else {
+      const m = sim.measured_rtf;
+      el("simstate").textContent = sim.paused
+        ? "PAUSED"
+        : `${m === null || m === undefined ? "?" : m.toFixed(2)}x real time`;
+      el("simstate").className = sim.paused ? "bad" : "good";
+    }
+    el("pause").textContent = sim.paused ? "resume" : "pause";
+    el("pause").disabled = !sim.enabled;
+    el("speed").disabled = !sim.enabled;
   }
 
   const st = S.status;
@@ -325,6 +368,30 @@ function bindInput() {
     }
   }, { passive: false });
   canvas.addEventListener("touchend", () => { pinch = null; });
+
+  // ---- simulator controls ------------------------------------------------
+  // The page sends intent only. Validation, the range check and the actual
+  // service call all live in dsim_viz/simcontrol.py, and the reply reports
+  // what the simulator was observed to do afterwards.
+  const post = (body) => fetch("/control", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  }).then((r) => r.json()).then((r) => {
+    if (r.error) { hudError = r.error; } else { S.sim = r; hudError = ""; }
+  }).catch((e) => { hudError = `control: ${e.message}`; });
+
+  el("pause").onclick = () => post({ paused: !(S.sim && S.sim.paused) });
+
+  const speed = el("speed");
+  const speedLabel = () => {
+    el("speedval").textContent = `${Number(speed.value).toFixed(2)}x`;
+  };
+  speedLabel();
+  speed.oninput = speedLabel;
+  // On release, not on every drag pixel: each change is a service call into
+  // the simulator, and 40 of them while dragging would be 40 subprocesses.
+  speed.onchange = () => post({ rtf: Number(speed.value) });
 
   el("reset").onclick = () => {
     cam = { ...CAM_HOME, target: CAM_HOME.target.slice() };
