@@ -206,6 +206,33 @@ function updateHud() {
   setTimeout(updateHud, 100);
 }
 
+/// A speed, or an em dash when the simulator has not said yet. Distinct from
+/// fmt() because "unknown" and "1.00x" must never look the same on screen.
+const num = (v, digits = 2) =>
+  (typeof v === "number" && Number.isFinite(v)) ? v.toFixed(digits) : "—";
+
+const speedLabel = () => {
+  el("speedval").textContent = `${Number(el("speed").value).toFixed(2)}x`;
+};
+
+/// The slider's bounds come from the simulator, so this page holds no copy of
+/// them; index.html's attributes are only a placeholder until the control node
+/// reports. Applied once: re-applying every frame would drag the handle out
+/// from under a user who is holding it.
+let speedRangeSet = false;
+function applySpeedRange(sim) {
+  const speed = el("speed");
+  const known = sim.enabled &&
+    typeof sim.min_speed === "number" && typeof sim.max_speed === "number";
+  speed.disabled = !known;
+  if (!known || speedRangeSet) { return; }
+  speed.min = sim.min_speed;
+  speed.max = sim.max_speed;
+  speed.value = sim.requested_speed ?? 1;
+  speedLabel();
+  speedRangeSet = true;
+}
+
 const fmt = (v, unit, digits = 2) =>
   (v === null || v === undefined || Number.isNaN(v) ? "—" : v.toFixed(digits) + unit);
 
@@ -251,15 +278,23 @@ function updateHudOnce() {
       el("simstate").textContent = sim.error;
       el("simstate").className = "bad";
     } else {
-      const m = sim.measured_rtf;
+      // Two numbers, because they disagree whenever the machine cannot keep
+      // up. Showing only the requested one would be a lie at exactly the
+      // moment it matters; showing only the achieved one would make the
+      // slider look broken.
+      const want = sim.requested_speed;
+      const got = sim.achieved_speed;
       el("simstate").textContent = sim.paused
         ? "PAUSED"
-        : `${m === null || m === undefined ? "?" : m.toFixed(2)}x real time`;
+        : `${num(want)}x asked · ${num(got)}x real`;
       el("simstate").className = sim.paused ? "bad" : "good";
     }
+    el("resets").textContent = `${sim.resets ?? 0}` +
+      (sim.step_errors ? ` (${sim.step_errors} step errors)` : "");
     el("pause").textContent = sim.paused ? "resume" : "pause";
     el("pause").disabled = !sim.enabled;
-    el("speed").disabled = !sim.enabled;
+    el("simreset").disabled = !sim.enabled;
+    applySpeedRange(sim);
   }
 
   const st = S.status;
@@ -383,17 +418,22 @@ function bindInput() {
     if (r.error) { hudError = r.error; } else { S.sim = r; hudError = ""; }
   }).catch((e) => { hudError = `control: ${e.message}`; });
 
-  el("pause").onclick = () => post({ paused: !(S.sim && S.sim.paused) });
+  // The press, not a computed state. Working out the new value here would
+  // mean deciding it from a cached copy that can be stale, and two open tabs
+  // would fight over it; the control node holds the truth and flips it.
+  el("pause").onclick = () => post({ toggle_pause: true });
+  el("simreset").onclick = () => {
+    post({ reset: true });
+    S.flown = [];
+    S.planned = [];
+  };
 
   const speed = el("speed");
-  const speedLabel = () => {
-    el("speedval").textContent = `${Number(speed.value).toFixed(2)}x`;
-  };
   speedLabel();
   speed.oninput = speedLabel;
   // On release, not on every drag pixel: each change is a service call into
-  // the simulator, and 40 of them while dragging would be 40 subprocesses.
-  speed.onchange = () => post({ rtf: Number(speed.value) });
+  // the simulator, and forty of them while dragging is forty round trips.
+  speed.onchange = () => post({ speed: Number(speed.value) });
 
   el("reset").onclick = () => {
     cam = { ...CAM_HOME, target: CAM_HOME.target.slice() };

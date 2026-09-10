@@ -1,7 +1,10 @@
-# Teleport the vehicle back to a start pose and zero all eval metrics.
-# Use this between planner trials so runs are independent.
-geometry_msgs/Pose start_pose
-bool use_default_start      # true -> ignore start_pose, use the world's default
+# Zero the referee's metrics and start a new run.
+#
+# This does NOT move the vehicle. Resetting the WORLD is dsim_simctl's job
+# (/sim/control with command RESET); the referee notices that on its own,
+# because simulated time goes backwards -- see dsim_time/sim_epoch.hpp. This
+# service exists for the other case: starting a fresh scoring run without
+# disturbing a flight that is already in the air.
 ---
 bool success
 string message

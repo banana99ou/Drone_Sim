@@ -15,6 +15,7 @@
 
 #include <rclcpp/rclcpp.hpp>
 #include <dsim_msgs/msg/trajectory.hpp>
+#include <dsim_time/sim_epoch.hpp>
 
 using namespace std::chrono_literals;
 
@@ -57,23 +58,17 @@ private:
     double x, y, z, vx, vy, vz, ax, ay, az, yaw, yaw_rate;
   };
 
-  /// Smooth ramp from 0 to 1 with zero velocity and acceleration at both ends.
-  /// Used for takeoff so the vehicle is not asked for a step in position,
-  /// which no controller can track and which would pollute the error metrics.
-  static double smoothstep(double u)
-  {
-    u = std::min(std::max(u, 0.0), 1.0);
-    return u * u * u * (u * (6.0 * u - 15.0) + 10.0);
-  }
-  static double smoothstepDot(double u, double duration)
-  {
-    if (u <= 0.0 || u >= 1.0) {return 0.0;}
-    return 30.0 * u * u * (u - 1.0) * (u - 1.0) / duration;
-  }
-
   Sample evaluate(double t) const
   {
     Sample s{};
+
+    // The quintic below is only a valid interpolant on [0, T]; outside it the
+    // basis functions diverge fast. t used to be non-negative by construction,
+    // which stopped being true when the world became resettable -- one sample
+    // taken between the clock jumping back and t0_ being re-anchored is enough
+    // to emit a setpoint hundreds of metres away, and the controller would
+    // chase it.
+    t = std::max(0.0, t);
 
     // Phase 1: takeoff, blended into the cruise path with a quintic Hermite.
     //
@@ -191,6 +186,15 @@ private:
   void publish()
   {
     const auto now = get_clock()->now();
+    // The world was reset: fly the profile again from the beginning rather
+    // than from wherever the old run had got to. t0_ happened to be ~0 at
+    // launch, so this used to come out right by accident -- but only for a
+    // generator started before the clock did, and only for a reset that lands
+    // exactly on zero.
+    if (epoch_.restarted(now.seconds())) {
+      t0_ = now;
+      RCLCPP_INFO(get_logger(), "simulated time went backwards — restarting the reference");
+    }
     const double t_now = (now - t0_).seconds();
 
     dsim_msgs::msg::Trajectory msg;
@@ -216,6 +220,7 @@ private:
     pub_->publish(msg);
   }
 
+  dsim_time::SimEpoch epoch_;
   mutable double dummy_ {0.0};
   std::string mode_;
   double altitude_, radius_, period_, horizon_s_, sample_dt_, publish_hz_, takeoff_s_;

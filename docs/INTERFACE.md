@@ -15,6 +15,8 @@ publish trajectories, it flies them and scores the result.**
 | sim → you | `/drone/setpoint` | `dsim_msgs/msg/TrajectorySetpoint` | 250 Hz |
 | sim → you | `/drone/tof` | `sensor_msgs/msg/Range` | 30 Hz |
 | sim → you | `/drone/optical_flow` | `dsim_msgs/msg/OpticalFlow` | 50 Hz |
+| sim → you | `/sim/state` | `dsim_msgs/msg/SimState` | 5 Hz |
+| **you → sim** | `/sim/control` (service) | `dsim_msgs/srv/SimControl` | on demand |
 
 **Renamed:** this topic was `/drone/odom` until it was pointed out that nothing
 here is odometry — it is ground truth straight out of the simulator, with no
@@ -177,12 +179,34 @@ ros2 launch dsim_bringup sim.launch.py world:=pillars reference:=none csv:=/ws/l
 ros2 run my_planner planner_node --ros-args -p use_sim_time:=true
 ```
 
-Between trials:
+Between trials, one call does all of it — vehicle home, clock to zero, metrics
+cleared:
+
+```bash
+ros2 service call /sim/control dsim_msgs/srv/SimControl "{command: 3}"   # RESET
+```
+
+Nothing has to be told about that reset. Every node that accumulates watches
+the clock instead, because simulated time going backwards is the one signal
+common to a reset from here, from the Gazebo GUI, or from a terminal — see
+`src/dsim_time/include/dsim_time/sim_epoch.hpp`. So this works for your nodes
+too: **if your planner integrates anything across time, watch for the clock
+going backwards and start again.** Before this existed, the referee reported an
+RMSE of 1118 m for a vehicle tracking a circle to 5 cm, because `elapsed_s`
+followed the clock back to zero and the sum of squares did not.
+
+The narrower tools are still there when you want only one of the effects:
 
 ```bash
 scripts/reset_pose.sh -4 0 1.0                                   # move the drone
 ros2 service call /drone/eval/reset dsim_msgs/srv/ResetRun "{}"  # zero the metrics
 ```
+
+`/sim/control` also carries pause (`command: 1`, with `paused`) and playback
+speed (`command: 2`, with `speed`, from 0.05 to 1.0). There is no
+faster-than-real-time: the world is throttled to real time by its SDF, and the
+only Gazebo service that lifts that throttle also deletes the world's gravity.
+See `src/dsim_simctl/include/dsim_simctl/pacer.hpp`.
 
 ## Scoring
 

@@ -90,7 +90,18 @@ def launch_setup(context, *args, **kwargs):
     # the contact-sensor topic is namespaced by it, so read it rather than
     # assume it. Guessing here produces a bridge that silently carries nothing.
     import xml.etree.ElementTree as ET
-    world_name = ET.parse(world_file).getroot().find('world').get('name')
+    world_root = ET.parse(world_file).getroot().find('world')
+    world_name = world_root.get('name')
+    # The physics step, read from the same file the simulator reads. The
+    # playback-speed control counts in steps, so a hard-coded 0.001 here would
+    # make every speed wrong by the ratio between the two numbers, silently,
+    # without any single step being incorrect.
+    step_node = world_root.find('physics/max_step_size')
+    if step_node is None or not step_node.text:
+        raise RuntimeError(
+            f'{world_file} declares no <physics><max_step_size>; the playback '
+            f'speed control has nothing to count in.')
+    step_size_s = float(step_node.text)
     sensors = LaunchConfiguration('sensors').perform(context)
     noise_seed = LaunchConfiguration('noise_seed').perform(context)
 
@@ -197,6 +208,20 @@ def launch_setup(context, *args, **kwargs):
                          'period_s': float(period)}],
         ))
 
+    # ---- the one write path into the simulator ----------------------------
+    # Separate from the viewer on purpose. It owns a persistent gz-transport
+    # connection, and it is the only thing in the system that sends Gazebo a
+    # command. use_sim_time is FALSE and must be: it pauses the world to pace
+    # it, and a node timed by the world it has paused never ticks again.
+    if control == 'true':
+        nodes.append(Node(
+            package='dsim_simctl', executable='sim_control_node', name='dsim_simctl',
+            output='screen',
+            parameters=[{'use_sim_time': False,
+                         'world': world_name,
+                         'step_size_s': step_size_s}],
+        ))
+
     # Tell the viewer which world is actually running. Without this its world
     # selector is cosmetic, and it could happily draw the pillar course while
     # the sim flies an empty one -- showing obstacles that are not there.
@@ -235,8 +260,7 @@ def launch_setup(context, *args, **kwargs):
             output='screen',
             parameters=[{'use_sim_time': False}],
             arguments=(['--port', web_port, '--bind', bind,
-                        '--directory', WEB_DIR,
-                        '--world-name', world_name]
+                        '--directory', WEB_DIR]
                        + (['--allow-control'] if control == 'true' else [])),
         ))
 

@@ -183,22 +183,25 @@ world, and it fires in the pillar field at the geometrically predicted moment
 
 - **`scripts/mutation_check.sh`** — deliberately breaks the mixer and controller
   (flipped yaw torque, swapped roll/pitch, dropped feedforward, inverted
-  position error, faked arm length, a rotor swapped in the layout table) and the
+  position error, faked arm length, a rotor swapped in the layout table), the
   overlay geometry (unrotated body vectors, a flipped aero residual, an arrow
-  decoupled from its rotor, a doubly-rotated velocity), then fails if the tests
-  do not notice. A green suite is only evidence if it would have gone red on a
-  wrong implementation.
+  decoupled from its rotor, a doubly-rotated velocity), the sensor models, the
+  playback pacer and the restart detector, then fails if the tests do not
+  notice. A green suite is only evidence if it would have gone red on a wrong
+  implementation.
 
-  Currently **50 C++ + 45 Python + 10 viewer tests pass, 27/27 injected bugs
+  Currently **71 C++ + 54 Python + 10 viewer tests pass, 38/38 injected bugs
   caught, 0 skipped.**
 
-  Two rules keep the harness honest, both added after it lied. A mutation whose
+  Three rules keep the harness honest, all added after it lied. A mutation whose
   pattern no longer matches the source counts as a **failure**, not a pass:
   that bug went untested, and reporting it green would make this script the
-  very thing it exists to catch. And a baseline that does not compile **aborts
+  very thing it exists to catch. A baseline that does not compile **aborts
   the run**, because every mutation is then "caught" by the same build error —
   which is exactly what happened the moment a new source file was added to the
-  package and not to the harness's compile line.
+  package and not to the harness's compile line. And every `.cpp` in a package
+  must be either compiled by the harness or **declared untestable on the host**,
+  so that failure cannot recur quietly.
 - **`gen_assets.py --check`** — fails if any generated file drifted from source.
 
 ## Scope

@@ -12,5 +12,6 @@
   <depend>actuator_msgs</depend>
   <depend>ros_gz_interfaces</depend>
   <depend>dsim_msgs</depend>
+  <depend>dsim_time</depend>
   <export><build_type>ament_cmake</build_type></export>
 </package>

@@ -1,0 +1,22 @@
+# Pause, playback speed and reset for the running world.
+#
+# Deliberately one service with an explicit command rather than a bag of
+# optional fields: "set speed" and "unpause" are different intents, and a
+# request that carried both would have to define an order between them.
+uint8 NONE=0
+uint8 SET_PAUSED=1
+uint8 SET_SPEED=2
+uint8 RESET=3
+# The pause BUTTON, as opposed to a pause state. A viewer that computed the new
+# state itself -- `post({paused: !cached.paused})` -- would be deciding
+# something from a copy that can be stale, and two open tabs would fight over
+# it. The page sends the press; the node, which knows the truth, decides.
+uint8 TOGGLE_PAUSED=4
+
+uint8 command
+bool paused                 # for SET_PAUSED
+float64 speed               # for SET_SPEED, in simulated seconds per wall second
+---
+bool ok
+string message              # a reason fit to show a user when ok is false
+SimState state              # what the simulator was observed to be doing after

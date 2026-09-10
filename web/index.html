@@ -80,6 +80,7 @@
     <tr class="sep"><td colspan="2">viewer</td></tr>
     <tr><td>frame rate</td><td id="fps">—</td></tr>
     <tr><td>simulator</td><td id="simstate">—</td></tr>
+    <tr><td>resets</td><td id="resets">—</td></tr>
   </table>
 </div>
 
@@ -95,10 +96,14 @@
   <hr>
   <label class="field">simulation</label>
   <button id="pause">pause</button>
+  <button id="simreset">reset run</button>
+  <!-- min/max/step are set from the stream, not written here: the accepted
+       range is published by the control node so the slider, the HTTP layer and
+       the node cannot disagree about what 4x means. -->
   <div id="speedrow"><span>speed</span><span id="speedval">1.00x</span></div>
-  <input type="range" id="speed" min="0.05" max="4" step="0.05" value="1">
+  <input type="range" id="speed" min="0.05" max="4" step="0.05" value="1" disabled>
   <hr>
-  <button id="reset">reset view</button>
+  <button id="reset">recentre view</button>
   <button id="clear">clear trails</button>
 </div>
 

@@ -71,24 +71,51 @@ To undo: `sudo tailscale serve reset`. To stop needing `sudo` for this:
 
 ## Controls
 
-drag to orbit · wheel or pinch to zoom · shift-drag to pan · **reset view** ·
+drag to orbit · wheel or pinch to zoom · shift-drag to pan · **recentre view** ·
 **clear trails**.
 
-### Pausing and slowing the simulation
+### Pausing, slowing and resetting the simulation
 
-**pause / resume** freezes the physics, and the **speed** slider sets the
-real-time factor from 0.05× to 4×. Useful for watching a manoeuvre frame by
-frame, and for running faster than real time when you only want the result.
+**pause / resume** freezes the physics. **reset run** puts the vehicle back on
+the pad, sends the clock back to zero and starts the referee's metrics again.
+The **speed** slider runs the world in slow motion, from 0.05× to 1×.
 
-The speed applies on release, not on every drag pixel: each change is a service
-call into Gazebo, and forty of them while dragging would be forty subprocesses.
-The HUD's `simulator` row reports what the server **observed** afterwards, not
-what was requested — so if a command fails, or someone pauses from the Gazebo
-GUI, the number tells the truth rather than the intent.
+**There is no fast-forward, and that is a measured limit rather than an
+omission.** The world is throttled to real time by `<real_time_factor>` in its
+SDF; stepping does not bypass the throttle (ten seconds of simulated time
+requested in one message took 10.38 seconds of wall clock), and the only
+service that lifts it is the one that deletes gravity — see below. The slider
+used to go to 4×, which it could not deliver.
 
-Above about 2× the 1 ms physics step stops keeping up on this machine, and the
-simulator quietly fails to reach the target instead of running faster. The
-observed factor is what to trust; that is why it is displayed.
+The speed applies on release, not on every drag pixel. Its range is not written
+in the page: the control node publishes the range it will accept, and the
+slider takes its bounds from that, so the page cannot offer a speed the
+simulator will refuse.
+
+The HUD's `simulator` row shows two numbers, "asked" and "real". They differ
+whenever the machine cannot keep up, and that is the point: a viewer that
+showed only the requested speed would be lying at exactly the moment it
+mattered.
+
+### How the speed is actually produced
+
+Not by telling Gazebo a real-time factor. `dsim_simctl` runs the world for a
+fraction of each 50 ms tick and pauses it for the rest; the fraction is the
+speed. Measured: 0.05× → 0.050×, 0.25× → 0.255×, 0.50× → 0.497×, 0.75× →
+0.755×.
+
+The reason it is done this way is `docs/`-worthy in itself. `set_physics`, the
+obvious call, makes the world **weightless**: `gz.msgs.Physics` has no gravity
+field, gz-sim 8.11.0 assigns gravity from the message regardless, and proto3
+reads the absent field as (0, 0, 0). It answers `data: true`, the world SDF
+still reports `<gravity>0 0 -9.8</gravity>`, and the IMU keeps reading a clean
+1 g — so nothing in this repo noticed while a drone climbed to 41.5 km. Sending
+the world the real-time factor it already had, a request that changes nothing,
+reproduces it in one second.
+
+`scripts/check_simcontrol.py` is the regression test. It drives pause, speed
+and reset against a live sim and asserts, after each one, that the vehicle is
+still producing about 14.7 N of thrust — which a weightless one cannot be.
 
 ### Frame rate
 
@@ -267,12 +294,23 @@ source.
 the tailnet.
 
 Every `GET` is read-only. The **one** write path is `POST /control`, and it can
-express exactly two things: paused, and a range-checked real-time factor. It
-cannot arm a vehicle, retune a controller, move the drone, or run a command —
-the world name comes from the launch file rather than the request, and the gz
-command is built as an argument list, never a shell string, so nothing from the
-network can be read as shell syntax. Validation lives in
-`dsim_viz/simcontrol.py` and is unit-tested.
+express exactly four things: `{"paused": bool}`, `{"toggle_pause": true}`,
+`{"speed": x}` and `{"reset": true}`. One verb per request. It cannot arm a
+vehicle, retune a controller, move the drone, or run a command.
+
+There is no shell anywhere in that path any more. It used to build `gz` command
+lines and run them with `subprocess`, and the narrowness claimed for it was not
+real: the CLI it reached for could delete the world's gravity, and did. The
+endpoint now forwards to one ROS service with four commands defined in
+`dsim_msgs/srv/SimControl.srv`, and `dsim_simctl` holds the only connection to
+Gazebo. Parsing and validation live in `dsim_viz/simcontrol.py` and are
+unit-tested; the accepted speed range comes from the control node rather than
+being a third copy of a constant.
+
+Every request to `/control` is logged with its outcome and the client address.
+The `GET`s are not — a 30 Hz stream would drown the launch output — but the
+write path leaves a record, because the last time it broke a run there was
+nothing to read afterwards.
 
 To remove the endpoint entirely and get the old read-only guarantee back:
 

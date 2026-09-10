@@ -30,6 +30,7 @@
 #include <string>
 
 #include <rclcpp/rclcpp.hpp>
+#include <dsim_time/sim_epoch.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <sensor_msgs/msg/imu.hpp>
 #include <sensor_msgs/msg/range.hpp>
@@ -168,14 +169,38 @@ private:
 
   /// True once ground truth has arrived AND is recent enough to sense from.
   ///
-  /// Without the staleness half, a paused world or a dead bridge leaves both
-  /// timers publishing confident readings from a frozen state forever. Real
-  /// hardware in that position stops reporting; a simulated sensor that keeps
-  /// insisting is worse than one that goes quiet, because nothing downstream
-  /// can tell.
+  /// The case this guards is a truth source that has died while the world
+  /// keeps running -- a crashed bridge, a stalled publisher. Both timers would
+  /// otherwise go on publishing confident readings from a frozen state
+  /// forever. Real hardware in that position stops reporting; a simulated
+  /// sensor that keeps insisting is worse than one that goes quiet, because
+  /// nothing downstream can tell.
+  ///
+  /// A PAUSED world is not that case and never reaches here: these timers run
+  /// on simulated time, so pausing stops the sensors and the clock together.
+  /// The comment here used to claim otherwise, describing a scenario the code
+  /// cannot be in.
   bool truthUsable(double now) const
   {
     return have_truth_ && (now - truth_stamp_) <= truth_timeout_s_;
+  }
+
+  /// Drop the state that only means something within one run.
+  ///
+  /// Called by both timers because either may be the first to notice; the
+  /// SimEpoch reports a restart exactly once, and the work is the same
+  /// whichever caller sees it.
+  void noteEpoch(double now)
+  {
+    if (!epoch_.restarted(now)) {return;}
+    RCLCPP_INFO(get_logger(), "simulated time went backwards — sensors starting a new run");
+    // Negative integration time. flowSample() would reject it, but only after
+    // reporting a reading with quality 0, and the gyro integrals in that
+    // message would be a fabricated zero rather than a measurement.
+    last_flow_s_ = 0.0;
+    // Truth from the old run is not fresh truth, however recent its stamp
+    // looks against a clock that has just jumped backwards.
+    have_truth_ = false;
   }
 
   void publishTof()
@@ -190,6 +215,7 @@ private:
       // might make to fix timer jitter, which would then be a data race on
       // std::mt19937 and would destroy the reproducibility the seed exists for.
       std::lock_guard<std::mutex> lock(mutex_);
+      noteEpoch(now);
       if (!truthUsable(now)) {
         warnStale(now);
         return;
@@ -217,6 +243,7 @@ private:
     FlowSample s;
     {
       std::lock_guard<std::mutex> lock(mutex_);
+      noteEpoch(now);
       if (!truthUsable(now)) {
         warnStale(now);
         return;
@@ -254,11 +281,17 @@ private:
   {
     if (!have_truth_) {return;}
     RCLCPP_WARN_THROTTLE(
-      get_logger(), *get_clock(), 2000,
+      get_logger(), steady_, 2000,
       "no ground truth for %.2f s (limit %.2f) -- sensors are silent rather "
       "than reporting a frozen state",
       now - truth_stamp_, truth_timeout_s_);
   }
+
+  dsim_time::SimEpoch epoch_;
+  // Throttling on the simulated clock stays mute until simulated time passes
+  // the value it had before a reset. A warning about right now needs a clock
+  // that only moves forwards.
+  mutable rclcpp::Clock steady_ {RCL_STEADY_TIME};
 
   TofConfig tof_;
   FlowConfig flow_;

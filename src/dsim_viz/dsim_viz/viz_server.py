@@ -39,14 +39,22 @@ Endpoints, all on one port and one origin:
     /              web/index.html and friends (static)
     /snapshot      one JSON object with the latest state  (curl-friendly)
     /state         text/event-stream, ~30 Hz of the same object
-    /control       POST: pause/resume and playback speed  (see simcontrol.py)
+    /control       POST: pause, playback speed, reset  (see simcontrol.py)
 
-Almost read-only. Every GET is; /control is the single write path, and it can
-express exactly two things -- paused, and a range-checked real-time factor.
-It cannot arm a vehicle, retune a controller, move the drone or run a command.
-That narrowness is the point: this port is reachable from the whole tailnet.
-With `control:=false` the endpoint still exists and answers 403 -- it is
-disabled, not removed -- and no gz command can be issued.
+Almost read-only. Every GET is; /control is the single write path. It forwards
+to one ROS service with four commands -- pause, toggle pause, speed, reset --
+and can express nothing else. It cannot arm a vehicle, retune a controller,
+move the drone or run a command. That narrowness is the point: this port is
+reachable from the whole tailnet. With `control:=false` the endpoint still
+exists and answers 403 -- it is disabled, not removed.
+
+The narrowness claim used to be made about a version of this endpoint that
+could, through `gz service -s set_physics`, delete the world's gravity and
+throw the vehicle four kilometres. So: every request to /control is logged,
+with its outcome. The GETs are not -- a 30 Hz stream would drown the launch
+output -- but the write path leaves a record, because the last time it broke a
+run there was nothing to read afterwards and the sequence of events had to be
+reconstructed from the spacing of unrelated INFO lines.
 """
 import json
 import math
@@ -64,7 +72,7 @@ from sensor_msgs.msg import Imu
 from dsim_msgs.msg import ControlDebug, FlightStatus, TrajectorySetpoint
 
 from . import overlay
-from .simcontrol import ControlError, SimControl
+from .simcontrol import UNKNOWN, ControlError, SimControlClient
 
 
 def _v3(v):
@@ -88,11 +96,12 @@ class State:
         self.status = None
         self.control = None
         self.imu = None
-        # Simulator pause/speed, sampled by a background thread. Kept outside
-        # the snapshot memo because it changes on its own schedule and must not
-        # invalidate a cached frame of vehicle state.
-        self.sim = {"paused": False, "measured_rtf": None,
-                    "target_rtf": 1.0, "enabled": False, "error": None}
+        # The simulator's own state is READ THROUGH, not copied in. It arrives
+        # on its own topic at its own rate, and a second copy here would be one
+        # more thing that can go stale: the first version of this rewrite kept
+        # a copy, forgot to refresh it, and the viewer reported "waiting for
+        # the simulation control node" while the node published happily.
+        self.sim_source = lambda: dict(UNKNOWN)
         self._cache = None
         self._cache_seq = -1
 
@@ -107,9 +116,9 @@ class State:
         """
         with self.lock:
             if self._cache_seq == self.seq:
-                # The memo holds vehicle state; the simulator's pause/speed is
-                # refreshed independently, so it is stamped in fresh.
-                return dict(self._cache, sim=dict(self.sim))
+                # The memo holds vehicle state; the simulator's pause/speed
+                # arrives on its own topic, so it is read fresh here.
+                return dict(self._cache, sim=self.sim_source())
             seq, odom, sp = self.seq, self.odom, self.setpoint
             status, control, imu = self.status, self.control, self.imu
 
@@ -134,7 +143,7 @@ class State:
             # the memo is only valid for the seq it was built from.
             if self._cache_seq < seq:
                 self._cache, self._cache_seq = snap, seq
-            snap = dict(snap, sim=dict(self.sim))
+            snap = dict(snap, sim=self.sim_source())
         return snap
 
 
@@ -289,6 +298,7 @@ class VizNode(Node):
 class Handler(SimpleHTTPRequestHandler):
     state = None          # set via partial()
     sim_control = None    # set via partial()
+    logger = None         # set via partial(): the node's logger
     rate_hz = 30.0
     # Refuse a body larger than this outright. The only legitimate request is a
     # few dozen bytes of JSON, so anything bigger is a mistake or an attempt to
@@ -326,17 +336,25 @@ class Handler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def do_POST(self):
-        """The one write path: pause/resume and playback speed.
+    def _audit(self, outcome, detail=""):
+        """One line per write attempt, whatever the outcome."""
+        if self.logger is not None:
+            self.logger.info(
+                f"/control from {self.client_address[0]}: {outcome}"
+                + (f" — {detail}" if detail else ""))
 
-        Everything the request can express is validated in simcontrol.py before
-        it reaches the simulator, and the reply reports what was OBSERVED
+    def do_POST(self):
+        """The one write path: pause, playback speed and reset.
+
+        Everything the request can express is parsed in simcontrol.py and
+        applied by dsim_simctl, and the reply reports what was OBSERVED
         afterwards rather than what was asked for.
         """
         if self.path.split("?")[0] != "/control":
             self._json({"error": "not found"}, 404)
             return
         if self.sim_control is None or not self.sim_control.enabled:
+            self._audit("refused", "control disabled")
             self._json({"error": "simulation control is disabled"}, 403)
             return
 
@@ -373,24 +391,15 @@ class Handler(SimpleHTTPRequestHandler):
             return
 
         try:
-            result = None
-            # Speed first, then pause: setting a speed on a paused world should
-            # leave it paused, not silently resume it.
-            if "rtf" in body:
-                result = self.sim_control.set_rtf(body["rtf"])
-            if "paused" in body:
-                result = self.sim_control.set_paused(bool(body["paused"]))
-            if result is None:
-                self._json({"error": "nothing to do: send paused or rtf"}, 400)
-                return
+            result = self.sim_control.command(body)
         except ControlError as exc:
             # A refused request is a normal outcome, not a server fault: 400 so
             # the page can show the reason instead of a generic failure.
+            self._audit("refused", f"{body} — {exc}")
             self._json({"error": str(exc)}, 400)
             return
 
-        with self.state.lock:
-            self.state.sim.update(result)
+        self._audit("applied", f"{body} — {result.get('message', '')}")
         self._json(result)
 
     def do_GET(self):
@@ -425,20 +434,6 @@ class Handler(SimpleHTTPRequestHandler):
             pass          # the tab was closed; entirely normal
 
 
-def _watch_sim(state, sim_control, period=2.0):
-    """Keep the reported pause/speed honest without costing anything.
-
-    Sampling gz means spawning a process, so it happens here on a slow timer
-    instead of inside snapshot() -- which the event stream calls 30 times a
-    second per browser, and which must never block on a subprocess.
-    """
-    while True:
-        observed = sim_control.observe()
-        with state.lock:
-            state.sim.update(observed)
-        time.sleep(period)
-
-
 def main():
     import argparse
 
@@ -447,28 +442,27 @@ def main():
     parser.add_argument("--bind", default="0.0.0.0")
     parser.add_argument("--directory", default="/ws/web")
     parser.add_argument("--rate", type=float, default=30.0)
-    parser.add_argument("--world-name", default="",
-                        help="Gazebo world name, for the pause/speed services. "
-                             "This is the name INSIDE the SDF, not the file "
-                             "stem; the launch file reads it and passes it.")
+    # No --world-name: this process no longer talks to Gazebo at all. The world
+    # name belongs to dsim_simctl, which is the only thing that does.
     parser.add_argument("--allow-control", action="store_true",
-                        help="expose POST /control (pause and playback speed)")
+                        help="expose POST /control (pause, speed, reset)")
     args, ros_args = parser.parse_known_args()
 
     rclpy.init(args=ros_args)
     state = State()
     node = VizNode(state)
 
-    control_enabled = bool(args.allow_control and args.world_name)
-    sim_control = SimControl(args.world_name, enabled=control_enabled)
-    with state.lock:
-        state.sim.update(sim_control.state)
-    if control_enabled:
-        threading.Thread(target=_watch_sim, args=(state, sim_control),
-                         daemon=True).start()
+    # The simulator's state arrives as a ROS message now. The polling thread
+    # that used to keep it fresh spawned a Ruby interpreter and a gz-transport
+    # discovery round every two seconds -- 1,800 processes an hour -- to read
+    # numbers that are published to any subscriber, inside a process whose own
+    # docstring is about not being the reason the physics slows down.
+    sim_control = SimControlClient(node, enabled=bool(args.allow_control))
+    state.sim_source = lambda: sim_control.state
 
     Handler.state = state
     Handler.sim_control = sim_control
+    Handler.logger = node.get_logger()
     Handler.rate_hz = args.rate
     handler = partial(Handler, directory=args.directory)
     server = ThreadingHTTPServer((args.bind, args.port), handler)
@@ -479,7 +473,7 @@ def main():
     node.get_logger().info(
         f"viewer on http://{args.bind}:{args.port}  "
         f"(static {args.directory}, SSE /state at {args.rate:.0f} Hz, "
-        f"control {'ON for world ' + args.world_name if control_enabled else 'OFF'})")
+        f"control {'ON' if args.allow_control else 'OFF'})")
 
     try:
         rclpy.spin(node)

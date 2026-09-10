@@ -11,9 +11,14 @@ namespace dsim_control
 /// Holds the active trajectory and samples it at the control rate.
 ///
 /// Semantics deliberately match how a replanning planner behaves: every new
-/// Trajectory REPLACES the previous one, and sampling is by wall-clock offset
-/// from the trajectory's header stamp — so a planner that replans at 5 Hz just
-/// keeps publishing, and a planner that emits one long trajectory also works.
+/// Trajectory REPLACES the previous one, and sampling is by offset from the
+/// trajectory's header stamp — so a planner that replans at 5 Hz just keeps
+/// publishing, and a planner that emits one long trajectory also works.
+///
+/// The clock is SIMULATED time, the same clock the stamps are written with.
+/// This comment used to say wall clock, which would have made every plan
+/// expire at the wrong rate the moment the simulation stopped running at 1x;
+/// the code was right and the comment was wrong.
 class TrajectoryBuffer
 {
 public:

@@ -13,6 +13,7 @@ find_package(rclcpp REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(dsim_msgs REQUIRED)
+find_package(dsim_time REQUIRED)
 find_package(Eigen3 REQUIRED)
 
 # Header-only sensor models, so the maths is testable without a node.
@@ -24,7 +25,7 @@ target_link_libraries(dsim_sensors_core INTERFACE Eigen3::Eigen)
 
 add_executable(sensors_node src/sensors_node.cpp)
 target_link_libraries(sensors_node dsim_sensors_core)
-ament_target_dependencies(sensors_node rclcpp nav_msgs sensor_msgs dsim_msgs)
+ament_target_dependencies(sensors_node rclcpp nav_msgs sensor_msgs dsim_msgs dsim_time)
 
 install(TARGETS sensors_node DESTINATION lib/${PROJECT_NAME})
 install(DIRECTORY include/ DESTINATION include)

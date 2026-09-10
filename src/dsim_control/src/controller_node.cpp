@@ -39,6 +39,7 @@
 #include <dsim_msgs/msg/trajectory_setpoint.hpp>
 
 #include "dsim_control/body_rate_source.hpp"
+#include <dsim_time/sim_epoch.hpp>
 #include "dsim_control/mixer.hpp"
 #include "dsim_control/se3_controller.hpp"
 #include "dsim_control/trajectory_buffer.hpp"
@@ -126,8 +127,12 @@ public:
           return;
         }
         buffer_.set(*msg);
-        RCLCPP_INFO(
-          get_logger(), "accepted trajectory: %zu points, %.2f s",
+        // Throttled, and on the STEADY clock. At 5 Hz this line was 99.55% of
+        // an eleven-hour log -- 200,741 of 201,647 lines -- and the 903
+        // warnings that mattered were the other 0.45%. A log that has to be
+        // filtered before it can be read is not a log.
+        RCLCPP_INFO_THROTTLE(
+          get_logger(), steady_, 10000, "accepting trajectories: %zu points, %.2f s",
           msg->points.size(), buffer_.duration());
       });
 
@@ -257,7 +262,7 @@ private:
     state_.angular_rate = rate_source_->update(measured, dt);
     if (rate_source_->rejected() != before) {
       RCLCPP_WARN_THROTTLE(
-        get_logger(), *get_clock(), 2000,
+        get_logger(), steady_, 2000,
         "discarded an implausible body rate of %.1f rad/s (limit %.0f); "
         "%zu rejected so far -- the state source is malfunctioning",
         measured.norm(), rate_source_->maxRate(), rate_source_->rejected());
@@ -289,6 +294,20 @@ private:
 
     const double now = nowSeconds();
 
+    // A reset sends simulated time back to zero, which leaves a trajectory
+    // stamped in the old run sitting in the buffer, dated minutes into the
+    // future. Sampling it would hold the last commanded point until the
+    // planner published again; clearing it drops the controller into its
+    // position hold, which is the correct behaviour with no plan.
+    if (epoch_.restarted(now)) {
+      RCLCPP_INFO(get_logger(), "simulated time went backwards — dropping the stale plan");
+      buffer_.clear();
+      hold_valid_ = false;
+      std::lock_guard<std::mutex> lock(state_mutex_);
+      last_odom_s_ = now;
+      last_imu_s_ = now;
+    }
+
     // No rate feedback means no rotational loop. Commanding anyway would fly
     // on a fabricated zero rate, which looks fine at hover and diverges the
     // moment the vehicle is disturbed.
@@ -298,14 +317,14 @@ private:
     }
     if ((now - last_odom) > odom_timeout_s_) {
       RCLCPP_WARN_THROTTLE(
-        get_logger(), *get_clock(), 2000,
+        get_logger(), steady_, 2000,
         "no state for %.2f s — cutting motors", now - last_odom);
       publishIdle();
       return;
     }
     if ((now - last_imu) > imu_timeout_s_) {
       RCLCPP_WARN_THROTTLE(
-        get_logger(), *get_clock(), 2000,
+        get_logger(), steady_, 2000,
         "no gyro for %.2f s — cutting motors", now - last_imu);
       publishIdle();
       return;
@@ -342,7 +361,7 @@ private:
 
     if (dbg.tilt_clamped) {
       RCLCPP_WARN_THROTTLE(
-        get_logger(), *get_clock(), 1000,
+        get_logger(), steady_, 1000,
         "tilt clamped at %.0f deg — trajectory is more aggressive than the vehicle allows",
         controller_->gains().max_tilt_rad * 180.0 / M_PI);
     }
@@ -454,6 +473,13 @@ private:
   std::unique_ptr<SE3Controller> controller_;
   std::unique_ptr<Mixer> mixer_;
   std::unique_ptr<BodyRateSource> rate_source_;
+  dsim_time::SimEpoch epoch_;
+  // Throttling on the SIMULATED clock goes permanently mute after a reset:
+  // rcutils compares `now >= last_logged + period`, and a clock that jumped
+  // back has to re-reach the old value before another line is allowed through.
+  // Every warning in this file is about right now, so all of them are timed by
+  // a clock that only moves forwards.
+  rclcpp::Clock steady_ {RCL_STEADY_TIME};
   TrajectoryBuffer buffer_;
 
   mutable std::mutex state_mutex_;

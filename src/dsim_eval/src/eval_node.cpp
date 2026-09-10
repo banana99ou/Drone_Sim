@@ -30,6 +30,7 @@
 #include <dsim_msgs/msg/flight_status.hpp>
 #include <dsim_msgs/msg/trajectory_setpoint.hpp>
 #include <dsim_msgs/srv/reset_run.hpp>
+#include <dsim_time/sim_epoch.hpp>
 
 namespace dsim_eval
 {
@@ -198,7 +199,9 @@ private:
   {
     // Momentum-theory scaling anchored to the data sheet's hover draw:
     //   P / P_hover = (T / T_hover)^1.5
-    // This is a MODEL, not a measurement — see docs/SYSID.md before quoting it.
+    // This is a MODEL, not a measurement. It is anchored to one data-sheet
+    // number and has never been compared against a real battery, so it is
+    // a figure for ranking plans against each other and nothing else.
     double thrust = 0.0;
     for (const auto & w : m.velocity) {thrust += motor_constant_ * w * w;}
     const double hover_thrust = mass_ * 9.80665;
@@ -216,6 +219,16 @@ private:
   void onTruth(const nav_msgs::msg::Odometry & m)
   {
     const double now = get_clock()->now().seconds();
+    // Checked here rather than on the publish timer because this is where
+    // everything accumulates. One truth sample attributed to the wrong run is
+    // one sample of a 3.8 km excursion inside the sum of squares for a flight
+    // that never left 5 cm.
+    if (epoch_.restarted(now)) {
+      RCLCPP_INFO(
+        get_logger(), "simulated time went backwards — scoring a new run (reset %zu)",
+        epoch_.epochs());
+      reset();
+    }
     const double px = m.pose.pose.position.x;
     const double py = m.pose.pose.position.y;
     const double pz = m.pose.pose.position.z;
@@ -300,6 +313,9 @@ private:
     have_last_pos_ = false; was_airborne_ = false;
     RCLCPP_INFO(get_logger(), "metrics reset");
   }
+
+  // Simulated time going backwards means a new run. See dsim_time/sim_epoch.hpp.
+  dsim_time::SimEpoch epoch_;
 
   std::vector<Obstacle> obstacles_;
   double vehicle_radius_, hover_power_w_, mass_, motor_constant_, publish_hz_;

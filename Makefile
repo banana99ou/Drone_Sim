@@ -4,7 +4,7 @@ export UID := $(shell id -u)
 export GID := $(shell id -g)
 
 .PHONY: help setup build up down shell sim viz stop status test test-overlay \
-        test-viewer verify assets fly telemetry sensors plot clean
+        test-viewer verify assets fly telemetry simctl sensors plot clean
 
 help:
 	@echo "make setup    one-time host setup (sudo: docker group + nvidia toolkit)"
@@ -16,6 +16,7 @@ help:
 	@echo "make verify   mutation check + generated-asset drift check (host, no docker)"
 	@echo "make fly      headless flight check: proves it actually flies"
 	@echo "make telemetry  cross-check a RUNNING sim's control telemetry"
+	@echo "make simctl     drive pause/speed/reset against a RUNNING sim"
 	@echo "make sensors  measure a RUNNING sim's sensor noise vs its config"
 	@echo "make viz      start the sim + browser viewer, print the URL"
 	@echo "make stop     stop the sim and the viewer"
@@ -93,6 +94,12 @@ assets:
 # different paths, so agreement is evidence rather than self-report.
 telemetry:
 	python3 scripts/check_telemetry.py
+
+# Needs a sim already running WITH controls (make viz, which enables them).
+# Drives pause, speed and reset against the live world and checks the vehicle
+# still weighs anything afterwards -- the one thing fifty unit tests missed.
+simctl:
+	python3 scripts/check_simcontrol.py
 
 # Measures the live sensor noise against config/drone.yaml. Needs a HOVERING
 # sim: on a still vehicle the spread around zero rate and one g is the noise,

@@ -8,8 +8,14 @@
 # This talks to Gazebo directly rather than through ROS, because the pose
 # service is a gz-transport service with no ROS bridge by default.
 #
-# NOTE: this moves the vehicle but does NOT reset the referee's metrics.
-# Call both:  ros2 service call /drone/eval/reset dsim_msgs/srv/ResetRun "{}"
+# THIS IS THE NARROW TOOL. It moves the vehicle and nothing else: the clock
+# keeps running, the referee keeps accumulating, and the trajectory keeps
+# playing. That is what you want when placing a vehicle for a trial.
+#
+# To start a whole run again -- vehicle home, clock to zero, metrics cleared --
+# use the simulator's reset instead, which every node notices on its own:
+#   ros2 service call /sim/control dsim_msgs/srv/SimControl "{command: 3}"
+# or press "reset run" in the viewer.
 set -euo pipefail
 
 X="${1:-0}"; Y="${2:-0}"; Z="${3:-0.1}"

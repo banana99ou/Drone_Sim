@@ -12,7 +12,7 @@ echo "container:  up"
 
 echo -n "processes:  "
 $COMPOSE exec -T sim bash -lc \
-  'ps -eo args | grep -cE "controller_node|eval_node|reference_generator|parameter_bridge|viz_server"' 2>/dev/null
+  'ps -eo args | grep -cE "$(find /ws/install -mindepth 4 -maxdepth 4 -path "*/lib/*" \( -type f -o -type l \) -perm -u+x -printf "%f\n" 2>/dev/null | sort -u | paste -sd"|")|parameter_bridge"' 2>/dev/null
 
 echo "publishing:"
 $COMPOSE exec -T sim bash -lc \
