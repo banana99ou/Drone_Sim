@@ -64,7 +64,7 @@ def main(url):
     snap = fetch(url)
     c = Checks()
 
-    for key in ("pose", "control", "imu", "overlay"):
+    for key in ("pose", "control", "imu", "overlay", "state_vel"):
         if not snap.get(key):
             c.bad(f"{key} present", "missing from /snapshot",
                   "a dead subscription, or a node that never started")
@@ -91,11 +91,16 @@ def main(url):
 
     # 2. Same vector, two frames. A rotation cannot change a length, so the
     #    world-frame velocity the controller resolved must match the magnitude
-    #    of the body-frame twist Gazebo published.
+    #    of the body-frame twist it was GIVEN -- state_vel, the Odometry the
+    #    controller subscribes to, which is /drone/state_est by default and
+    #    /drone/truth under state:=truth. Comparing against truth instead would
+    #    fail by exactly the estimation error (26 mm/s on an 18 degree lap,
+    #    against a 4 mm/s tolerance): a measurement of the estimator, not an
+    #    identity about the controller.
+    given = math.dist(snap["state_vel"], [0, 0, 0])
     c.near("velocity magnitude survives the frame change",
-           speed, math.dist(snap["vel"], [0, 0, 0]),
-           max(SAMPLE_SKEW, SAMPLE_SKEW * speed),
-           f"|v_world| {speed:.4f} vs |twist| {math.dist(snap['vel'], [0, 0, 0]):.4f} m/s",
+           speed, given, max(SAMPLE_SKEW, SAMPLE_SKEW * speed),
+           f"|v_world| {speed:.4f} vs |twist given| {given:.4f} m/s",
            "a body/world frame mix-up in the odometry handling")
 
     # 3. Physics, not code: holding altitude at a bank angle needs

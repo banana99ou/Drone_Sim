@@ -23,6 +23,17 @@ which fly a circle. A check that quietly does nothing is worse than no check.
 The ground-truth cross-checks need motion to have any signal, so those are
 skipped -- loudly -- when the vehicle is hovering.
 
+The magnetometer gets the same two kinds of check: its noise against config
+in every regime, and its tilt-compensated heading against the true yaw. Its
+noise estimate uses SECOND differences rather than first, and the reason is
+arithmetic, not taste: the compass runs at 50 Hz and its signal IS the
+attitude, which on the demo lap turns at 1.8 rad/s. That moves the body field
+by ~0.5 uT between samples -- the size of the noise -- so a first-difference
+estimate reads 0.3-0.5 uT from motion alone on a NOISELESS sensor, inside the
+pass band. Zeroing the noise would have passed. Second differences cancel the
+linear part and leave curvature x dt^2, about 0.01 uT here, and the script
+measures that floor from the truth attitude rather than assuming it.
+
 Exit code is the number of failed checks, so this works as a gate.
 """
 import math
@@ -35,7 +46,7 @@ import yaml
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
-from sensor_msgs.msg import Imu, Range
+from sensor_msgs.msg import Imu, MagneticField, Range
 
 from dsim_msgs.msg import OpticalFlow
 
@@ -59,6 +70,44 @@ def yaw_free_cos_tilt(q):
     return 1.0 - 2.0 * (q.x * q.x + q.y * q.y)
 
 
+def euler_zyx(q):
+    """Roll, pitch, yaw for R = Rz(yaw) Ry(pitch) Rx(roll), from a quaternion."""
+    w, x, y, z = q.w, q.x, q.y, q.z
+    roll = math.atan2(2.0 * (w * x + y * z), 1.0 - 2.0 * (x * x + y * y))
+    pitch = math.asin(max(-1.0, min(1.0, 2.0 * (w * y - z * x))))
+    yaw = math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+    return roll, pitch, yaw
+
+
+def rotate(q, v):
+    """q * v * q^-1: a body vector expressed in the world, for a truth q."""
+    w, x, y, z = q
+    vx, vy, vz = v
+    tx, ty, tz = 2.0 * (y * vz - z * vy), 2.0 * (z * vx - x * vz), 2.0 * (x * vy - y * vx)
+    return (vx + w * tx + (y * tz - z * ty),
+            vy + w * ty + (z * tx - x * tz),
+            vz + w * tz + (x * ty - y * tx))
+
+
+def world_to_body(q, v):
+    """A world vector as the body sees it -- what the magnetometer models."""
+    return rotate((q[0], -q[1], -q[2], -q[3]), v)
+
+
+def level(b, roll, pitch):
+    """Ry(pitch) Rx(roll) b: the body field with the tilt taken back out, so
+    only yaw is left in it. Exactly the tilt compensation a heading estimator
+    performs with roll and pitch from the accelerometer -- here from truth,
+    because this checks the SENSOR, not an estimator."""
+    cr, sr, cp, sp = math.cos(roll), math.sin(roll), math.cos(pitch), math.sin(pitch)
+    ux, uy, uz = b[0], cr * b[1] - sr * b[2], sr * b[1] + cr * b[2]
+    return cp * ux + sp * uz, uy, -sp * ux + cp * uz
+
+
+def wrap_pi(a):
+    return math.atan2(math.sin(a), math.cos(a))
+
+
 def sigma_from_differences(series):
     """Estimate white-noise sigma from consecutive differences.
 
@@ -74,6 +123,23 @@ def sigma_from_differences(series):
     return statistics.stdev(diffs) / math.sqrt(2.0)
 
 
+def sigma_from_second_differences(series):
+    """Estimate white-noise sigma from second differences.
+
+    var(x[n+1] - 2 x[n] + x[n-1]) = 6 var(noise) for independent samples. A
+    smooth signal underneath contributes its CURVATURE over one interval
+    rather than its slope, which is what makes this usable on the magnetometer
+    at 50 Hz where the first-difference estimate is not (see the module
+    docstring for the numbers). As with first differences, whatever the real
+    signal contributes makes the estimate LARGER, so this cannot fake a pass
+    on a clean sensor.
+    """
+    if len(series) < 4:
+        return 0.0
+    d2 = [c - 2.0 * b + a for a, b, c in zip(series, series[1:], series[2:])]
+    return statistics.stdev(d2) / math.sqrt(6.0)
+
+
 class Probe(Node):
     def __init__(self):
         super().__init__("sensor_probe")
@@ -83,6 +149,7 @@ class Probe(Node):
         self.truth = None
         self.tof = []      # (measured, altitude, cos_tilt)
         self.flow = []     # (vx, vy, true_vx, true_vy, quality, range)
+        self.mag = []      # ((bx, by, bz), truth q, (roll, pitch, yaw))
         self.create_subscription(Imu, "/drone/imu", self.on_imu,
                                  qos_profile_sensor_data)
         self.create_subscription(Odometry, "/drone/truth", self.on_truth,
@@ -91,6 +158,8 @@ class Probe(Node):
                                  qos_profile_sensor_data)
         self.create_subscription(OpticalFlow, "/drone/optical_flow",
                                  self.on_flow, qos_profile_sensor_data)
+        self.create_subscription(MagneticField, "/drone/mag", self.on_mag,
+                                 qos_profile_sensor_data)
 
     def on_imu(self, m):
         g, a = m.angular_velocity, m.linear_acceleration
@@ -103,7 +172,7 @@ class Probe(Node):
         q = m.pose.pose.orientation
         v = m.twist.twist.linear          # body frame, REP-145
         self.truth = (m.pose.pose.position.z, yaw_free_cos_tilt(q),
-                      (v.x, v.y, v.z))
+                      (v.x, v.y, v.z), (q.w, q.x, q.y, q.z), euler_zyx(q))
         self.speeds.append(math.dist((v.x, v.y, v.z), (0, 0, 0)))
 
     def on_tof(self, m):
@@ -121,6 +190,11 @@ class Probe(Node):
         vy = -(m.integrated_x - m.integrated_xgyro) / dt * h
         tv = self.truth[2]
         self.flow.append((vx, vy, tv[0], tv[1], m.quality, h))
+
+    def on_mag(self, m):
+        if self.truth:
+            b = m.magnetic_field
+            self.mag.append(((b.x, b.y, b.z), self.truth[3], self.truth[4]))
 
 
 class Checks:
@@ -274,6 +348,93 @@ def check_optical_flow(p, cfg, c, speed):
               "consumer would reject usable readings")
 
 
+def check_magnetometer(p, cfg, c):
+    """Noise of the configured size on every axis, and a heading that is the
+    true yaw once the reading is levelled with the true roll and pitch.
+
+    Both are checked against a lever measured in the same window, so neither
+    can print a pass it did not earn. The noise estimator's floor is what the
+    truth attitude alone would produce through the model with NO noise; if
+    that were inside the pass band the check could not fail, and it says so
+    instead of passing. The heading check computes what the two canonical
+    wrong sensors would report -- the world field unrotated, and the field
+    rotated by R instead of R^T -- and skips, loudly, when the window has too
+    little yaw and tilt for either to be told from the right one.
+    """
+    if not p.mag:
+        c.bad("magnetometer publishes", "no samples on /drone/mag",
+              "a sensor that never publishes, or a node that refused its parameters")
+        return
+
+    mag = cfg["magnetometer"]
+    noise = float(mag["noise_t"])
+    field = tuple(float(v) for v in mag["field_world_t"])
+    readings = [b for b, _, _ in p.mag]
+    noiseless = [world_to_body(q, field) for _, q, _ in p.mag]
+
+    # (a) noise, in every regime. Reported in uT so the numbers are legible.
+    floor = max(sigma_from_second_differences([b[i] for b in noiseless]) for i in range(3))
+    # A configured noise of zero is not a degenerate ratio, it is a sensor
+    # that must read (nearly) exactly the model -- ratio() reports inf on it.
+    if noise > 0.0 and floor / noise >= SIGMA_LOW:
+        print(f"  skip mag noise                          the vehicle's own motion "
+              f"puts {floor * 1e6:.3f} uT into the estimator, inside the pass band "
+              f"for {noise * 1e6:.2f} uT of noise -- this check could not fail here")
+    else:
+        for i, axis in enumerate("xyz"):
+            c.ratio(f"mag {axis} noise (uT)",
+                    1e6 * sigma_from_second_differences([b[i] for b in readings]),
+                    1e6 * noise,
+                    f"noise configured but not applied by the sensor (motion floor "
+                    f"here is {floor * 1e6:.3f} uT, so zero noise reads ratio "
+                    f"~{floor / noise if noise > 0.0 else float('inf'):.2f})")
+
+    # (b) heading. World +x is magnetic north with the declination folded in,
+    # so the field's own heading is the reference the yaw is read against.
+    b_h = math.hypot(field[0], field[1])
+    decl = math.atan2(field[1], field[0])
+
+    def heading_error(b, rpy):
+        lx, ly, _ = level(b, rpy[0], rpy[1])
+        return abs(wrap_pi(decl - math.atan2(ly, lx) - rpy[2]))
+
+    err = statistics.median([heading_error(b, rpy) for b, _, rpy in p.mag])
+    # The two bugs the unit tests exist for, evaluated on THIS window's
+    # attitudes: how wrong would each have been here?
+    unrotated = statistics.median([heading_error(field, rpy) for _, _, rpy in p.mag])
+    transposed = statistics.median([heading_error(rotate(q, field), rpy)
+                                    for _, q, rpy in p.mag])
+    # One sigma of heading from one sigma of field across the horizontal
+    # component; median of |N(0, s)| is 0.674 s, allow 3x for the estimator's
+    # own spread, plus whatever a configured hard iron may add. Plus one
+    # truth interval of yaw: the sensor node and this probe each pair a
+    # reading with THEIR latest truth sample, which can differ by one, and
+    # on a 1.8 rad/s lap that is 0.4 deg. Derived from the window, so a
+    # noiseless compass is held to the lag and nothing else.
+    sigma_psi = noise / b_h
+    yaws = [rpy[2] for _, _, rpy in p.mag]
+    yaw_step = statistics.median([abs(wrap_pi(b - a)) for a, b in zip(yaws, yaws[1:])])
+    truth_dt = SECONDS / max(1, len(p.speeds))
+    mag_dt = SECONDS / len(p.mag)
+    lag = yaw_step / mag_dt * truth_dt
+    limit = 3.0 * 0.674 * sigma_psi + float(mag["hard_iron_t"]) / b_h + lag
+    lever = min(unrotated, transposed)
+    if lever < 3.0 * limit:
+        print(f"  skip mag heading                        too little yaw and tilt "
+              f"here: an unrotated field would err only {math.degrees(lever):.2f} "
+              f"deg (limit {math.degrees(limit):.2f}); fly a circle to exercise it")
+    else:
+        c.within("mag heading recovers true yaw", err, limit,
+                 f"median error {math.degrees(err):.3f} deg (limit "
+                 f"{math.degrees(limit):.2f} from noise_t / |B_h| + "
+                 f"{math.degrees(lag):.2f} lag; unrotated would err "
+                 f"{math.degrees(unrotated):.1f}, R for R^T "
+                 f"{math.degrees(transposed):.1f})",
+                 "the world field reported unrotated, R applied instead of R^T, "
+                 "swapped components, or a vertical component that does not "
+                 "leak into the horizontal axes under bank")
+
+
 def main():
     with open(CONFIG) as fh:
         cfg = yaml.safe_load(fh)["drone"]["sensors"]
@@ -293,12 +454,15 @@ def main():
 
     speed = statistics.fmean(p.speeds) if p.speeds else 0.0
     print(f"{n} IMU samples over {SECONDS:.0f} s ({n / SECONDS:.0f} Hz), "
-          f"{len(p.tof)} range, {len(p.flow)} usable flow")
+          f"{len(p.tof)} range, {len(p.flow)} usable flow, {len(p.mag)} mag")
     print(f"mean speed {speed:.2f} m/s")
     print()
 
     c = Checks()
     check_imu_noise(p, cfg, c)
+    print()
+    # Decides for itself whether the window has signal; see its docstring.
+    check_magnetometer(p, cfg, c)
     print()
 
     if speed >= MOVING_SPEED:

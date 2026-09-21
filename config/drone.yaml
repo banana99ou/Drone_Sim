@@ -53,3 +53,12 @@ drone:
       min_height_m: 0.1
       max_height_m: 3.0
       max_tilt_rad: 0.52
+    # Not a Gazebo sensor: synthesised from the truth attitude by
+    # dsim_sensors, so nothing here has a twin in model.sdf. The field is in
+    # the WORLD frame, +x magnetic north, z up (vertical component negative
+    # in the northern hemisphere); readings are body frame, in tesla.
+    magnetometer:
+      rate_hz: 50.0
+      noise_t: 5.0000e-07
+      hard_iron_t: 0.0000e+00
+      field_world_t: [3.0000e-05, 0.0000e+00, -4.0000e-05]

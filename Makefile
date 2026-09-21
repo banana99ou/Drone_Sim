@@ -4,7 +4,7 @@ export UID := $(shell id -u)
 export GID := $(shell id -g)
 
 .PHONY: help setup build up down shell sim viz stop status test test-overlay \
-        test-viewer verify assets fly telemetry simctl sensors plot clean
+        test-viewer verify assets fly telemetry simctl sensors estimator plot clean
 
 help:
 	@echo "make setup    one-time host setup (sudo: docker group + nvidia toolkit)"
@@ -18,6 +18,7 @@ help:
 	@echo "make telemetry  cross-check a RUNNING sim's control telemetry"
 	@echo "make simctl     drive pause/speed/reset against a RUNNING sim"
 	@echo "make sensors  measure a RUNNING sim's sensor noise vs its config"
+	@echo "make estimator  compare a RUNNING sim's /drone/state_est against truth"
 	@echo "make viz      start the sim + browser viewer, print the URL"
 	@echo "make stop     stop the sim and the viewer"
 	@echo "make status   is it up and publishing?"
@@ -44,13 +45,14 @@ sim:
 		source install/setup.bash && ros2 launch dsim_bringup sim.launch.py"
 
 # Three suites, three languages, one command. They cover different things:
-#   dsim_control  the control maths and the mixer geometry           (C++)
-#   dsim_sensors  the rangefinder and optical-flow error models       (C++)
-#   dsim_viz      the overlay geometry the browser is handed         (Python)
-#   web/js        the drawing maths and colour mapping in the page   (JS)
+#   dsim_control     the control maths and the mixer geometry          (C++)
+#   dsim_sensors     the rangefinder and optical-flow error models      (C++)
+#   dsim_estimation  the attitude and velocity filters                  (C++)
+#   dsim_viz         the overlay geometry the browser is handed        (Python)
+#   web/js           the drawing maths and colour mapping in the page  (JS)
 test: test-overlay test-viewer
 	$(COMPOSE) exec sim bash -lc \
-		"colcon test --packages-select dsim_control dsim_sensors && \
+		"colcon test --packages-select dsim_control dsim_sensors dsim_estimation && \
 		colcon test-result --verbose"
 
 # All overlay LOGIC lives on the ROS side, so this is where an arrow pointing
@@ -107,6 +109,16 @@ simctl:
 #   make viz REFERENCE=hover WORLD=empty
 sensors:
 	$(COMPOSE) exec sim bash -lc "cd /ws && python3 scripts/check_sensors.py"
+
+# Compares /drone/state_est and /drone/estimator_debug against /drone/truth
+# on a RUNNING sim, over ~20 s. Works in hover and in a turn, and reports
+# different things in each: the hover bounds are the sensor-noise floor, the
+# turn adds the banked-turn attitude error the filter is known to have. It
+# also checks the estimate is NOT a copy of truth: the errors must be
+# non-zero and must track the sensor noise.
+#   make viz REFERENCE=hover WORLD=empty      (or the default circle)
+estimator:
+	$(COMPOSE) exec sim bash -lc "cd /ws && python3 scripts/check_estimator.py"
 
 clean:
 	$(COMPOSE) down -v

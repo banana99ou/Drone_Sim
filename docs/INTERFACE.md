@@ -15,6 +15,9 @@ publish trajectories, it flies them and scores the result.**
 | sim → you | `/drone/setpoint` | `dsim_msgs/msg/TrajectorySetpoint` | 250 Hz |
 | sim → you | `/drone/tof` | `sensor_msgs/msg/Range` | 30 Hz |
 | sim → you | `/drone/optical_flow` | `dsim_msgs/msg/OpticalFlow` | 50 Hz |
+| sim → you | `/drone/mag` | `sensor_msgs/msg/MagneticField` | 50 Hz |
+| sim → you | `/drone/state_est` | `nav_msgs/msg/Odometry` | 250 Hz |
+| sim → you | `/drone/estimator_debug` | `dsim_msgs/msg/EstimatorDebug` | 250 Hz |
 | sim → you | `/sim/state` | `dsim_msgs/msg/SimState` | 5 Hz |
 | **you → sim** | `/sim/control` (service) | `dsim_msgs/srv/SimControl` | on demand |
 
@@ -68,8 +71,8 @@ than silent. `scripts/check_telemetry.py` asserts them against a live run.
 
 ### The onboard sensors
 
-Both are simplified, and the simplifications are stated so you know where the
-model stops being usable.
+All three are simplified, and the simplifications are stated so you know where
+the model stops being usable.
 
 **`/drone/tof`** — a downward single-beam rangefinder, VL53L1X class. It
 reports the **slant range**, not the altitude: a tilted vehicle's downward beam
@@ -105,10 +108,144 @@ That check also covers the range: a wrong `ground_distance_m` scales the
 reconstructed velocity proportionally, so reporting twice the true height fails
 it.
 
+**`/drone/mag`** — a three-axis magnetometer, the compass in a consumer IMU.
+`sensor_msgs/MagneticField` in **tesla**, in the body frame
+(`frame_id: base_link`), at 50 Hz. It reports the Earth's field as the body
+sees it: `B_body = R^T · field_world + hard_iron + noise`, where `R` is the
+true attitude. The world field is one fixed vector, **+x is magnetic north**
+with the declination already folded in (there is no separate true north), z
+is up, so the vertical component is negative — the default
+`[30, 0, -40] µT` dips 53°, roughly Korea. That vertical component is most of
+the field, and under bank it leaks into the horizontal axes: at 20° of roll
+an uncompensated compass reads 24° while the vehicle points north. Level the
+reading with roll and pitch before taking a heading from it. Noise is 0.5 µT
+per axis, about **one degree of heading** in a 30 µT horizontal field, and
+`magnetic_field_covariance` carries exactly that and nothing else: a
+hard-iron offset — a fixed body-frame bias of magnitude `hard_iron_t` in a
+seeded random direction, the field of the airframe's own magnetised parts —
+is not random, so no covariance can describe it, and an estimator that
+trusts the matrix will be confidently wrong by it. It ships at **zero**, an
+ideal compass; set `hard_iron_t` in `scripts/gen_assets.py` to make
+calibration the estimator's problem. It is **not a Gazebo sensor**: like the
+rangefinder and the flow it is synthesised from the truth attitude in
+`dsim_sensors`, so the model is a pure function the unit tests pin and the
+mutation harness breaks on purpose, and so the hard iron exists at all —
+Gazebo's magnetometer offers Gaussian noise and nothing else. No soft iron,
+no motor-current field. `scripts/check_sensors.py` measures the live noise
+against `noise_t` in every regime and, on a lap, levels each reading with the
+true roll and pitch and requires the heading to match the true yaw to a
+limit derived from `noise_t / |B_horizontal|` — measured median **0.66°** on
+the 3.5 s demo lap against a 2.3° limit, where a sensor reporting the world
+field unrotated errs by 94°. Its noise estimate uses second differences, not
+first: at 50 Hz with the yaw following the path, the body field moves ~0.5 µT
+per sample on that lap, the size of the noise, so a first-difference estimate
+passes a noiseless compass. Dropping the noise from the model fails the check
+at ratio 0.02.
+
 `noise_seed:=1` by default gives a repeatable starting point and a fixed noise
 distribution. It does **not** promise bit-identical streams between runs: one
 generator feeds both sensor timers, so which draw lands in which reading
 depends on callback interleaving. Use `noise_seed:=0` for a fresh sequence.
+
+## State estimate
+
+`/drone/state_est` is what the controller flies on by default. It is shaped
+exactly like `/drone/truth` — `nav_msgs/Odometry`, `frame_id: world`,
+`child_frame_id: base_link`, twist in the **body** frame per REP-145 — so the
+controller consumes it through a topic remap and nothing in `dsim_control`
+knows which of the two it is reading. That is the point: a run on the
+estimate and a run on truth differ in one launch argument and nothing else.
+
+| Field | Comes from | Notes |
+|---|---|---|
+| `pose.orientation` | gyro integrated at 250 Hz; roll/pitch pulled to the accelerometer's gravity direction, yaw to the magnetometer's tilt-compensated heading | Mahony-style complementary filter, `src/dsim_estimation/include/dsim_estimation/attitude_filter.hpp` |
+| `twist.linear` (body) | accelerometer rotated with the estimated attitude, gravity removed, integrated; pinned horizontally by the optical flow (`flow_tau_s`) and vertically by the rangefinder through a second-order altitude / climb-rate pair | `velocity_filter.hpp` |
+| `twist.angular` | the raw gyro sample | the controller does not read it here — it takes rates from `/drone/imu` and gates them itself |
+| `pose.position` | **ground truth, copied** | no position sensor exists yet; see below |
+
+**Position is still truth**, by decision. The simulator has no position
+sensor, and inventing one — a GPS, a SLAM or VIO emulator with its own drift
+model — is separate work with its own error budget. The estimator's
+`position_source` parameter is the seam it plugs into; its only accepted
+value today is `truth`, and anything else refuses to start rather than
+falling back. Until then the position loop closes on perfect position, and
+the estimate is exercised where it matters most to a quadrotor: the attitude
+and velocity loops, which are the fast ones.
+
+**`state:=est|truth`** on `sim.launch.py` chooses, default `est`. Only the
+controller's subscription is remapped; the referee, the sensors and the
+viewer always see truth, and the estimator itself reads truth for position.
+`state:=est` with `sensors:=false` is refused at launch — a controller whose
+state source never publishes sits on the ground with its motors cut, which
+looks like a quiet, healthy sim until someone asks why it never took off.
+
+**`/drone/estimator_debug`** reports every step: the attitude and gyro-bias
+estimates, the fused velocity, the last flow-derived world velocity, the
+last rangefinder-derived altitude and the climb rate, the mag heading, and
+a flag per sensor saying whether its correction was applied on that step.
+`make estimator` (`scripts/check_estimator.py`) reads it and `/drone/truth`
+over 20 s and asserts the errors against bounds derived from the configured
+sensor noise and the gains — and also asserts the errors are **not zero**
+and are **correlated with the sensor noise** reconstructed independently
+from `/drone/mag` and `/drone/optical_flow`, because an estimator that
+copied truth would pass every bound.
+
+**Known limitations**, each measured rather than assumed:
+
+* **Banked turns.** The accelerometer cannot separate gravity from the
+  vehicle's own acceleration; in a coordinated turn it reports "up" along
+  the thrust axis, and the roll/pitch correction pulls the estimate towards
+  level for as long as the turn lasts. The gain is low (`kp_accel` 0.1 /s)
+  so this costs about **1° of tilt on the 3.5 s demo lap** (steady state
+  `kp·sin(bank)/√(kp²+Ω²)`, up to twice that during the first ten seconds
+  of a turn), and it is why there is **no integral gain on the
+  accelerometer**: the turn's error is constant in the body frame,
+  indistinguishable from a gyro bias, and any integrator winds up on it at
+  about half a degree per lap without bound. The 2e-4 rad/s gyro bias the
+  integrator would have removed costs 0.11° through `kp_accel`, below the
+  accelerometer's own bias floor.
+* **Yaw bias from hard iron.** A body-frame magnetic offset turns with the
+  vehicle, so no single reading can tell it from the Earth's field; the
+  estimator does not calibrate it, and it shows up as a constant heading
+  error of `hard_iron_t / |B_horizontal|`. It ships at zero. Without a mag
+  at all (no `/drone/mag` within `mag_timeout_s`, or no field configured),
+  yaw starts at zero and integrates the gyro: about 0.7°/min of drift from
+  the bias, plus a slow leak from the accelerometer correction while banked.
+  The node warns once at startup and the debug message says so on every step.
+* **Flow over a flat floor only.** The optical flow is a velocity only
+  because the rangefinder supplies a height, and both assume the ground
+  plane at z = 0: over a pillar top or a slope the height is wrong and so is
+  the velocity, and neither sensor can tell. The vehicle flies at 1.5 m and
+  the pillars are 3 m, so it never passes over one in the shipped course.
+* **No accelerometer bias state.** A 0.02 m/s² bias becomes a steady
+  velocity offset of `bias × flow_tau_s` horizontally (4 mm/s) and
+  `bias × 2ζ/ω` vertically (14 mm/s) — below what the sensors themselves
+  contribute, so not worth a third filter state yet.
+
+Measured live on this machine with `make estimator`, 20 s windows, shipped
+noise and gains (the script prints each bound's derivation next to the
+number):
+
+| | hover, 1.5 m | 1 m circle, 3.5 s lap (18° bank, 1.8 m/s) |
+|---|---|---|
+| tilt (roll/pitch) error RMS | **0.033°** | **1.00°** — the banked-turn figure above, to the decimal |
+| yaw error RMS / mean | 0.070° / +0.05° | 0.106° / +0.02° |
+| velocity error RMS x / y / z | 6 / 8 / 9 mm/s | 29 / 26 / 11 mm/s |
+| `/drone/state_est` rate | 250.1 Hz, stamps equal to the IMU's | 250.1 Hz |
+| referee tracking RMSE, flying on the estimate | — | 1.3 cm (r = 2 m, 6 s lap: 2.6 cm) |
+
+The response correlations — how much each mag and flow sample moves the
+estimate — read 0.99 in both regimes. Setting `flow_tau_s` to 1000 (flow
+ignored) fails the velocity checks at 0.87 m/s; `kp_accel` at 5 puts the
+vehicle on the floor; `kp_mag` at 0 (mag not fused) reports the gyro-only
+branch with the yaw error at 0.31° and drifting.
+
+One consequence for existing tooling: `scripts/check_telemetry.py` asserts
+`|velocity_world| == |odom twist|` between the controller's telemetry and
+`/drone/truth`. With `state:=est` the controller reports the *estimated*
+velocity, so that identity now holds only to the estimation error (measured
+2.4–5.7 cm/s in the turn against a 4 mm/s tolerance), and `make fly` fails
+on it while the flight itself passes.
 
 ## Publishing a trajectory
 

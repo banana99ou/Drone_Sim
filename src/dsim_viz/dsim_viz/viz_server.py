@@ -92,6 +92,11 @@ class State:
         self.lock = threading.Lock()
         self.seq = 0                # bumped by every message of any kind
         self.odom = None
+        # The Odometry the CONTROLLER flew on: /drone/truth or /drone/state_est,
+        # whichever state:= selected. Kept apart from odom, which is always
+        # truth, so the page draws the vehicle where it is while the telemetry
+        # check compares the controller against what it was given.
+        self.consumed = None
         self.setpoint = None
         self.status = None
         self.control = None
@@ -121,6 +126,7 @@ class State:
                 return dict(self._cache, sim=self.sim_source())
             seq, odom, sp = self.seq, self.odom, self.setpoint
             status, control, imu = self.status, self.control, self.imu
+            consumed = self.consumed
 
         # Built outside the lock: message objects are not mutated after
         # publication, so reading them here cannot tear, and holding the lock
@@ -130,6 +136,7 @@ class State:
             "t": _stamp_seconds(odom) if odom else 0.0,
             "pose": _pose_of(odom),
             "vel": _twist_linear_of(odom),
+            "state_vel": _twist_linear_of(consumed),
             "setpoint": _setpoint_of(sp),
             "status": _status_of(status),
             "control": _control_of(control),
@@ -256,6 +263,8 @@ class VizNode(Node):
         # callback runs, so it cannot be avoided by decimating here.
         self.create_subscription(Odometry, "/drone/viz/truth", self.on_odom,
                                  qos_profile_sensor_data)
+        self.create_subscription(Odometry, "/drone/viz/state", self.on_consumed,
+                                 qos_profile_sensor_data)
         self.create_subscription(TrajectorySetpoint, "/drone/viz/setpoint",
                                  self.on_setpoint, qos_profile_sensor_data)
         self.create_subscription(ControlDebug, "/drone/viz/control_debug",
@@ -272,6 +281,11 @@ class VizNode(Node):
     def on_odom(self, m):
         with self.state.lock:
             self.state.odom = m
+            self.state._bump()
+
+    def on_consumed(self, m):
+        with self.state.lock:
+            self.state.consumed = m
             self.state._bump()
 
     def on_setpoint(self, m):

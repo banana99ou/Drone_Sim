@@ -13,6 +13,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   msg/FlightStatus.msg
   msg/ControlDebug.msg
   msg/OpticalFlow.msg
+  msg/EstimatorDebug.msg
   msg/SimState.msg
   srv/ResetRun.srv
   srv/SimControl.srv

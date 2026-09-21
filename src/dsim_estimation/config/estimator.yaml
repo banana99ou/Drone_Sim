@@ -1,0 +1,73 @@
+# Estimator tuning. Separate from config/drone.yaml (facts about the vehicle
+# and its sensors, generated) and from dsim_bringup's gains.yaml (how the
+# controller flies): this file is how the vehicle WORKS OUT where it is.
+# Every number here is a choice, and the reason for each is next to it or in
+# the header it feeds (attitude_filter.hpp, velocity_filter.hpp).
+#
+# The gains are continuous-time -- 1/s, 1/s^2, rad/s, seconds -- and every
+# update scales them by the actual sample interval, so none of them changes
+# meaning if a sensor rate does.
+estimator:
+  # The only position source today. See the comment at the top of
+  # estimator_node.cpp for what a future SLAM/VIO emulator would replace.
+  position_source: truth
+
+  attitude:
+    # Pull of roll/pitch towards the accelerometer's gravity direction. LOW
+    # on purpose: the accelerometer is wrong in a banked turn (it reports
+    # "up" along the thrust axis), and this gain sets how much of that
+    # wrongness leaks in -- 0.1 /s is ~1 deg of steady tilt error on the 3.5 s
+    # demo lap, and the gyro carries the attitude through the manoeuvre.
+    # Measured in test_estimation.cpp (BankedTurn...) and live by
+    # scripts/check_estimator.py.
+    kp_accel: 0.1
+    # ZERO, measured not guessed: any integral gain on the accelerometer
+    # error winds up in a sustained turn (the error is constant in the body
+    # frame, indistinguishable from a gyro bias) -- about half a degree of
+    # tilt error per lap at 0.01. The 2e-4 rad/s bias it would have removed
+    # costs 0.11 deg through kp_accel, below the accelerometer's own bias
+    # floor. test_estimation.cpp (AnAccelIntegratorWindsUp...) pins this.
+    ki_accel: 0.0
+    # Pull of yaw towards the magnetometer's tilt-compensated heading. Higher
+    # than kp_accel: the mag has no manoeuvre that fools it. With 0.5 uT of
+    # noise on a 30 uT horizontal field (1 deg per sample at 50 Hz) this
+    # leaves ~0.04 deg of yaw noise.
+    kp_mag: 0.2
+    # Yaw-rate bias from the mag: safe where ki_accel is not, because the
+    # heading error a turn induces rotates with the lap and averages out.
+    # With kp_mag 0.2 this is a 0.7-damped 0.14 rad/s loop, ~10 s to settle.
+    ki_mag: 0.02
+    # The accelerometer is only used as a gravity reference while its
+    # magnitude is within this of g. 3 m/s^2 admits the coordinated turn at
+    # the 40 deg tilt clamp (g / cos 40 deg = g + 3.0) and refuses free fall
+    # and impacts. Turns are handled by the low gain, not by this gate.
+    accel_gate_m_s2: 3.0
+    # An IMU gap longer than this is a stall, not a sample interval.
+    max_dt_s: 0.05
+    # A mag sample's correction is held until the next one (50 Hz against
+    # the 250 Hz gyro) and dropped after this: a compass that stopped must
+    # stop steering.
+    mag_hold_s: 0.1
+
+  velocity:
+    # Time constant of the pull towards the optical-flow velocity. Sets the
+    # crossover between the integrated accelerometer (above) and the flow
+    # (below): 0.2 s averages ~10 flow samples (3 cm/s each at 1.5 m) while
+    # an accelerometer bias of 0.02 m/s^2 integrated over 0.2 s is 4 mm/s.
+    flow_tau_s: 0.2
+    # Altitude / climb-rate pair driven by the rangefinder: a 2 rad/s,
+    # 0.7-damped second-order response. The range's 2.5 cm of noise reaches
+    # the climb rate as ~8 mm/s; differencing consecutive 30 Hz readings
+    # would give ~1 m/s.
+    tof_omega_rad_s: 2.0
+    tof_zeta: 0.7
+    # An accelerometer gap longer than this is a stall.
+    max_dt_s: 0.1
+
+  # How long to wait for the first magnetometer sample before initialising
+  # yaw at zero and warning. One second is 50 mag samples' worth: if none has
+  # arrived, none is coming.
+  mag_timeout_s: 1.0
+  # Truth position older than this is a dead position source; the estimator
+  # goes quiet so the controller's own timeout cuts the motors.
+  truth_timeout_s: 0.5

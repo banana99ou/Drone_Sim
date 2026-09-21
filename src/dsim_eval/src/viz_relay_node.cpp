@@ -4,6 +4,14 @@
 //   /drone/setpoint       250 Hz  ->  /drone/viz/setpoint       30 Hz
 //   /drone/control_debug  250 Hz  ->  /drone/viz/control_debug  30 Hz
 //   /drone/imu            250 Hz  ->  /drone/viz/imu            30 Hz
+//   <state_topic>         250 Hz  ->  /drone/viz/state          30 Hz
+//
+// The last one is whichever Odometry the controller is flying on -- /drone/truth
+// or /drone/state_est, chosen by the state:= launch argument -- so a check can
+// compare what the controller resolved against what it was actually given.
+// scripts/check_telemetry.py asserts |velocity_world| == |twist| on that pair;
+// against /drone/truth it would fail by exactly the estimation error, which is
+// a measurement, not an identity.
 //
 // Why this node exists, with numbers.
 //
@@ -27,6 +35,7 @@
 // the original down.
 
 #include <memory>
+#include <string>
 
 #include <rclcpp/rclcpp.hpp>
 #include <nav_msgs/msg/odometry.hpp>
@@ -83,6 +92,7 @@ public:
   : Node("dsim_viz_relay")
   {
     const double rate = declare_parameter("rate_hz", 30.0);
+    const std::string state_topic = declare_parameter("state_topic", std::string("/drone/truth"));
 
     truth_ = std::make_unique<LatestRelay<nav_msgs::msg::Odometry>>(
       this, "/drone/truth", "/drone/viz/truth");
@@ -92,6 +102,8 @@ public:
       this, "/drone/control_debug", "/drone/viz/control_debug");
     imu_ = std::make_unique<LatestRelay<sensor_msgs::msg::Imu>>(
       this, "/drone/imu", "/drone/viz/imu");
+    state_ = std::make_unique<LatestRelay<nav_msgs::msg::Odometry>>(
+      this, state_topic, "/drone/viz/state");
 
     // Sim-clock timer, like every other periodic task here: if Gazebo runs
     // slower than real time, a wall timer would tick faster than simulated
@@ -103,9 +115,12 @@ public:
         setpoint_->tick();
         debug_->tick();
         imu_->tick();
+        state_->tick();
       });
 
-    RCLCPP_INFO(get_logger(), "viz relay up: 4 topics decimated to %.0f Hz", rate);
+    RCLCPP_INFO(
+      get_logger(), "viz relay up: 5 topics decimated to %.0f Hz, controller state from %s",
+      rate, state_topic.c_str());
   }
 
 private:
@@ -113,6 +128,7 @@ private:
   std::unique_ptr<LatestRelay<dsim_msgs::msg::TrajectorySetpoint>> setpoint_;
   std::unique_ptr<LatestRelay<dsim_msgs::msg::ControlDebug>> debug_;
   std::unique_ptr<LatestRelay<sensor_msgs::msg::Imu>> imu_;
+  std::unique_ptr<LatestRelay<nav_msgs::msg::Odometry>> state_;
   rclcpp::TimerBase::SharedPtr timer_;
 };
 

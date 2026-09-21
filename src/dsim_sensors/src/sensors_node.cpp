@@ -1,11 +1,13 @@
-// Downward rangefinder and optical-flow sensors, derived from ground truth.
+// Downward rangefinder, optical-flow and magnetometer sensors, derived from
+// ground truth.
 //
 //   /drone/truth   (nav_msgs/Odometry)   pose + body velocity
 //   /drone/imu     (sensor_msgs/Imu)     gyro, for the flow's rotation terms
 //        |
 //        v
-//   /drone/tof            (sensor_msgs/Range)      ~30 Hz
-//   /drone/optical_flow   (dsim_msgs/OpticalFlow)  ~50 Hz
+//   /drone/tof            (sensor_msgs/Range)          ~30 Hz
+//   /drone/optical_flow   (dsim_msgs/OpticalFlow)      ~50 Hz
+//   /drone/mag            (sensor_msgs/MagneticField)  ~50 Hz
 //
 // These pretend to BE hardware, which is why they live apart from dsim_eval:
 // the referee measures the vehicle and must never lie, while these are
@@ -22,20 +24,30 @@
 // than taken from /drone/truth's twist.angular, because that field is produced
 // by Gazebo's wheeled-robot OdometryPublisher and jumps to 626 rad/s once per
 // revolution when the quaternion changes sheet. See rates.hpp.
+//
+// The magnetometer is the same truth attitude seen through one transpose: the
+// world field rotated into the body, plus a hard-iron offset drawn once per
+// run, plus noise. It is not a Gazebo sensor, for the reasons in
+// magnetometer.hpp -- and because it shares R_ with the rangefinder and the
+// flow, the three sensors can never disagree about the attitude they were
+// sampled at.
 
 #include <algorithm>
 #include <memory>
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include <rclcpp/rclcpp.hpp>
 #include <dsim_time/sim_epoch.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <sensor_msgs/msg/imu.hpp>
+#include <sensor_msgs/msg/magnetic_field.hpp>
 #include <sensor_msgs/msg/range.hpp>
 #include <dsim_msgs/msg/optical_flow.hpp>
 
+#include "dsim_sensors/magnetometer.hpp"
 #include "dsim_sensors/optical_flow.hpp"
 #include "dsim_sensors/rates.hpp"
 #include "dsim_sensors/tof.hpp"
@@ -68,15 +80,20 @@ public:
     flow_.max_height_m = require("optical_flow.max_height_m");
     flow_.max_tilt_rad = require("optical_flow.max_tilt_rad");
     const double flow_rate = require("optical_flow.rate_hz");
-    truth_timeout_s_ = 3.0 / std::min(tof_rate, flow_rate);
+
+    mag_.noise_t = require("magnetometer.noise_t");
+    mag_.hard_iron_t = require("magnetometer.hard_iron_t");
+    mag_.field_world_t = requireVector3("magnetometer.field_world_t");
+    const double mag_rate = require("magnetometer.rate_hz");
+    truth_timeout_s_ = 3.0 / std::min({tof_rate, flow_rate, mag_rate});
 
     // Fixed by default so noise is not a fresh surprise every run. Worth
     // being precise about what this does and does not promise: ONE generator
-    // feeds both timers, at 30 and 50 Hz, drawing one and two variates
-    // respectively, and the flow's dt comes from clock deltas. So the
-    // interleaving -- and therefore which draw lands in which reading --
+    // feeds all three timers, at 30, 50 and 50 Hz, drawing one, two and three
+    // variates respectively, and the flow's dt comes from clock deltas. So
+    // the interleaving -- and therefore which draw lands in which reading --
     // depends on callback order and /clock delivery. A dropped tick shifts
-    // both sequences permanently.
+    // every sequence permanently.
     //
     // What you get is a fixed noise DISTRIBUTION and a repeatable starting
     // point, not bit-identical sensor streams between runs. Seeding per sensor
@@ -85,6 +102,13 @@ public:
     // metrics, which is what this simulator is for.
     const int seed = declare_parameter("noise_seed", 1);
     rng_.seed(seed != 0 ? static_cast<std::uint32_t>(seed) : std::random_device{}());
+
+    // The hard-iron direction is the first thing drawn after seeding, and it
+    // is drawn whether or not a hard iron is configured, so that switching
+    // one on does not shift every other sensor's noise sequence by three
+    // draws. With hard_iron_t = 0 the result is exactly zero regardless.
+    hard_iron_ = magHardIron(
+      mag_.hard_iron_t, Eigen::Vector3d(gauss_(rng_), gauss_(rng_), gauss_(rng_)));
 
     truth_sub_ = create_subscription<nav_msgs::msg::Odometry>(
       "/drone/truth", rclcpp::SensorDataQoS(),
@@ -101,6 +125,8 @@ public:
       "/drone/tof", rclcpp::SensorDataQoS());
     flow_pub_ = create_publisher<dsim_msgs::msg::OpticalFlow>(
       "/drone/optical_flow", rclcpp::SensorDataQoS());
+    mag_pub_ = create_publisher<sensor_msgs::msg::MagneticField>(
+      "/drone/mag", rclcpp::SensorDataQoS());
 
     // Sim-clock timers: a wall timer would change the sensor rate whenever
     // the simulation ran slower than real time, and the playback-speed slider
@@ -111,14 +137,21 @@ public:
     flow_timer_ = rclcpp::create_timer(
       this, get_clock(), rclcpp::Duration::from_seconds(1.0 / flow_rate),
       [this] {publishFlow();});
+    mag_timer_ = rclcpp::create_timer(
+      this, get_clock(), rclcpp::Duration::from_seconds(1.0 / mag_rate),
+      [this] {publishMag();});
 
     RCLCPP_INFO(
       get_logger(),
       "sensors up: tof %.0f Hz (%.2f-%.2f m, sigma %.3f + %.1f%%), "
-      "flow %.0f Hz (%.2f-%.2f m band), seed %d, truth timeout %.2f s",
+      "flow %.0f Hz (%.2f-%.2f m band), "
+      "mag %.0f Hz (sigma %.2f uT, hard iron %.2f uT, field [%.1f %.1f %.1f] uT), "
+      "seed %d, truth timeout %.2f s",
       tof_rate, tof_.min_range_m, tof_.max_range_m, tof_.noise_m,
       100.0 * tof_.noise_frac, flow_rate, flow_.min_height_m,
-      flow_.max_height_m, seed, truth_timeout_s_);
+      flow_.max_height_m, mag_rate, 1e6 * mag_.noise_t, 1e6 * mag_.hard_iron_t,
+      1e6 * mag_.field_world_t.x(), 1e6 * mag_.field_world_t.y(),
+      1e6 * mag_.field_world_t.z(), seed, truth_timeout_s_);
   }
 
 private:
@@ -138,6 +171,26 @@ private:
       throw std::runtime_error("dsim_sensors: missing parameter " + name);
     }
     return value;
+  }
+
+  /// The three-component form of require(): a double array of exactly three,
+  /// with the same refusal to start on anything else. The world field is one
+  /// vector in config/drone.yaml and stays one vector here, so nobody has to
+  /// remember which of three scalars is the vertical.
+  Eigen::Vector3d requireVector3(const std::string & name)
+  {
+    declare_parameter<std::vector<double>>(name);
+    std::vector<double> v;
+    if (!get_parameter(name, v) || v.size() != 3) {
+      RCLCPP_FATAL(
+        get_logger(),
+        "parameter '%s' must be a list of exactly three doubles (got %zu). "
+        "It comes from config/drone.yaml via the launch file; run this node "
+        "with 'ros2 launch dsim_bringup sim.launch.py' rather than directly.",
+        name.c_str(), v.size());
+      throw std::runtime_error("dsim_sensors: bad parameter " + name);
+    }
+    return Eigen::Vector3d(v[0], v[1], v[2]);
   }
 
   void onTruth(const nav_msgs::msg::Odometry & m)
@@ -276,6 +329,37 @@ private:
     flow_pub_->publish(msg);
   }
 
+  void publishMag()
+  {
+    const double now = get_clock()->now().seconds();
+    Eigen::Vector3d b;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      noteEpoch(now);
+      if (!truthUsable(now)) {
+        warnStale(now);
+        return;
+      }
+      b = magMeasure(
+        magTrueField(R_, mag_.field_world_t), mag_, hard_iron_,
+        Eigen::Vector3d(gauss_(rng_), gauss_(rng_), gauss_(rng_)));
+    }
+
+    sensor_msgs::msg::MagneticField msg;
+    msg.header.stamp = get_clock()->now();
+    msg.header.frame_id = "base_link";
+    msg.magnetic_field.x = b.x();
+    msg.magnetic_field.y = b.y();
+    msg.magnetic_field.z = b.z();
+    // The white noise, and only that. A hard-iron offset is precisely the
+    // error a covariance cannot describe -- it is not random -- so it is not
+    // in here, and an estimator that trusts this matrix will be confidently
+    // wrong by exactly the configured bias. That is the point of modelling it.
+    const double var = mag_.noise_t * mag_.noise_t;
+    msg.magnetic_field_covariance = {var, 0.0, 0.0, 0.0, var, 0.0, 0.0, 0.0, var};
+    mag_pub_->publish(msg);
+  }
+
   /// Throttled, so a paused world says so once rather than at the sensor rate.
   void warnStale(double now) const
   {
@@ -295,6 +379,8 @@ private:
 
   TofConfig tof_;
   FlowConfig flow_;
+  MagConfig mag_;
+  Eigen::Vector3d hard_iron_ {Eigen::Vector3d::Zero()};   ///< body frame, per run
   double fov_rad_ {0.0};
   double truth_timeout_s_ {0.1};
 
@@ -318,8 +404,10 @@ private:
   rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
   rclcpp::Publisher<sensor_msgs::msg::Range>::SharedPtr range_pub_;
   rclcpp::Publisher<dsim_msgs::msg::OpticalFlow>::SharedPtr flow_pub_;
+  rclcpp::Publisher<sensor_msgs::msg::MagneticField>::SharedPtr mag_pub_;
   rclcpp::TimerBase::SharedPtr tof_timer_;
   rclcpp::TimerBase::SharedPtr flow_timer_;
+  rclcpp::TimerBase::SharedPtr mag_timer_;
 };
 
 }  // namespace dsim_sensors

@@ -95,6 +95,25 @@ PARAMS = {
     "flow_max_height_m":       3.00,
     "flow_max_tilt_rad":       0.52,      # 30 deg; past this the ground
                                           # leaves the field of view
+
+    # --- magnetometer ------------------------------------------------------
+    # A consumer three-axis part (AK8963 / LIS3MDL class): 0.5 uT of white
+    # noise per axis at 50 Hz, which is about one degree of heading in a
+    # 30 uT horizontal field. NOT a Gazebo sensor: like the rangefinder and
+    # the flow it is synthesised from the truth attitude in dsim_sensors, so
+    # the model is a pure function that compiles on the host, and so the
+    # hard-iron offset -- the error that actually decides whether a compass
+    # is usable -- is modelled explicitly rather than not at all. Nothing
+    # here reaches model.sdf. The Earth's field is one vector in the WORLD
+    # frame: +x is magnetic north with the declination folded in, z is up,
+    # so the vertical component is negative in the northern hemisphere; the
+    # default dips 53 deg, roughly Korea. hard_iron_t is the magnitude of a
+    # fixed body-frame offset in a seeded random direction; 0 is an ideal
+    # compass, and 2.0e-06 (2 uT, ~4 deg of heading) is a realistic airframe.
+    "mag_rate_hz":             50.0,
+    "mag_noise_t":             5.0e-07,
+    "mag_hard_iron_t":         0.0,
+    "mag_field_world_t":       (3.0e-05, 0.0, -4.0e-05),
 }
 
 # name, type, x, y, z, sx, sy, sz     (cylinder: sx=radius, sz=length)
@@ -388,6 +407,15 @@ drone:
       min_height_m: {p["flow_min_height_m"]}
       max_height_m: {p["flow_max_height_m"]}
       max_tilt_rad: {p["flow_max_tilt_rad"]}
+    # Not a Gazebo sensor: synthesised from the truth attitude by
+    # dsim_sensors, so nothing here has a twin in model.sdf. The field is in
+    # the WORLD frame, +x magnetic north, z up (vertical component negative
+    # in the northern hemisphere); readings are body frame, in tesla.
+    magnetometer:
+      rate_hz: {p["mag_rate_hz"]}
+      noise_t: {p["mag_noise_t"]:.4e}
+      hard_iron_t: {p["mag_hard_iron_t"]:.4e}
+      field_world_t: [{", ".join(f"{v:.4e}" for v in p["mag_field_world_t"])}]
 """
 
 

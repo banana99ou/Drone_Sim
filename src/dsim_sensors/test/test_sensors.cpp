@@ -1,12 +1,16 @@
-// Invariants for the simplified ToF and optical-flow models.
+// Invariants for the simplified ToF, optical-flow and magnetometer models.
 //
 // Written as statements that cannot be false if the model is right, with the
 // noise draws passed in so every number below is exact rather than
-// statistical. Each test says what would make it fail.
+// statistical -- except the one test that asks whether noise exists at all,
+// which has to draw. Each test says what would make it fail.
 
 #include <gtest/gtest.h>
 #include <cmath>
+#include <random>
+#include <vector>
 
+#include "dsim_sensors/magnetometer.hpp"
 #include "dsim_sensors/optical_flow.hpp"
 #include "dsim_sensors/rates.hpp"
 #include "dsim_sensors/tof.hpp"
@@ -432,4 +436,248 @@ TEST(OpticalFlow, ModerateBankStaysUsable)
   // envelope limit would be decoration.
   EXPECT_LT(flowQuality(1.5, std::cos(0.50), c), 60);
   EXPECT_EQ(flowQuality(1.5, std::cos(0.60), c), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Magnetometer.
+//
+// The whole sensor is one transpose: the world field rotated INTO the body.
+// Every wrong version of that -- the world field reported as it is, R for
+// R^T, two components swapped, the vertical component dropped -- still
+// produces a perfectly plausible field vector on every sample, so nothing
+// downstream can notice. These tests hand-compute what the body must see at
+// known attitudes and recover the heading the way a consumer would, so each
+// of those bugs shows up as a wrong number here rather than as a compass that
+// quietly turns the wrong way.
+// ---------------------------------------------------------------------------
+
+namespace
+{
+Eigen::Matrix3d pitchMatrix(double theta)
+{
+  return Eigen::Matrix3d(Eigen::AngleAxisd(theta, Eigen::Vector3d::UnitY()));
+}
+
+Eigen::Matrix3d yawMatrix(double psi)
+{
+  return Eigen::Matrix3d(Eigen::AngleAxisd(psi, Eigen::Vector3d::UnitZ()));
+}
+
+/// World <- body for a ZYX (yaw, pitch, roll) attitude, the convention the
+/// heading recovery below assumes.
+Eigen::Matrix3d attitude(double roll, double pitch, double yaw)
+{
+  return yawMatrix(yaw) * pitchMatrix(pitch) * rollMatrix(roll);
+}
+
+double wrapPi(double a) {return std::atan2(std::sin(a), std::cos(a));}
+
+/// Heading from a body-frame field with NO tilt compensation: what a naive
+/// consumer computes, and what is wrong by tens of degrees under bank.
+double naiveHeading(const Eigen::Vector3d & b)
+{
+  return std::atan2(-b.y(), b.x());
+}
+
+/// Tilt-compensated heading: level the body field with the known roll and
+/// pitch, then read the yaw off the horizontal components. With world +x as
+/// magnetic north, a level field of (cos yaw, -sin yaw) * |B_h| means the
+/// vehicle is at that yaw. Exactly the reconstruction an attitude estimator
+/// performs once it has roll and pitch from the accelerometer.
+double compensatedHeading(const Eigen::Vector3d & b, double roll, double pitch)
+{
+  const Eigen::Vector3d level = pitchMatrix(pitch) * rollMatrix(roll) * b;
+  return naiveHeading(level);
+}
+
+const Eigen::Vector3d kField(3.0e-05, 0.0, -4.0e-05);   // the shipped default
+}  // namespace
+
+// FAILS IF: the field is not rotated into the body, or is rotated the wrong
+// way. A vehicle that has turned left by 90 degrees has its nose along world
+// +y, so magnetic north (world +x) is off its RIGHT side: body -y. Reporting
+// the world field unrotated gives (30, 0, -40); applying R instead of R^T
+// puts north on the LEFT, (0, +30, -40). Both are compasses that do not
+// turn, or turn backwards, and neither produces a reading anyone would
+// reject.
+TEST(Magnetometer, FieldTurnsAgainstTheVehicle)
+{
+  // Hand-computed, so this pins the implementation rather than a property of
+  // Eigen's transpose. Rz(-90) * (30, 0, -40) = (0, -30, -40) uT.
+  const Eigen::Vector3d left = magTrueField(yawMatrix(M_PI / 2), kField);
+  EXPECT_NEAR(left.x(), 0.0, 1e-15);
+  EXPECT_NEAR(left.y(), -3.0e-05, 1e-15) << "north must be off the right side";
+  EXPECT_NEAR(left.z(), -4.0e-05, 1e-15) << "yaw must not touch the vertical";
+
+  const Eigen::Vector3d right = magTrueField(yawMatrix(-M_PI / 2), kField);
+  EXPECT_NEAR(right.y(), 3.0e-05, 1e-15) << "turned right, north is on the left";
+
+  const Eigen::Vector3d about = magTrueField(yawMatrix(M_PI), kField);
+  EXPECT_NEAR(about.x(), -3.0e-05, 1e-15) << "facing south, north is behind";
+  EXPECT_NEAR(about.y(), 0.0, 1e-15);
+
+  // ...and level, facing north, the body sees the world field as it is.
+  const Eigen::Vector3d north = magTrueField(Eigen::Matrix3d::Identity(), kField);
+  EXPECT_LT((north - kField).norm(), 1e-15);
+}
+
+// FAILS IF: the vertical component does not leak into the horizontal axes
+// under tilt. This is the effect that makes tilt compensation necessary at
+// all, and the one a model that only rotated the horizontal field -- or that
+// dropped the vertical component, or rotated by yaw alone -- would not have.
+// At 20 degrees of roll, facing north, a 40 uT downward field puts
+// 40 * sin(20) = 13.68 uT on body y, and a naive compass reads 24.5 degrees
+// while the vehicle points exactly north. Levelling the reading recovers 0.
+TEST(Magnetometer, VerticalComponentLeaksIntoTheHorizontalAxesUnderTilt)
+{
+  const double roll = 20.0 * M_PI / 180.0;
+  const Eigen::Vector3d b = magTrueField(rollMatrix(roll), kField);
+
+  // Rx(-20) * (30, 0, -40) = (30, -40 sin 20, -40 cos 20) uT, by hand.
+  EXPECT_NEAR(b.x(), 3.0e-05, 1e-15);
+  EXPECT_NEAR(b.y(), -1.3681e-05, 1e-09) << "the vertical field must appear on y";
+  EXPECT_NEAR(b.z(), -3.7588e-05, 1e-09);
+
+  const double naive_deg = naiveHeading(b) * 180.0 / M_PI;
+  EXPECT_NEAR(naive_deg, 24.5, 0.1) << "an uncompensated compass must be wrong here";
+  EXPECT_GT(std::abs(naive_deg), 20.0);
+
+  EXPECT_NEAR(compensatedHeading(b, roll, 0.0), 0.0, 1e-12)
+    << "levelling with the known roll must recover a heading of north";
+}
+
+// FAILS IF: the tilt-compensated heading does not recover the true yaw at
+// SOME attitude in the sweep. This is the consumer's reconstruction run
+// against the model at combined roll, pitch and yaw, so it catches everything
+// at once -- R for R^T, swapped components, a dropped vertical, a yaw-only
+// rotation -- without needing to guess which mistake was made. A model that
+// passed the single-axis tests above by coincidence does not pass this.
+TEST(Magnetometer, TiltCompensatedHeadingRecoversYawAtAnyAttitude)
+{
+  for (const double yaw_deg : {-150.0, -60.0, 0.0, 45.0, 120.0, 179.0}) {
+    for (const double roll_deg : {-25.0, 0.0, 10.0}) {
+      for (const double pitch_deg : {-15.0, 20.0}) {
+        const double roll = roll_deg * M_PI / 180.0;
+        const double pitch = pitch_deg * M_PI / 180.0;
+        const double yaw = yaw_deg * M_PI / 180.0;
+        const Eigen::Vector3d b = magTrueField(attitude(roll, pitch, yaw), kField);
+
+        const double got = compensatedHeading(b, roll, pitch);
+        EXPECT_NEAR(wrapPi(got - yaw), 0.0, 1e-9)
+          << "yaw " << yaw_deg << " roll " << roll_deg << " pitch " << pitch_deg;
+
+        // Levelled, the vertical component is the world's again: a check
+        // the heading alone cannot make, since heading ignores z.
+        const Eigen::Vector3d level = pitchMatrix(pitch) * rollMatrix(roll) * b;
+        EXPECT_NEAR(level.z(), kField.z(), 1e-15);
+      }
+    }
+  }
+}
+
+// FAILS IF: the rotation changes the length of the field. A rotation cannot,
+// so a model that scaled, projected or dropped a component would show up as
+// a body field of a different magnitude from the world's.
+TEST(Magnetometer, RotationPreservesTheFieldMagnitude)
+{
+  for (const double yaw_deg : {-100.0, 30.0}) {
+    for (const double tilt_deg : {0.0, 17.0, 38.0}) {
+      const Eigen::Matrix3d R = attitude(tilt_deg * M_PI / 180.0, 0.6 * tilt_deg * M_PI / 180.0,
+                                         yaw_deg * M_PI / 180.0);
+      EXPECT_NEAR(magTrueField(R, kField).norm(), kField.norm(), 1e-15);
+    }
+  }
+}
+
+// FAILS IF: the noise is not applied, is applied at the wrong sigma, or is
+// applied to fewer than all three axes. Exact first -- one draw pins the
+// model -- and then statistically, because "the noise exists" is a claim
+// about many draws: over 20000 samples the per-axis standard deviation of
+// (measured - true) must be noise_t to within a few percent, and it must NOT
+// be zero. A clean sensor passes every exact test in this file that feeds a
+// zero draw; this is the one that asks.
+TEST(Magnetometer, NoiseHasTheConfiguredSigmaOnEveryAxis)
+{
+  MagConfig c;
+  c.noise_t = 5.0e-07;
+  const Eigen::Vector3d truth = magTrueField(Eigen::Matrix3d::Identity(), kField);
+  const Eigen::Vector3d none = Eigen::Vector3d::Zero();
+
+  // Exact: the draw scales by noise_t and lands on the matching axis.
+  const Eigen::Vector3d one = magMeasure(truth, c, none, Eigen::Vector3d(1.0, -2.0, 0.5));
+  EXPECT_NEAR(one.x() - truth.x(), 5.0e-07, 1e-18);
+  EXPECT_NEAR(one.y() - truth.y(), -1.0e-06, 1e-18);
+  EXPECT_NEAR(one.z() - truth.z(), 2.5e-07, 1e-18);
+
+  // Statistical, on a fixed seed so it is repeatable.
+  std::mt19937 rng(7);
+  std::normal_distribution<double> gauss(0.0, 1.0);
+  const int n = 20000;
+  Eigen::Vector3d sum = Eigen::Vector3d::Zero();
+  Eigen::Vector3d sum_sq = Eigen::Vector3d::Zero();
+  for (int i = 0; i < n; ++i) {
+    const Eigen::Vector3d draw(gauss(rng), gauss(rng), gauss(rng));
+    const Eigen::Vector3d e = magMeasure(truth, c, none, draw) - truth;
+    sum += e;
+    sum_sq += e.cwiseProduct(e);
+  }
+  for (int axis = 0; axis < 3; ++axis) {
+    const double mean = sum(axis) / n;
+    const double sigma = std::sqrt(sum_sq(axis) / n - mean * mean);
+    // The estimate's own spread is sigma / sqrt(2n) = 0.5%; 5% is ten of
+    // those. Zero noise gives sigma = 0, which is 100% out.
+    EXPECT_NEAR(sigma, c.noise_t, 0.05 * c.noise_t) << "axis " << axis;
+    EXPECT_GT(sigma, 0.5 * c.noise_t) << "axis " << axis << ": noise absent";
+    EXPECT_LT(std::abs(mean), 5.0 * c.noise_t / std::sqrt(double(n)))
+      << "axis " << axis << ": noise must be zero-mean";
+  }
+}
+
+// FAILS IF: a configured hard iron is missing from the reading, has the
+// wrong magnitude, changes between readings, or ignores the draw it was
+// meant to take its direction from. The offset is a body-frame constant: it
+// is the same vector whatever the attitude, and that constancy is what
+// distinguishes it from noise and what a calibration relies on.
+TEST(Magnetometer, HardIronIsAFixedBodyOffsetOfTheConfiguredMagnitude)
+{
+  MagConfig c;
+  c.noise_t = 0.0;
+  c.hard_iron_t = 2.0e-06;
+  const Eigen::Vector3d draw(0.3, -1.2, 0.8);
+  const Eigen::Vector3d bias = magHardIron(c.hard_iron_t, draw);
+
+  EXPECT_NEAR(bias.norm(), 2.0e-06, 1e-18) << "magnitude is the configured one";
+  EXPECT_LT(bias.cross(draw).norm(), 1e-18) << "direction is the draw's";
+  EXPECT_GT(bias.dot(draw), 0.0) << "...and not its negation";
+
+  // Present in the reading, unchanged by attitude.
+  const Eigen::Vector3d none = Eigen::Vector3d::Zero();
+  const Eigen::Vector3d b_north = magTrueField(Eigen::Matrix3d::Identity(), kField);
+  const Eigen::Vector3d b_banked = magTrueField(attitude(0.3, -0.2, 1.1), kField);
+  EXPECT_LT((magMeasure(b_north, c, bias, none) - b_north - bias).norm(), 1e-18);
+  EXPECT_LT((magMeasure(b_banked, c, bias, none) - b_banked - bias).norm(), 1e-18);
+  EXPECT_GT((magMeasure(b_north, c, bias, none) - b_north).norm(), 1.0e-06)
+    << "a 2 uT hard iron must be visible in the reading";
+
+  // A different draw gives a different direction: the seed governs it.
+  const Eigen::Vector3d other = magHardIron(c.hard_iron_t, Eigen::Vector3d(-1.0, 0.2, 0.1));
+  EXPECT_GT((other - bias).norm(), 1.0e-06);
+  EXPECT_NEAR(other.norm(), 2.0e-06, 1e-18);
+}
+
+// FAILS IF: the default configuration is not an ideal compass. With
+// hard_iron_t = 0 the offset must be EXACTLY zero on every axis, not small:
+// an estimator developed against the shipped config is entitled to a
+// bias-free sensor, and a residual 1e-12 T would be a lie it cannot detect.
+TEST(Magnetometer, ZeroHardIronIsExactlyZero)
+{
+  const Eigen::Vector3d bias = magHardIron(0.0, Eigen::Vector3d(0.3, -1.2, 0.8));
+  EXPECT_EQ(bias.x(), 0.0);
+  EXPECT_EQ(bias.y(), 0.0);
+  EXPECT_EQ(bias.z(), 0.0);
+
+  // ...and a zero draw still yields the configured magnitude, not a NaN.
+  const Eigen::Vector3d degenerate = magHardIron(2.0e-06, Eigen::Vector3d::Zero());
+  EXPECT_TRUE(degenerate.allFinite());
+  EXPECT_NEAR(degenerate.norm(), 2.0e-06, 1e-18);
 }

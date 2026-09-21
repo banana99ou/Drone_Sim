@@ -30,6 +30,8 @@ sources_dsim_simctl=""                                   # header-only
 untestable_dsim_simctl=""
 sources_dsim_time=""                                     # header-only
 untestable_dsim_time=""
+sources_dsim_estimation="src/attitude_filter.cpp src/velocity_filter.cpp"
+untestable_dsim_estimation=""
 
 audit_sources() {   # $1 = package
   local pkg="$1" listed found missing=0
@@ -108,6 +110,7 @@ baseline=ALL_PASS
 check_baseline dsim_control test/test_control.cpp || baseline=BAD
 check_baseline dsim_simctl test/test_pacer.cpp    || baseline=BAD
 check_baseline dsim_time   test/test_sim_epoch.cpp || baseline=BAD
+check_baseline dsim_estimation test/test_estimation.cpp || baseline=BAD
 if [ "$baseline" != "ALL_PASS" ]; then
   # Without this guard every mutation below is "caught" by the same build
   # failure, and the script reports teeth it does not have. That happened the
@@ -384,7 +387,7 @@ open(p, "w").write(t.replace(a, b, 1))
 ' "$WORK/sens/$file" "$from" "$to"
   local result; result="$(build_and_run_sensors "$WORK/sens")"
   if [ "$result" = "SOME_FAIL" ]; then
-    local caught; caught="$(grep -c '^\[  FAILED  \] [A-Za-z]' "$WORK/run.log")"
+    local caught; caught="$(grep '^\[  FAILED  \] [A-Za-z]' "$WORK/run.log" | sed 's/ ([0-9]* ms)$//' | sort -u | wc -l)"
     echo "  [CAUGHT]   $name  -> $caught test(s) failed"
     return 0
   elif [ "$result" = "BUILD_FAIL" ]; then
@@ -405,7 +408,17 @@ run_sensor_mutation() {
 
 echo
 echo "baseline (unmutated sensor models):"
-echo "  $(build_and_run_sensors src/dsim_sensors)  (expected: ALL_PASS)"
+sensors_baseline="$(build_and_run_sensors src/dsim_sensors)"
+echo "  $sensors_baseline  (expected: ALL_PASS)"
+if [ "$sensors_baseline" != "ALL_PASS" ]; then
+  # Same guard as the C++ and overlay blocks, added after it was seen to
+  # matter: with magnetometer.hpp deliberately broken, every one of the 17
+  # sensor mutations below reported CAUGHT against the same pre-existing
+  # failure. This block printed its baseline and carried on regardless.
+  echo "  BASELINE IS NOT GREEN -- every sensor result below would be meaningless."
+  tail -20 "$WORK/build.log" "$WORK/run.log" 2>/dev/null
+  exit 1
+fi
 echo
 echo "injected sensor bugs:"
 
@@ -465,6 +478,140 @@ run_sensor_mutation "body rate uses the naive, sheet-sensitive formulation" \
   "  const Eigen::AngleAxisd aa(dq);
   return aa.axis() * (aa.angle() / dt);" \
   "  return 2.0 * dq.vec() / dt;"
+
+# The magnetometer is one transpose, and every wrong version of it -- the
+# world field reported unrotated, R for R^T, swapped or dropped components --
+# still yields a plausible field on every sample. A compass that turns the
+# wrong way is invisible to everything but a test that knows the true yaw.
+run_sensor_mutation "magnetometer reports the world field unrotated" \
+  "include/dsim_sensors/magnetometer.hpp" \
+  "  return R_wb.transpose() * field_world;" \
+  "  return field_world;"
+
+run_sensor_mutation "magnetometer rotated the wrong way (R for R^T)" \
+  "include/dsim_sensors/magnetometer.hpp" \
+  "  return R_wb.transpose() * field_world;" \
+  "  return R_wb * field_world;"
+
+run_sensor_mutation "magnetometer x and y components swapped" \
+  "include/dsim_sensors/magnetometer.hpp" \
+  "  return R_wb.transpose() * field_world;" \
+  "  const Eigen::Vector3d b = R_wb.transpose() * field_world;
+  return Eigen::Vector3d(b.y(), b.x(), b.z());"
+
+run_sensor_mutation "magnetometer drops the vertical component" \
+  "include/dsim_sensors/magnetometer.hpp" \
+  "  return R_wb.transpose() * field_world;" \
+  "  return R_wb.transpose() * Eigen::Vector3d(field_world.x(), field_world.y(), 0.0);"
+
+run_sensor_mutation "magnetometer noise not applied" \
+  "include/dsim_sensors/magnetometer.hpp" \
+  "  return true_body + hard_iron_body + c.noise_t * gauss_unit;" \
+  "  return true_body + hard_iron_body + 0.0 * c.noise_t * gauss_unit;"
+
+run_sensor_mutation "hard iron dropped from the reading" \
+  "include/dsim_sensors/magnetometer.hpp" \
+  "  return true_body + hard_iron_body + c.noise_t * gauss_unit;" \
+  "  return true_body + c.noise_t * gauss_unit;"
+
+run_sensor_mutation "hard iron not scaled to the configured magnitude" \
+  "include/dsim_sensors/magnetometer.hpp" \
+  "  return gauss_unit * (hard_iron_t / n);" \
+  "  return gauss_unit;"
+
+# ---------------------------------------------------------------------------
+# The state estimator. Every mutation here is a bug that flies: the vehicle
+# takes off on the estimate, and each of these produces a plausible-looking
+# state that is wrong in one way -- a phantom climb in every turn, a velocity
+# on the wrong axes once yawed, a compass that reads 30 deg off when banked.
+# None of them is visible at a level hover, which is why the tests fly a
+# tilted, yawed, rotating vehicle.
+# ---------------------------------------------------------------------------
+PKG=dsim_estimation
+TEST=test/test_estimation.cpp
+
+run_mutation "gravity added with the wrong sign (hover reads as a 2 g climb)" \
+  "src/velocity_filter.cpp" \
+  "return R_est * accel_body + Eigen::Vector3d(0.0, 0.0, -cfg_.gravity);" \
+  "return R_est * accel_body + Eigen::Vector3d(0.0, 0.0, cfg_.gravity);"
+
+run_mutation "accelerometer rotated with R^T instead of R" \
+  "src/velocity_filter.cpp" \
+  "return R_est * accel_body + Eigen::Vector3d(0.0, 0.0, -cfg_.gravity);" \
+  "return R_est.transpose() * accel_body + Eigen::Vector3d(0.0, 0.0, -cfg_.gravity);"
+
+run_mutation "flow y sign flipped against OpticalFlow.msg" \
+  "src/velocity_filter.cpp" \
+  "const double vy = -(f.integrated_x - f.integrated_xgyro) / f.integration_time_s * h;" \
+  "const double vy = (f.integrated_x - f.integrated_xgyro) / f.integration_time_s * h;"
+
+run_mutation "gyro term dropped from the flow (rotation becomes velocity)" \
+  "src/velocity_filter.cpp" \
+  "const double vx = (f.integrated_y - f.integrated_ygyro) / f.integration_time_s * h;" \
+  "const double vx = f.integrated_y / f.integration_time_s * h;"
+
+run_mutation "slant range used as altitude" \
+  "src/velocity_filter.cpp" \
+  "  return range_m * R_est(2, 2);" \
+  "  return range_m;"
+
+run_mutation "mag heading read without tilt compensation" \
+  "src/attitude_filter.cpp" \
+  "  const Eigen::Vector3d m_world = q_ * mag_body;" \
+  "  const Eigen::Vector3d m_world = mag_body;"
+
+run_mutation "flow innovation not rotated into the world" \
+  "src/velocity_filter.cpp" \
+  "  v_ += alpha * (R_est * innovation_body);" \
+  "  v_ += alpha * innovation_body;"
+
+run_mutation "flow innovation compares against R v instead of R^T v" \
+  "src/velocity_filter.cpp" \
+  "  const Eigen::Vector3d v_body_est = R_est.transpose() * v_;" \
+  "  const Eigen::Vector3d v_body_est = R_est * v_;"
+
+run_mutation "gyro bias feedback sign flipped" \
+  "src/attitude_filter.cpp" \
+  "  bias_ -= (cfg_.ki_accel * e_acc + cfg_.ki_mag * e_mag) * dt;" \
+  "  bias_ += (cfg_.ki_accel * e_acc + cfg_.ki_mag * e_mag) * dt;"
+
+run_mutation "accelerometer correction sign flipped" \
+  "src/attitude_filter.cpp" \
+  "  accel_error_ = v_meas.cross(v_pred);" \
+  "  accel_error_ = v_pred.cross(v_meas);"
+
+run_mutation "gyro integrated in the world frame" \
+  "src/attitude_filter.cpp" \
+  "    q_ = (q_ * dq).normalized();" \
+  "    q_ = (dq * q_).normalized();"
+
+run_mutation "mag correction computed but never applied" \
+  "src/attitude_filter.cpp" \
+  "  mag_error_z_ = std::sin(err);" \
+  "  mag_error_z_ = 0.0;"
+
+run_mutation "quality-0 flow readings fused anyway" \
+  "src/velocity_filter.cpp" \
+  "  if (f.quality == 0 || !std::isfinite(f.ground_distance_m)" \
+  "  if (!std::isfinite(f.ground_distance_m)"
+
+run_mutation "out-of-range (infinite) ranges accepted" \
+  "src/velocity_filter.cpp" \
+  "  if (!std::isfinite(range_m) || range_m <= 0.0 || cos_tilt <= 0.0) {" \
+  "  if (range_m <= 0.0 || cos_tilt <= 0.0) {"
+
+run_mutation "range residual not fed into the climb rate" \
+  "src/velocity_filter.cpp" \
+  "  v_.z() += k_vz * residual;" \
+  "  v_.z() += 0.0 * residual;"
+
+run_mutation "accel integral gain re-enabled (winds up in every turn)" \
+  "include/dsim_estimation/attitude_filter.hpp" \
+  "  double ki_accel {0.0};" \
+  "  double ki_accel {0.01};"
+
+PKG=dsim_control
+TEST=test/test_control.cpp
 
 echo
 if [ "$skipped" -ne 0 ]; then

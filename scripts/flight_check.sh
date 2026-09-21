@@ -28,6 +28,9 @@ RADIUS="${RADIUS:-2.0}"
 # split, so the telemetry cross-checks below would have almost nothing to bite
 # on. 6 s is 13 degrees -- enough that a mixer or frame error shows up.
 PERIOD="${PERIOD:-6.0}"
+# est flies on the sensor-based estimate (the launch default); truth is the
+# control run, same lap, so the two RMSEs in the README are comparable.
+STATE="${STATE:-est}"
 WEB_PORT="${WEB_PORT:-8080}"
 
 source /opt/ros/jazzy/setup.bash
@@ -57,11 +60,11 @@ if pgrep -f "$SIM_PROCS" >/dev/null 2>&1; then
   exit 1
 fi
 
-echo "== launching ($WORLD, $REFERENCE, headless) =="
+echo "== launching ($WORLD, $REFERENCE, state=$STATE, headless) =="
 # setsid so the whole launch tree is one process group we can signal as a unit.
 setsid ros2 launch dsim_bringup sim.launch.py \
     world:="$WORLD" reference:="$REFERENCE" gui:=false \
-    radius:="$RADIUS" period:="$PERIOD" web_port:="$WEB_PORT" \
+    radius:="$RADIUS" period:="$PERIOD" web_port:="$WEB_PORT" state:="$STATE" \
     >/tmp/flight_check.log 2>&1 &
 LAUNCH_PID=$!
 

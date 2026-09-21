@@ -2,7 +2,7 @@
 
     ros2 launch dsim_bringup sim.launch.py
     ros2 launch dsim_bringup sim.launch.py world:=pillars reference:=none
-    ros2 launch dsim_bringup sim.launch.py state_mode:=perfect gui:=false
+    ros2 launch dsim_bringup sim.launch.py state:=truth gui:=false
 
 Vehicle parameters are read from ONE file (config/drone.yaml) and handed to
 every node that needs them, so the controller, the referee and the Gazebo model
@@ -60,9 +60,62 @@ def _sensor_params(raw_cfg):
     """
     s = raw_cfg['sensors']
     out = {}
-    for group in ('tof', 'optical_flow'):
+    for group in ('tof', 'optical_flow', 'magnetometer'):
         for key, value in s[group].items():
+            # A list stays a list (the magnetometer's world field is one
+            # vector), everything else is one double.
+            out[f'{group}.{key}'] = ([float(v) for v in value] if isinstance(value, list)
+                                     else float(value))
+    return out
+
+
+def _mag_field(raw_cfg):
+    """The magnetometer's world field from config/drone.yaml, or None.
+
+    Tolerates both shapes the generator might emit: one list under
+    `field_world_t`, or three scalars `field_world_t_x/_y/_z`. None means no
+    magnetometer block at all, in which case the estimator runs yaw
+    gyro-only and says so. A block that is present but carries the field in
+    neither form is a broken config and is refused here, not degraded.
+    """
+    mag = (raw_cfg.get('sensors') or {}).get('magnetometer')
+    if not mag:
+        return None
+    field = mag.get('field_world_t')
+    if isinstance(field, list) and len(field) == 3:
+        return [float(v) for v in field]
+    scalars = [mag.get(f'field_world_t_{axis}') for axis in 'xyz']
+    if all(v is not None for v in scalars):
+        return [float(v) for v in scalars]
+    raise RuntimeError(
+        'config/drone.yaml has a drone.sensors.magnetometer block but no '
+        'field_world_t (as a 3-list or as field_world_t_x/_y/_z); the '
+        'estimator cannot take a heading from a field it does not know.')
+
+
+def _estimator_params(raw_cfg, vehicle):
+    """Flatten src/dsim_estimation/config/estimator.yaml for the estimator.
+
+    Gravity comes from the VEHICLE config, not from a copy here, and the
+    magnetometer's world field from the SENSOR config: the estimator must
+    compare the compass against the same field the sensor is generated from,
+    or its yaw is wrong by exactly the difference and nothing would say so.
+    """
+    est = _load_yaml(os.path.join(get_package_share_directory('dsim_estimation'),
+                                  'config', 'estimator.yaml'))['estimator']
+    out = {
+        'use_sim_time': True,
+        'gravity_m_s2': vehicle['vehicle.gravity_m_s2'],
+        'position_source': str(est['position_source']),
+        'mag_timeout_s': float(est['mag_timeout_s']),
+        'truth_timeout_s': float(est['truth_timeout_s']),
+    }
+    for group in ('attitude', 'velocity'):
+        for key, value in est[group].items():
             out[f'{group}.{key}'] = float(value)
+    field = _mag_field(raw_cfg)
+    if field is not None:
+        out['mag.field_world_t'] = field
     return out
 
 
@@ -104,6 +157,19 @@ def launch_setup(context, *args, **kwargs):
     step_size_s = float(step_node.text)
     sensors = LaunchConfiguration('sensors').perform(context)
     noise_seed = LaunchConfiguration('noise_seed').perform(context)
+    state = LaunchConfiguration('state').perform(context)
+    if state not in ('est', 'truth'):
+        raise RuntimeError(f"state:={state} is not one of est | truth")
+    if state == 'est' and sensors != 'true':
+        # Refuse rather than fall back. With no sensors there is no estimate,
+        # and a controller whose state source never publishes sits on the
+        # ground holding position with its motors cut -- which looks like a
+        # quiet, healthy sim right up until someone asks why it never took
+        # off. Say so at launch instead.
+        raise RuntimeError(
+            'state:=est needs sensors:=true -- the estimator has nothing to '
+            'estimate from. Either enable the sensors or fly on ground truth '
+            'explicitly with state:=truth.')
 
     vehicle, raw_cfg = _vehicle_params()
     gains = _load_yaml(
@@ -159,9 +225,16 @@ def launch_setup(context, *args, **kwargs):
         'state.max_body_rate_rad_s': float(gains['state']['max_body_rate_rad_s']),
         'state.gyro_lowpass_tau_s': float(gains['state']['gyro_lowpass_tau_s']),
     })
+    # state:=est points the controller's state subscription at the estimator.
+    # A remap on THIS node only: the referee, the sensors and the viewer keep
+    # reading /drone/truth, because they measure the vehicle rather than fly
+    # it, and the estimator itself reads truth for position. Nothing in
+    # dsim_control knows which it is getting -- that is what makes the two
+    # runs comparable.
     controller = Node(
         package='dsim_control', executable='controller_node', name='dsim_controller',
         output='screen', parameters=[controller_params],
+        remappings=[('/drone/truth', '/drone/state_est')] if state == 'est' else [],
     )
 
     # ---- referee ----------------------------------------------------------
@@ -196,6 +269,16 @@ def launch_setup(context, *args, **kwargs):
         nodes.append(Node(
             package='dsim_sensors', executable='sensors_node', name='dsim_sensors',
             output='screen', parameters=[sensor_params],
+        ))
+
+        # ---- state estimator ----------------------------------------------
+        # Runs whenever the sensors do, whichever state the controller flies
+        # on, so /drone/state_est can be compared against /drone/truth in a
+        # state:=truth run too (scripts/check_estimator.py). Position is
+        # still ground truth inside it; see estimator_node.cpp.
+        nodes.append(Node(
+            package='dsim_estimation', executable='estimator_node', name='dsim_estimator',
+            output='screen', parameters=[_estimator_params(raw_cfg, vehicle)],
         ))
 
     # ---- optional built-in reference --------------------------------------
@@ -245,7 +328,12 @@ def launch_setup(context, *args, **kwargs):
         nodes.append(Node(
             package='dsim_eval', executable='viz_relay_node', name='dsim_viz_relay',
             output='screen',
-            parameters=[{'use_sim_time': True, 'rate_hz': 30.0}],
+            # state_topic is the Odometry the controller was remapped to, so
+            # /drone/viz/state is what it consumed and check_telemetry.py can
+            # hold |velocity_world| == |twist| against the right source.
+            parameters=[{'use_sim_time': True, 'rate_hz': 30.0,
+                         'state_topic': '/drone/state_est' if state == 'est'
+                         else '/drone/truth'}],
         ))
         # use_sim_time is deliberately FALSE here, and it is the single biggest
         # cost in this launch if you get it wrong. Setting it True makes rclpy
@@ -314,6 +402,16 @@ def generate_launch_description():
                               'sensor (/drone/optical_flow). Both are derived '
                               'from ground truth with the noise model in '
                               'config/drone.yaml.'),
+        DeclareLaunchArgument('state', default_value='est',
+                              description='what the controller flies on: est '
+                              '(the sensor-based estimate on /drone/state_est: '
+                              'attitude from gyro + accel + mag, velocity from '
+                              'accel + optical flow + rangefinder, position '
+                              'still ground truth) or truth (/drone/truth, '
+                              'perfect state). est is the default and needs '
+                              'sensors:=true; the launch refuses est without '
+                              'them. Only the controller is remapped -- the '
+                              'referee, sensors and viewer always see truth.'),
         DeclareLaunchArgument('noise_seed', default_value='1',
                               description='RNG seed for the sensor noise. '
                               'Fixed by default, which gives a repeatable '

@@ -56,13 +56,15 @@ src/dsim_msgs/              the planner interface
 src/dsim_description/       generated — the Gazebo model
 src/dsim_control/           SE(3) geometric controller, mixer, test trajectories
 src/dsim_eval/              the referee: collision, clearance, tracking, energy
-src/dsim_sensors/           simulated rangefinder + optical flow, with noise
+src/dsim_sensors/           simulated rangefinder, optical flow and compass, with noise
+src/dsim_estimation/        attitude + velocity from those sensors; what the controller flies on
 src/dsim_bringup/           launch, bridge, RViz
 scripts/flight_check.sh     headless "does it actually fly" gate
 scripts/plot_run.py         CSV -> SVG, no dependencies
 scripts/kill_sim.sh         clear leftover sim processes
 scripts/run_sim.sh          make viz -- start sim + viewer, verify it is up
 scripts/check_telemetry.py  cross-check a running sim's telemetry against physics
+scripts/check_estimator.py  the estimate against ground truth, live
 src/dsim_viz/               one-port viewer server + the overlay geometry it sends
 web/                        the browser viewer (dependency-free, draw-only)
 docs/VIEWER.md              how to watch from any tailnet device
@@ -147,6 +149,7 @@ make test                         # C++ invariants + overlay geometry + viewer m
 make verify                       # mutation check + generated-asset drift (host)
 make fly                          # headless: proves it flies AND reports honestly
 make telemetry                    # cross-check a sim that is already running
+make estimator                    # the estimate vs truth on a sim that is running
 ```
 
 Measured on this machine, empty world, 42 s runs:
@@ -155,6 +158,28 @@ Measured on this machine, empty world, 42 s runs:
 |---|---|---|---|
 | circle, 2 m radius, 12 s period | **3.2 cm** | 6.5 cm | none |
 | lemniscate (figure-eight) | **4.2 cm** | 6.6 cm | none |
+
+Those two were flown on ground truth. The controller now flies on the
+sensor-based estimate by default (`state:=est`); `make fly` flies the same
+2 m circle at a 6 s lap (13° of bank) either way, and the two are directly
+comparable:
+
+| state source, same lap | tracking RMSE | worst error | mean radial / tangential |
+|---|---|---|---|
+| `state:=est` (default) | **1.4 cm** | 2.9 cm | −0.1 cm / +1.4 cm |
+| `state:=truth` | 7.2 cm | 7.4 cm | −5.8 cm / −4.2 cm |
+
+The perfect-state run is the *worse* one, by a constant offset — 6 cm inside
+the circle and 4 cm behind, every lap, reproducible to a millimetre across
+three runs. Nothing on its control path changed when the estimator was added
+(`git diff` on `dsim_control`, the gains and the vehicle is empty), so that
+offset was always there at this bank; the earlier table is a 3° lap, where it
+is small. It is **not explained yet**. The one hypothesis on the table is the
+velocity in `/drone/truth`, which comes from the same pose-differentiating
+`OdometryPublisher` that produced the body-rate bug below; a lag there enters
+the velocity loop as an inward force proportional to centripetal acceleration,
+which is the right direction and roughly the right size. The estimate takes
+velocity from the accelerometer, corrected by flow, and shows no such offset.
 
 Independent cross-checks that the plant, mixer and config agree:
 mean rotor speed in hover measured **638.4 rad/s** against the generator's
@@ -190,7 +215,7 @@ world, and it fires in the pillar field at the geometrically predicted moment
   notice. A green suite is only evidence if it would have gone red on a wrong
   implementation.
 
-  Currently **71 C++ + 54 Python + 10 viewer tests pass, 38/38 injected bugs
+  Currently **99 C++ + 54 Python + 10 viewer tests pass, 61/61 injected bugs
   caught, 0 skipped.**
 
   Three rules keep the harness honest, all added after it lied. A mutation whose
@@ -212,10 +237,12 @@ replanning behaviour, collision counting, comparing planners fairly.
 **Sensors:** an IMU with noise derived from a consumer MEMS data sheet (gyro
 1.0e-3 rad/s, accel 4.4e-2 m/s² at 250 Hz) plus startup bias and slow thermal
 drift; a downward rangefinder (`/drone/tof`, slant range, 1 cm + 1% error,
-millimetre quantised, REP 117 out-of-range); and an optical-flow sensor
-(`/drone/optical_flow`, integrated angle plus gyro terms, PMW3901 style).
-Ground truth on `/drone/truth` stays clean, so a planner can be developed
-against either.
+millimetre quantised, REP 117 out-of-range); an optical-flow sensor
+(`/drone/optical_flow`, integrated angle plus gyro terms, PMW3901 style); and
+a magnetometer (`/drone/mag`, body-frame field with 0.5 µT noise and an
+optional hard-iron offset — the only yaw reference there is, since there is
+no GPS and no lidar). Ground truth on `/drone/truth` stays clean, so a planner
+can be developed against either.
 
 `make sensors` checks them. The IMU noise checks run in **every** regime: they
 estimate σ from consecutive-sample differences (`std(diff)/√2` for white noise,
@@ -230,13 +257,26 @@ vs 71.3 mm predicted at 17.3° of bank — a sensor returning plain altitude fai
 this), and the flow sensor's reconstructed velocity to a median **0.027 m/s at
 1.70 m/s** against a limit derived from the noise model.
 
-**Out:** state estimation, motor identification, matching a real airframe's
-numbers. The controller's model of the vehicle is exactly right, which is why
-tracking is as good as it is: with perfect state, an exact model and
-acceleration feedforward, the feedback terms have little left to do. The stack
-is a two-level cascade (position/velocity → attitude/body-rate → mixer) and it
-is **PD, not PID** — there are no integrators, because with no model error
-there is no steady-state error for one to remove.
+**State estimation, partly in.** By default the controller flies on
+`/drone/state_est` from `dsim_estimation`: attitude from a Mahony-style
+complementary filter (gyro integrated, roll/pitch pulled toward the
+accelerometer's gravity, yaw toward the compass), velocity from the
+accelerometer integrated in the world frame and pulled toward optical flow
+horizontally and the rangefinder vertically, body rate straight from the gyro.
+**Position is still ground truth**, behind a `position_source` parameter that
+accepts nothing else yet — that is the seam where a SLAM/VIO emulator plugs in.
+Measured live on the 18° lap: 1.0° of tilt error (the analytic value for the
+accelerometer correction in a coordinated turn is 0.985°), 0.1° of yaw, 3 cm/s
+of velocity. Details and known weaknesses in [docs/INTERFACE.md](docs/INTERFACE.md)
+under *State estimate*; `state:=truth` flies on perfect state for comparison.
+
+**Out:** position estimation, motor identification, matching a real airframe's
+numbers. The controller's model of the vehicle is exactly right and its
+position is exact, which is why tracking is as good as it is: with an exact
+model and acceleration feedforward, the feedback terms have little left to do.
+The stack is a two-level cascade (position/velocity → attitude/body-rate →
+mixer) and it is **PD, not PID** — there are no integrators, because with no
+model error there is no steady-state error for one to remove.
 
 ### A bug worth knowing about, because it was invisible
 
