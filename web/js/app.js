@@ -255,8 +255,18 @@ function updateHudOnce() {
   if (r) {
     el("spd").textContent = fmt(r.speed_mps, " m/s");
     el("tilt").textContent = fmt(r.tilt_deg, "°", 1);
-    el("tau").textContent = fmt(r.torque_nm, " N·m", 3);
+    // Millinewton-metres, matching the torque arrows' labels: a steady turn
+    // demands about 0.017 N·m, and two decimals of that is one significant
+    // figure. The HUD and the picture must not print the same quantity in
+    // different units.
+    el("tau").textContent = fmt(1e3 * r.torque_nm, " mN·m");
     el("aero").textContent = r.aero_n === null ? "—" : fmt(r.aero_n, " N");
+    // What each loop of the cascade is asking for, next to what the vehicle
+    // is doing. On screen even when an arrow is too short to carry a label.
+    el("ctrack").textContent = fmt(r.cmd_track_m, " m");
+    el("cspd").textContent = fmt(r.cmd_speed_mps, " m/s");
+    el("ctilt").textContent = fmt(r.tilt_deg, "°");
+    el("ctilt").className = r.tilt_clamped ? "bad" : "";
   }
   if (c) {
     el("thr").textContent = fmt(c.realised_thrust_n, " N");

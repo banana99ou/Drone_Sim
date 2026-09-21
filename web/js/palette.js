@@ -14,6 +14,10 @@ export const PALETTE = {
   torque: "#facc15",
   cmd_axis: "#e879f9",
   body_axis: "#22d3ee",
+  // The cascade's commands share one colour family, deliberately: they are
+  // three levels of one controller, and reading them as a set is the point.
+  cmd_position: "#f472b6",
+  cmd_velocity: "#f472b6",
 };
 
 export const TICK_COLOUR = "rgba(230,232,239,.6)";
@@ -24,6 +28,7 @@ export const GROUP_LABEL = {
   velocity: "velocity",
   attitude: "attitude cmd",
   torque: "torque",
+  command: "commands (pos/vel/att)",
 };
 
 export const LEGEND = [
@@ -34,6 +39,7 @@ export const LEGEND = [
   ["torque", "torque"],
   ["attitude cmd", "cmd_axis"],
   ["body z", "body_axis"],
+  ["cmd position / velocity", "cmd_position"],
 ];
 
 const BELOW = [59, 130, 246];      // blue   -- below hover thrust
@@ -58,5 +64,8 @@ export function colourFor(arrow) {
     : (PALETTE[arrow.kind] || "#e6e8ef");
 }
 
-const WIDTH = { rotor: 3.5, thrust: 4, weight: 4, body_axis: 2, cmd_axis: 2 };
+const WIDTH = {
+  rotor: 3.5, thrust: 4, weight: 4, body_axis: 2, cmd_axis: 2,
+  cmd_position: 2.5, cmd_velocity: 2.5,
+};
 export const widthFor = (arrow) => WIDTH[arrow.kind] || 3;

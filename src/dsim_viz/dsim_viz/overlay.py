@@ -58,7 +58,25 @@ MAX_ARROW_M = 2.0
 
 # Which toggle each arrow belongs to. Sent with the arrow so the page's
 # checkboxes are a pure filter that needs no idea what a torque is.
-GROUPS = ('motors', 'forces', 'velocity', 'attitude', 'torque')
+GROUPS = ('motors', 'forces', 'velocity', 'attitude', 'torque', 'command')
+
+# Decimal places on every arrow's numeric label. The wire carries full
+# precision (WIRE_DECIMALS); this is only what the page prints next to the
+# head, and it is one number rather than a per-arrow choice so two arrows can
+# be compared digit by digit.
+#
+# Torque is the exception, and it is a units exception rather than a precision
+# one: a steady turn on this airframe demands about 0.017 N.m, which at two
+# decimals prints as "0.02" and throws away most of what there is to see. It
+# is labelled in millinewton-metres instead, so the same two decimals carry
+# three significant figures of a quantity that never reaches 0.1 N.m.
+LABEL_DECIMALS = 2
+
+# The position command is a tracking error -- 1 to 3 cm in normal flight,
+# against a thrust arrow of 0.74 m. Drawn true to scale it is 1 mm, below the
+# renderer's own 2 px floor, so it would silently not exist. Magnified, with
+# the factor in the label and the true distance next to it.
+TRACK_MAGNIFY = 10.0
 
 
 def quat_matrix(q):
@@ -190,6 +208,13 @@ def build(pose, control, imu):
 
     readout = {
         'speed_mps': _norm(control['velocity_world']),
+        # What each loop is asking for, as one number per level, so the HUD
+        # can show the commands even when an arrow is too short to label.
+        'cmd_track_m': _norm(control['position_error']),
+        'cmd_speed_mps': _norm(_sub(control['velocity_world'],
+                                    control['velocity_error'])),
+        'saturated': bool(control['saturated']),
+        'tilt_clamped': bool(control['tilt_clamped']),
         'tilt_deg': math.degrees(control['commanded_tilt_rad']),
         'torque_nm': _norm(control['realised_torque_nm']),
         'aero_n': None if aero_body is None else _norm(aero_body),
@@ -211,7 +236,8 @@ def build(pose, control, imu):
         base = _add(p, rotate(m, hub))
         f = thrusts[i]
         arrows.append(_arrow(
-            'motors', 'rotor', base, _mul(up, f * scale_f), f'{f:.1f}',
+            'motors', 'rotor', base, _mul(up, f * scale_f),
+            f'{f:.{LABEL_DECIMALS}f}',
             # Deviation from hover in [-1, 1]. A quadrotor holds a bank by
             # splitting thrust across a diagonal, so this is the number that
             # makes the control action readable: two rotors go one way, two the
@@ -231,17 +257,18 @@ def build(pose, control, imu):
     # ---- forces at the centre of mass --------------------------------------
     arrows.append(_arrow(
         'forces', 'thrust', p, _mul(rotate(m, thrust_body), scale_f),
-        f'thrust {control["realised_thrust_n"]:.1f} N'))
+        f'thrust {control["realised_thrust_n"]:.{LABEL_DECIMALS}f} N'))
     weight = readout['hover_thrust_n']
     arrows.append(_arrow(
         'forces', 'weight', p, [0.0, 0.0, -weight * scale_f],
-        f'weight {weight:.1f} N'))
+        f'weight {weight:.{LABEL_DECIMALS}f} N'))
     if aero_body is not None:
         # Magnified, and the label says so -- see AERO_MAGNIFY.
         arrows.append(_arrow(
             'forces', 'aero', p,
             _mul(rotate(m, aero_body), scale_f * AERO_MAGNIFY),
-            f'aero {_norm(aero_body):.2f} N x{AERO_MAGNIFY:.0f}'))
+            f'aero {_norm(aero_body):.{LABEL_DECIMALS}f} N '
+            f'x{AERO_MAGNIFY:.0f}'))
 
     # ---- velocity ----------------------------------------------------------
     # control['velocity_world'] is already resolved into the world frame by the
@@ -251,7 +278,7 @@ def build(pose, control, imu):
     v = control['velocity_world']
     arrows.append(_arrow(
         'velocity', 'velocity', p, _mul(v, SCALE['vel_m_per_mps']),
-        f'{_norm(v):.2f} m/s'))
+        f'{_norm(v):.{LABEL_DECIMALS}f} m/s'))
 
     # ---- attitude: what the vehicle is doing vs what was demanded ----------
     # Unit directions, so these carry no magnitude to exaggerate. The gap
@@ -259,11 +286,6 @@ def build(pose, control, imu):
     # they separate visibly and the torque arrow is zero, something is broken.
     axis = SCALE['axis_m']
     arrows.append(_arrow('attitude', 'body_axis', p, _mul(up, axis), 'body z'))
-    cmd = _unit(control['desired_force'])
-    if _norm(cmd) > 0:
-        arrows.append(_arrow(
-            'attitude', 'cmd_axis', p, _mul(cmd, axis * 1.2),
-            f'cmd {readout["tilt_deg"]:.0f} deg', dashed=True))
 
     # ---- torque ------------------------------------------------------------
     tau = control['realised_torque_nm']
@@ -271,6 +293,58 @@ def build(pose, control, imu):
         arrows.append(_arrow(
             'torque', 'torque', p,
             _mul(rotate(m, tau), SCALE['torque_m_per_nm']),
-            f'{_norm(tau):.3f} N.m'))
+            f'{1e3 * _norm(tau):.{LABEL_DECIMALS}f} mN.m'))
+
+    # ---- what each loop of the cascade is COMMANDING -----------------------
+    # One arrow per level of the controller, in the order the cascade runs, so
+    # what the stack is asking for can be read next to what the vehicle is
+    # doing. Every actual has its counterpart already on screen: the vehicle
+    # itself for position, the velocity arrow for velocity, body z for
+    # attitude. These three are the other half of each of those pairs, and
+    # they share one toggle because reading one without the others tells you
+    # which loop is unhappy but not why.
+    #
+    # ControlDebug publishes ERRORS, defined as state - reference, so each
+    # reference is recovered by subtraction rather than re-derived here. That
+    # keeps the arrow tied to the number the controller actually used: a
+    # trajectory re-sampled in this file could disagree with the one the loop
+    # ran on, and the disagreement would look like a tracking failure.
+    #
+    #   cmd_position  where the position loop wants the vehicle to BE, drawn
+    #                 from where it is. This is the tracking error vector,
+    #                 pointing at the target.
+    #   cmd_velocity  the velocity the loop is asking for, on the same scale
+    #                 as the actual velocity arrow; the gap between them is
+    #                 the velocity error the loop is reacting to.
+    #   cmd_axis      the attitude demand: the direction the thrust axis is
+    #                 being asked to point, against body z.
+    ref_p = _sub(p, control['position_error'])
+    track = _norm(control['position_error'])
+    if track > 1e-9:
+        # Tracking runs at a few centimetres while the arrows around it are
+        # hundreds of times longer, so at true scale this one is shorter than
+        # the renderer's 2 px floor and never gets drawn at all. It is
+        # magnified by a declared factor, with the true distance in the label
+        # -- the same bargain the aero arrow makes. An exaggeration you can
+        # read is honest; a silent one is not.
+        arrows.append(_arrow(
+            'command', 'cmd_position', p,
+            _mul(_sub(ref_p, p), TRACK_MAGNIFY),
+            f'cmd pos {track:.{LABEL_DECIMALS}f} m x{TRACK_MAGNIFY:.0f}',
+            dashed=True))
+
+    ref_v = _sub(v, control['velocity_error'])
+    if _norm(ref_v) > 1e-9:
+        arrows.append(_arrow(
+            'command', 'cmd_velocity', p,
+            _mul(ref_v, SCALE['vel_m_per_mps']),
+            f'cmd vel {_norm(ref_v):.{LABEL_DECIMALS}f} m/s', dashed=True))
+
+    cmd = _unit(control['desired_force'])
+    if _norm(cmd) > 0:
+        arrows.append(_arrow(
+            'command', 'cmd_axis', p, _mul(cmd, axis * 1.2),
+            f'cmd tilt {readout["tilt_deg"]:.{LABEL_DECIMALS}f} deg',
+            dashed=True))
 
     return {'arrows': arrows, 'ticks': ticks, 'readout': readout, 'scale': SCALE}

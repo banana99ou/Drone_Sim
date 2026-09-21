@@ -73,6 +73,11 @@ def hover_imu():
     return imu([0.0, 0.0, WEIGHT / MASS])
 
 
+def quat_roll(angle):
+    """Hamilton quaternion for a roll of `angle` about body +x."""
+    return [math.cos(angle / 2.0), math.sin(angle / 2.0), 0.0, 0.0]
+
+
 def arrows_of(result, kind):
     return [a for a in result['arrows'] if a['kind'] == kind]
 
@@ -299,7 +304,8 @@ def test_absurd_torque_is_clamped_and_says_so():
     assert length(tau) == pytest.approx(overlay.MAX_ARROW_M, abs=TOL)
     assert tau['clamped'] is True
     # ...and the label still reports what was really demanded, unclamped.
-    assert '2.546' in tau['label']
+    # In millinewton-metres: 2.5456 N.m is the full 2.55 N.m saturation event.
+    assert '2545.60' in tau['label']
 
 
 # FAILS IF: ordinary arrows are marked clamped. The flag drives a different
@@ -322,3 +328,148 @@ def test_typical_torque_is_long_enough_to_read():
                       hover_imu())
     tau = arrows_of(r, 'torque')[0]
     assert 0.25 < length(tau) < overlay.MAX_ARROW_M
+
+
+# ---------------------------------------------------------------------------
+# What each loop of the cascade is COMMANDING.
+#
+# The arrows above show what the vehicle is doing. These show what it was told
+# to do, one per level: position, velocity, attitude. A vehicle tracking well
+# and a vehicle being asked for nothing look identical without them.
+# ---------------------------------------------------------------------------
+
+# FAILS IF: the position command points along the error instead of against it.
+# position_error is state - reference, so the arrow to the reference is its
+# NEGATIVE. Get this backwards and the arrow points exactly away from where
+# the controller is trying to go -- a picture that is confidently wrong.
+def test_position_command_points_at_the_reference_not_away_from_it():
+    err = [0.03, -0.02, 0.01]          # the vehicle is here, ref is behind it
+    r = overlay.build(pose(), control(position_error=err), hover_imu())
+    a = arrows_of(r, 'cmd_position')[0]
+    d = [a['to'][i] - a['from'][i] for i in range(3)]
+    for i in range(3):
+        assert d[i] == pytest.approx(-err[i] * overlay.TRACK_MAGNIFY, abs=TOL)
+
+
+# FAILS IF: the magnification is too small to see, or disappears entirely.
+#
+# Written against a FIXED length rather than against TRACK_MAGNIFY itself: the
+# first version of this test asserted `length == 0.04 * TRACK_MAGNIFY`, which
+# reads the constant it is checking and therefore passes at ANY value of it,
+# including 1.0. The mutation harness caught that -- "position command drawn
+# true to scale" survived. The number below is the property that matters: a
+# 3 cm tracking error, which is ordinary in flight, must draw an arrow of the
+# same order as the ones beside it (the weight arrow is 0.74 m), or it falls
+# under the renderer's 2 px floor and the position loop looks idle on screen.
+def test_position_command_is_magnified_enough_to_see():
+    r = overlay.build(pose(), control(position_error=[0.0, 0.0, -0.03]),
+                      hover_imu())
+    a = arrows_of(r, 'cmd_position')[0]
+    weight = length(arrows_of(r, 'weight')[0])
+    assert length(a) >= 0.25 * weight, (
+        f'a 3 cm error draws {length(a):.3f} m against a {weight:.2f} m '
+        f'weight arrow -- too short to see')
+    # ...and the label still carries the TRUE distance and the factor, so the
+    # exaggeration is readable rather than silent.
+    assert '0.03 m' in a['label']
+    assert f'x{overlay.TRACK_MAGNIFY:.0f}' in a['label']
+
+
+# FAILS IF: the velocity command is drawn as the error rather than as the
+# reference. They differ by the actual velocity, so at hover-with-drift the
+# two are indistinguishable and in cruise they point different ways.
+def test_velocity_command_is_the_reference_not_the_error():
+    r = overlay.build(
+        pose(),
+        control(velocity_world=[1.0, 0.0, 0.0], velocity_error=[0.2, 0.0, 0.0]),
+        hover_imu())
+    cmd = arrows_of(r, 'cmd_velocity')[0]
+    d = [cmd['to'][i] - cmd['from'][i] for i in range(3)]
+    # reference = state - error = 0.8 m/s, not the 0.2 m/s error.
+    assert d[0] == pytest.approx(0.8 * overlay.SCALE['vel_m_per_mps'], abs=TOL)
+    assert 'cmd vel 0.80 m/s' == cmd['label']
+
+
+# FAILS IF: the commanded and actual velocity are drawn on different scales.
+# The whole point of the pair is that the gap between them IS the velocity
+# error; two scales make that gap meaningless.
+def test_velocity_command_shares_the_actual_velocity_scale():
+    r = overlay.build(
+        pose(),
+        control(velocity_world=[2.0, 0.0, 0.0], velocity_error=[1.0, 0.0, 0.0]),
+        hover_imu())
+    act = arrows_of(r, 'velocity')[0]
+    cmd = arrows_of(r, 'cmd_velocity')[0]
+    assert length(act) == pytest.approx(2.0 * overlay.SCALE['vel_m_per_mps'],
+                                        abs=TOL)
+    assert length(cmd) == pytest.approx(1.0 * overlay.SCALE['vel_m_per_mps'],
+                                        abs=TOL)
+
+
+# FAILS IF: the three commands stop sharing one toggle. They are three levels
+# of one cascade; a reader who can see the velocity command but not the
+# attitude command knows a loop is unhappy and not which one.
+def test_all_three_commands_share_one_group():
+    r = overlay.build(
+        pose(),
+        control(position_error=[0.02, 0.0, 0.0],
+                velocity_world=[1.0, 0.0, 0.0],
+                velocity_error=[0.1, 0.0, 0.0]),
+        hover_imu())
+    cmds = {a['kind'] for a in r['arrows'] if a['group'] == 'command'}
+    assert cmds == {'cmd_position', 'cmd_velocity', 'cmd_axis'}
+    assert 'command' in overlay.GROUPS
+
+
+# FAILS IF: the attitude command loses its magnitude-free form or its label.
+# It is a DIRECTION -- the thrust axis being asked for -- and drawing it with
+# a magnitude would invite comparing it to the force arrows, which it is not.
+def test_attitude_command_is_a_unit_direction_against_body_z():
+    r = overlay.build(pose(), control(commanded_tilt_rad=math.radians(18.17)),
+                      hover_imu())
+    cmd = arrows_of(r, 'cmd_axis')[0]
+    body = arrows_of(r, 'body_axis')[0]
+    assert length(cmd) == pytest.approx(overlay.SCALE['axis_m'] * 1.2, abs=TOL)
+    assert length(body) == pytest.approx(overlay.SCALE['axis_m'], abs=TOL)
+    assert cmd['label'] == 'cmd tilt 18.17 deg'
+
+
+# FAILS IF: torque labels go back to newton-metres at two decimals. A steady
+# turn demands about 0.017 N.m, which prints as "0.02" -- one significant
+# figure, and the same string for a 40% change in the demand.
+def test_torque_labels_carry_three_significant_figures():
+    r = overlay.build(pose(), control(realised_torque_nm=[0.0175, 0.0, 0.0]),
+                      hover_imu())
+    assert arrows_of(r, 'torque')[0]['label'] == '17.50 mN.m'
+
+
+# FAILS IF: any numeric arrow label drops below two decimals. The reader
+# compares two arrows digit by digit; a label rounded to one decimal makes a
+# 0.04 N split across a diagonal invisible in the text while it is visible in
+# the picture.
+def test_every_numeric_label_carries_two_decimals():
+    import re
+    r = overlay.build(pose(),
+                      control(rotor_thrust_n=[3.6, 3.75, 3.7, 3.65],
+                              position_error=[0.02, 0.0, 0.0],
+                              velocity_world=[1.0, 0.0, 0.0],
+                              velocity_error=[0.1, 0.0, 0.0],
+                              realised_torque_nm=[0.0, 0.0, 0.02],
+                              commanded_tilt_rad=math.radians(12.6)),
+                      imu([0.2, 0.0, WEIGHT / MASS]))
+    seen = 0
+    for a in r['arrows']:
+        for number in re.findall(r'-?\d+\.\d+', a['label']):
+            assert len(number.split('.')[1]) == 2, (a['kind'], a['label'])
+            seen += 1
+    assert seen >= 8, f'only {seen} numeric labels checked'
+
+
+# FAILS IF: the commands survive disarm. Disarmed means the loops are not
+# commanding anything; drawing a stale pink arrow at a vehicle nobody is
+# flying is noise pretending to be information.
+def test_disarmed_draws_no_command_arrows():
+    r = overlay.build(pose(),
+                      control(armed=False, position_error=[0.5, 0.0, 0.0]),
+                      hover_imu())
+    assert r['arrows'] == []

@@ -350,6 +350,46 @@ run_py_mutation "quaternion transposed (body and world swapped)" \
   "        (1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w))," \
   "        (1 - 2 * (y * y + z * z), 2 * (x * y + z * w), 2 * (x * z - y * w)),"
 
+# The cascade's command arrows. Each of these is a plausible slip that draws a
+# command which looks reasonable and is wrong about the one thing it shows.
+run_py_mutation "position command points along the error, not at the reference" \
+  "            _mul(_sub(ref_p, p), TRACK_MAGNIFY)," \
+  "            _mul(_sub(p, ref_p), TRACK_MAGNIFY),"
+
+run_py_mutation "reference position recovered by adding the error" \
+  "    ref_p = _sub(p, control['position_error'])" \
+  "    ref_p = _add(p, control['position_error'])"
+
+run_py_mutation "position command drawn true to scale (below the draw floor)" \
+  "TRACK_MAGNIFY = 10.0" \
+  "TRACK_MAGNIFY = 1.0"
+
+run_py_mutation "velocity command drawn as the error instead of the reference" \
+  "    ref_v = _sub(v, control['velocity_error'])" \
+  "    ref_v = list(control['velocity_error'])"
+
+run_py_mutation "velocity command on its own scale" \
+  "            _mul(ref_v, SCALE['vel_m_per_mps'])," \
+  "            _mul(ref_v, SCALE['vel_m_per_mps'] * 2.0),"
+
+run_py_mutation "attitude command left out of the command group" \
+  "            'command', 'cmd_axis', p, _mul(cmd, axis * 1.2)," \
+  "            'attitude', 'cmd_axis', p, _mul(cmd, axis * 1.2),"
+
+run_py_mutation "commands survive disarm" \
+  "    if not control['armed']:
+        return {'arrows': [], 'ticks': [], 'readout': readout, 'scale': SCALE}" \
+  "    if not control['armed'] and False:
+        return {'arrows': [], 'ticks': [], 'readout': readout, 'scale': SCALE}"
+
+run_py_mutation "arrow labels drop back to one decimal" \
+  "LABEL_DECIMALS = 2" \
+  "LABEL_DECIMALS = 1"
+
+run_py_mutation "torque labelled in newton-metres at two decimals" \
+  "            f'{1e3 * _norm(tau):.{LABEL_DECIMALS}f} mN.m'))" \
+  "            f'{_norm(tau):.{LABEL_DECIMALS}f} N.m'))"
+
 echo
 
 # ---------------------------------------------------------------------------
