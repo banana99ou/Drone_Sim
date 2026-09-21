@@ -178,6 +178,10 @@ def test_state_to_dict_copies_field_for_field():
         target_sim_time_s = 96.136
         resets, step_errors = 3, 0
         ticks, run_requests = 4021, 4019
+        gust_remaining_s, max_gust_n, gusts = 1.5, 20.0, 2
+
+        class gust_force_n:
+            x, y, z = 4.0, 0.0, -1.0
         error = ""
 
     got = simcontrol.state_to_dict(FakeMsg())
@@ -185,4 +189,80 @@ def test_state_to_dict_copies_field_for_field():
     assert got["requested_speed"] == 0.25
     assert got["sim_time_s"] == 96.132
     assert got["resets"] == 3
+    assert got["gust_force_n"] == [4.0, 0.0, -1.0]
+    assert got["gust_remaining_s"] == 1.5
     assert set(got) == set(simcontrol.UNKNOWN)      # no field added or lost
+
+
+# ---------------------------------------------------------------------------
+# Gusts: an external force on the airframe, which the controller is never told
+# about. Everything below is about the request never becoming something the
+# node would refuse or the physics would not feel.
+# ---------------------------------------------------------------------------
+
+GUST_LIMITS = dict(simcontrol.UNKNOWN, min_speed=0.05, max_speed=1.0, max_gust_n=20.0)
+
+
+# FAILS IF: a gust is parsed into something other than a world-frame force in
+# newtons. The three components go to the node untouched -- no normalising, no
+# unit change -- because the number on the slider is the number the airframe
+# feels and anything in between would make the screen disagree with the
+# physics.
+def test_gust_carries_its_force_and_duration_through():
+    cmd = simcontrol.parse_command({"gust": [3.0, -2.0, 0.0], "duration_s": 1.5},
+                                   GUST_LIMITS)
+    assert cmd.verb == "gust"
+    assert cmd.force == (3.0, -2.0, 0.0)
+    assert cmd.duration_s == 1.5
+
+
+# FAILS IF: an omitted duration means anything other than "until cleared". A
+# default of, say, one second would quietly end an experiment the user meant
+# to leave running.
+def test_a_gust_with_no_duration_lasts_until_cleared():
+    assert simcontrol.parse_command({"gust": [1.0, 0.0, 0.0]}, GUST_LIMITS).duration_s == 0.0
+
+
+# FAILS IF: the page can ask for a force the node would cap. The limit comes
+# from the control node's own SimState, so this check and the node's cannot
+# drift apart -- the same arrangement the speed range uses.
+def test_a_gust_over_the_published_cap_is_refused_with_the_cap_in_the_message():
+    with pytest.raises(simcontrol.ControlError) as e:
+        simcontrol.parse_command({"gust": [30.0, 0.0, 0.0]}, GUST_LIMITS)
+    assert "20" in str(e.value)
+    # 12-16-12 has magnitude 23.3: refused on the NORM, not component by
+    # component. Capping each axis instead would let a diagonal gust through
+    # at 1.7x the limit.
+    with pytest.raises(simcontrol.ControlError):
+        simcontrol.parse_command({"gust": [12.0, 16.0, 12.0]}, GUST_LIMITS)
+    simcontrol.parse_command({"gust": [12.0, 16.0, 0.0]}, GUST_LIMITS)   # exactly 20
+
+
+# FAILS IF: the cap is invented here when the node has not published one. A
+# viewer that guessed a limit would let a gust through on exactly the run
+# where the control node is not there to enforce it.
+def test_a_gust_is_refused_until_the_node_publishes_its_limit():
+    with pytest.raises(simcontrol.ControlError):
+        simcontrol.parse_command({"gust": [1.0, 0.0, 0.0]}, simcontrol.UNKNOWN)
+
+
+# FAILS IF: nonsense reaches the node. NaN passes every comparison, so a NaN
+# force is not caught by the magnitude check above -- it has to be named.
+@pytest.mark.parametrize("body", [
+    {"gust": [float("nan"), 0.0, 0.0]},
+    {"gust": [float("inf"), 0.0, 0.0]},
+    {"gust": [1.0, 0.0]},
+    {"gust": "hard"},
+    {"gust": [1.0, 0.0, 0.0], "duration_s": -1.0},
+    {"gust": [1.0, 0.0, 0.0], "duration_s": "long"},
+])
+def test_malformed_gusts_are_refused(body):
+    with pytest.raises(simcontrol.ControlError):
+        simcontrol.parse_command(body, GUST_LIMITS)
+
+
+# FAILS IF: clearing needs a payload. "Stop pushing" carries nothing, and a
+# verb that required an argument to undo something would be one more way for
+# the page to be unable to stop an experiment.
+def test_clearing_a_gust_carries_nothing():
+    assert simcontrol.parse_command({"clear_gust": True}, GUST_LIMITS).verb == "clear_gust"

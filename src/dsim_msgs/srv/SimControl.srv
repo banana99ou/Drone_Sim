@@ -12,10 +12,26 @@ uint8 RESET=3
 # something from a copy that can be stale, and two open tabs would fight over
 # it. The page sends the press; the node, which knows the truth, decides.
 uint8 TOGGLE_PAUSED=4
+# An external force on the airframe -- a gust. The point of it is that the
+# controller has no idea it happened: nothing tells the loop a force was
+# applied, it sees only the state that results, exactly as it would outdoors.
+uint8 GUST=5
+uint8 CLEAR_GUST=6
 
 uint8 command
 bool paused                 # for SET_PAUSED
 float64 speed               # for SET_SPEED, in simulated seconds per wall second
+# for GUST. The force is in the WORLD frame and in newtons, so it stays the
+# same push whatever the vehicle does in response -- a gust that rotated with
+# the airframe would be a thruster, not weather. Magnitude is capped by the
+# node against a parameter, because a force nobody can recover from is not a
+# disturbance, it is a delete button.
+geometry_msgs/Vector3 force
+# How long the gust lasts, in SIMULATED seconds. Zero means until it is
+# cleared. Simulated and not wall, because the playback speed exists and a
+# gust measured in wall seconds would last a different distance at 0.25x --
+# and would keep expiring while the world is paused.
+float64 duration_s
 ---
 bool ok
 string message              # a reason fit to show a user when ok is false

@@ -300,9 +300,14 @@ def launch_setup(context, *args, **kwargs):
         nodes.append(Node(
             package='dsim_simctl', executable='sim_control_node', name='dsim_simctl',
             output='screen',
+            # gust_link is the link a gust pushes on, spelled as Gazebo names
+            # it. It has no default in the node: a name that does not resolve
+            # is not an error anywhere in the stack, it is a force that
+            # silently never lands.
             parameters=[{'use_sim_time': False,
                          'world': world_name,
-                         'step_size_s': step_size_s}],
+                         'step_size_s': step_size_s,
+                         'gust_link': 'drone::base_link'}],
         ))
 
     # Tell the viewer which world is actually running. Without this its world

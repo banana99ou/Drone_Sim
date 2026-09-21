@@ -117,6 +117,40 @@ reproduces it in one second.
 and reset against a live sim and asserts, after each one, that the vehicle is
 still producing about 14.7 N of thrust — which a weightless one cannot be.
 
+### Pushing the vehicle: gusts
+
+The **gust** controls apply an external force to the airframe, in the world
+frame, in newtons. Six buttons (±x, ±y, ±z), a magnitude slider, and a **hold
+until cleared** box — unticked, a press lasts 1.5 simulated seconds.
+
+The controller is never told. Nothing publishes "a force was applied"; the loop
+sees only the state that results, exactly as it would outdoors. That is the
+whole point of pushing the vehicle rather than moving its setpoint.
+
+Watch the **aero** arrow: it is measured from the accelerometer, so the gust
+shows up there as an orange arrow of the applied size, and the rotors visibly
+split to fight it.
+
+What a steady gust does to *this* controller, stated because it looks like a
+bug and is not: the stack is PD with no integrator, so a constant disturbance
+produces a constant position offset of about F/kp and nothing ever removes it.
+Measured, 5 N sideways on the demo lap: the vehicle settles about **1 m** off
+the plan, holds altitude, and returns to **3 cm** the moment the gust is
+cleared.
+
+Duration is in SIMULATED seconds, so a gust is the same push at any playback
+speed, and it does not expire while the world is paused. The force is capped
+(20 N against a 14.7 N weight) and the cap is published in `/sim/state`, so the
+slider, the HTTP layer and the node cannot disagree about it. There is no
+torque: a gust that spun the airframe would be indistinguishable from a broken
+mixer in every plot here.
+
+`scripts/check_simcontrol.py` covers it, and the check that matters reads the
+**accelerometer**, not the reply: a gust published to a link that does not
+exist still answers HTTP 200 and still shows up in `/sim/state`. Aimed at
+`drone::not_a_link` the measured residual stays at 0.37 N against 5.00 N
+applied, and only that check notices.
+
 ### Frame rate
 
 The HUD shows the page's own render rate. It exists because "it feels slower"
@@ -149,8 +183,25 @@ split *is* the control action.
 | weight | mass × g, straight down |
 | aero | **measured**: mass × IMU proper acceleration, minus the rotor thrust |
 | velocity | the world-frame velocity the controller resolved |
-| attitude cmd | the demanded thrust axis (dashed) next to the actual body z |
 | torque | the realised body torque |
+
+**And what each loop of the cascade asked for** (dashed, one toggle, because
+seeing one without the others tells you a loop is unhappy but not which):
+
+| arrow | what it is |
+|---|---|
+| cmd position | where the position loop wants the vehicle to be, drawn from where it is — the tracking error, magnified ×10 with the true distance in the label |
+| cmd velocity | the velocity being asked for, on the same scale as the actual velocity arrow, so the gap between them is the velocity error |
+| cmd tilt | the demanded thrust axis, against the actual body z |
+
+Each one is recovered from the ERROR the controller published (state minus
+reference), not re-sampled from the trajectory here. Re-sampling would let the
+picture disagree with the numbers the loop actually ran on, and that
+disagreement would read as a tracking failure.
+
+Numeric labels carry two decimals. Torque is labelled in **mN·m**: a steady
+turn realises about 0.017 N·m, and two decimals of that is one significant
+figure that does not move until the demand changes by 40%.
 
 The aero arrow is a measurement, not a model. An accelerometer reads total
 non-gravitational force over mass; subtract the thrust the rotors are producing

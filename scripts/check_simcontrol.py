@@ -56,6 +56,24 @@ TRACK_MAX_M = 1.0
 #: is exactly what three control nodes pacing one world produced, so this is
 #: the check that would catch that happening again.
 SPEED_FRAC = 0.25
+#: A gust must show up on the accelerometer within this fraction of the force
+#: that was asked for. The residual is MEASURED (mass x specific force minus
+#: rotor thrust), so it also carries rotor drag and whatever the plant does
+#: that the controller does not model -- about 0.35 N at cruise against a 5 N
+#: gust. Tight enough that a gust which never reaches the physics (0 N) fails
+#: by a mile, loose enough to survive the vehicle's own aerodynamics.
+GUST_FRAC = 0.20
+#: How much the standing offset may still be GROWING 2.5 s into a steady gust.
+#: A PD loop with no integrator settles at F/kp and stays there; a vehicle
+#: being carried away keeps adding metres, and one sample cannot tell them
+#: apart -- which is why this is measured as a difference and not a level.
+GUST_SETTLE_M = 0.15
+#: The largest standing offset a 5 N gust may produce. 5/kp is about 0.85 m
+#: with kp = 6; twice that is a vehicle that is no longer holding station.
+GUST_OFFSET_MAX_M = 1.7
+#: What the residual must fall back to once a gust is cleared, in newtons.
+#: Ordinary flight sits around 0.35 N; a 5 N gust still running reads 5 N.
+GUST_CLEARED_N = 1.0
 #: Simulated seconds a paused world may advance over two wall seconds, once it
 #: has settled. A step already in flight when the request lands is legitimate;
 #: anything more means the pause did not take. A world that ignored the request
@@ -121,6 +139,35 @@ def has_weight(snap):
     return abs(measured - expected) <= WEIGHT_FRAC * expected, measured, expected
 
 
+def gust_residual_n(snap):
+    """The external force on the airframe, as the ACCELEROMETER measures it.
+
+    An accelerometer reads specific force: every non-gravitational force on the
+    body over its mass. Subtract the thrust the rotors are actually producing
+    and what is left is everything else acting on the airframe -- rotor drag,
+    and any gust being applied. It is the same quantity the viewer draws as
+    "aero", and it is computed from two independent messages: the IMU, and the
+    mixer's own account of what it delivered.
+
+    Nothing in this path can be fooled by the request. A gust that is published
+    to a topic nobody is listening on, applied to a link that does not exist,
+    or cleared a step later leaves this number exactly where it was -- which is
+    the failure this check exists to catch, and the reason it is not enough to
+    read back /sim/state and see the force we just sent.
+
+    Returned as a MAGNITUDE. The residual is in the body frame while the gust
+    is specified in the world frame, so their components only agree while the
+    vehicle is level; the vehicle banks into a gust within a second. A rotation
+    cannot change a length, so the magnitudes must agree whatever it does.
+    """
+    c, i = snap["control"], snap["imu"]
+    if not c or not i:
+        return None
+    f = [c["mass_kg"] * a for a in i["accel_body"]]
+    f[2] -= c["realised_thrust_n"]
+    return math.sqrt(sum(v * v for v in f))
+
+
 def self_test(ck):
     """Prove the weight predicate can fail, on numbers rather than on trust.
 
@@ -141,6 +188,23 @@ def self_test(ck):
             "0.50 N against 14.71 N expected",
             "a predicate that passes for the exact failure it exists to "
             "detect -- which is what the previous test suite did")
+
+    # The same treatment for the gust predicate: it has to be shown reading
+    # zero on a vehicle nobody is pushing, and reading the force on one that
+    # is, before it is trusted to tell the two apart in flight.
+    quiet = {"control": {"mass_kg": 1.5, "realised_thrust_n": 14.71},
+             "imu": {"accel_body": [0.0, 0.0, 14.71 / 1.5]}}
+    pushed = json.loads(json.dumps(quiet))
+    pushed["imu"]["accel_body"] = [5.0 / 1.5, 0.0, 14.71 / 1.5]
+    ck.that(gust_residual_n(quiet) < 1e-6, "self-test/no push reads zero",
+            f"{gust_residual_n(quiet):.4f} N with the rotors holding hover",
+            "a residual that reports a force on an undisturbed vehicle, which "
+            "would make every gust below pass without a gust")
+    ck.that(abs(gust_residual_n(pushed) - 5.0) < 1e-6,
+            "self-test/a 5 N push reads 5 N",
+            f"{gust_residual_n(pushed):.4f} N",
+            "a residual that does not recover the applied force, so the check "
+            "would fail on a working gust or pass on a missing one")
 
 
 def settle(seconds=4.0):
@@ -313,6 +377,99 @@ def main():
             f"resumed at {res.get('requested_speed')}x",
             "a pause that forgets the playback speed")
     post({"speed": 1.0})
+
+    # --- gusts ---------------------------------------------------------------
+    #
+    # The point of this block is that the ACCELEROMETER has to see the force.
+    # /sim/state reporting the gust proves only that the node remembered what
+    # it was told; the residual proves the wrench reached the physics, on the
+    # link it was aimed at, in the world that is actually running.
+    print("\ngust")
+    snap = wait_flying(ck)
+    if snap is not None:
+        cap = snap["sim"].get("max_gust_n")
+        ck.that(isinstance(cap, (int, float)) and cap > 0, "gust/limit published",
+                f"max_gust_n = {cap!r}",
+                "a page with no cap to validate against, which would have to "
+                "invent one and would then disagree with the node")
+
+        quiet = gust_residual_n(snap)
+        ck.that(quiet is not None and quiet < GUST_CLEARED_N, "gust/quiet baseline",
+                f"residual {quiet:.2f} N before any gust",
+                "a run that was already being pushed, which would make the "
+                "measurement below meaningless")
+
+        code, res = post({"gust": [5.0, 0.0, 0.0], "duration_s": 0})
+        ck.that(code == 200, "gust/accepted", f"HTTP {code}: {res.get('error')}",
+                "a gust the node refuses but the page offers")
+        time.sleep(1.5)
+        snap = get()
+        felt = gust_residual_n(snap)
+        ck.that(felt is not None and abs(felt - 5.0) <= GUST_FRAC * 5.0,
+                "gust/the airframe feels it",
+                f"measured residual {felt:.2f} N against 5.00 N applied",
+                "a gust that never reaches the physics -- the wrench system "
+                "not loaded in the world, the wrong link name, or a topic "
+                "nobody subscribes to. Every one of those still answers ok")
+        reported = snap["sim"]["gust_force_n"]
+        ck.that(abs(math.sqrt(sum(v * v for v in reported)) - 5.0) < 1e-6,
+                "gust/reported as sent",
+                f"state reports {reported}",
+                "a node that reports the requested force rather than the one "
+                "it sent, hiding a cap from the person running the experiment")
+
+        # What a steady side force does to THIS controller, stated before it is
+        # checked: the stack is PD with no integrator (see Scope in the
+        # README), so a constant disturbance produces a constant position
+        # offset of roughly F/kp and nothing ever removes it. Measured: 5 N
+        # gives about 1 m against kp = 6. That is correct behaviour, not a
+        # failure, so the checks below are the two things that WOULD be
+        # failures -- an offset that keeps growing, and an offset that does not
+        # go away when the force does.
+        first = snap["status"]["tracking_error_m"]
+        time.sleep(2.5)
+        snap = get()
+        second = snap["status"]["tracking_error_m"]
+        ck.that(second <= first + GUST_SETTLE_M and second < GUST_OFFSET_MAX_M,
+                "gust/the offset settles instead of running away",
+                f"tracking error {first * 100:.0f} cm then {second * 100:.0f} cm, "
+                f"2.5 s apart under a steady 5 N",
+                "a vehicle the disturbance is carrying away -- which is what a "
+                "controller that had lost authority would look like, and it "
+                "reads as a large tracking error either way at one sample")
+        good, measured, expected = has_weight(snap)
+        ck.that(good, "gust/still holds itself up",
+                f"thrust {measured:.2f} N vs {expected:.2f} N expected",
+                "a gust that breaks the flight rather than disturbing it")
+
+        code, _ = post({"clear_gust": True})
+        ck.that(code == 200, "gust/cleared", f"HTTP {code}", "a clear that errors")
+        time.sleep(2.0)
+        time.sleep(2.0)
+        snap = get()
+        after = gust_residual_n(snap)
+        ck.that(after is not None and after < GUST_CLEARED_N, "gust/really stops",
+                f"residual back to {after:.2f} N (was {felt:.2f} N)",
+                "a gust that outlives the button that stopped it, which would "
+                "poison every run afterwards on this world")
+        recovered = snap["status"]["tracking_error_m"]
+        ck.that(recovered < TRACK_MAX_M, "gust/the vehicle comes back",
+                f"tracking error {second * 100:.0f} cm under the gust -> "
+                f"{recovered * 100:.0f} cm after it",
+                "a standing offset that survives the force that caused it. "
+                "The offset under load is expected -- PD with no integrator -- "
+                "but nothing should hold the vehicle off the plan once the "
+                "disturbance is gone")
+
+        # A timed gust is measured in SIMULATED seconds and must end by itself.
+        post({"gust": [0.0, 4.0, 0.0], "duration_s": 1.0})
+        time.sleep(3.0)
+        expired = gust_residual_n(get())
+        ck.that(expired is not None and expired < GUST_CLEARED_N,
+                "gust/a timed gust expires",
+                f"residual {expired:.2f} N three seconds after a 1 s gust",
+                "a duration nothing enforces, leaving a force running that "
+                "the state says has ended")
 
     # --- the endpoint must not accept the old, dangerous vocabulary ---------
     print("\nrefusals")

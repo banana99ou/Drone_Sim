@@ -220,6 +220,26 @@ const speedLabel = () => {
 /// reports. Applied once: re-applying every frame would drag the handle out
 /// from under a user who is holding it.
 let speedRangeSet = false;
+// The gust slider's ceiling is the control node's cap, for the same reason the
+// speed slider's is: a page that offered a force the node refuses would make
+// the user debug their own UI.
+let gustRangeSet = false;
+function applyGustRange(sim) {
+  const g = el("gustn");
+  const known = sim.enabled && typeof sim.max_gust_n === "number";
+  g.disabled = !known;
+  for (const b of document.querySelectorAll("button.gust")) { b.disabled = !known; }
+  el("gustclear").disabled = !known;
+  if (!known || gustRangeSet) { return; }
+  g.max = sim.max_gust_n;
+  gustLabel();
+  gustRangeSet = true;
+}
+
+function gustLabel() {
+  el("gustval").textContent = `${Number(el("gustn").value).toFixed(1)} N`;
+}
+
 function applySpeedRange(sim) {
   const speed = el("speed");
   const known = sim.enabled &&
@@ -305,6 +325,17 @@ function updateHudOnce() {
     el("pause").disabled = !sim.enabled;
     el("simreset").disabled = !sim.enabled;
     applySpeedRange(sim);
+    applyGustRange(sim);
+    // What the airframe is FEELING, from the control node -- not what was
+    // asked for. A capped gust shows the smaller number here, so the HUD and
+    // the physics cannot disagree.
+    const g = sim.gust_force_n;
+    const mag = g ? Math.hypot(g[0], g[1], g[2]) : 0;
+    el("gust").textContent = mag < 1e-6
+      ? "none"
+      : `${mag.toFixed(2)} N` +
+        (sim.gust_remaining_s > 0 ? ` · ${sim.gust_remaining_s.toFixed(1)} s` : " · held");
+    el("gust").className = mag < 1e-6 ? "" : "bad";
   }
 
   const st = S.status;
@@ -444,6 +475,23 @@ function bindInput() {
   // On release, not on every drag pixel: each change is a service call into
   // the simulator, and forty of them while dragging is forty round trips.
   speed.onchange = () => post({ speed: Number(speed.value) });
+
+  // One axis at a time, deliberately: a drag-a-vector control would need a
+  // projection from screen to world, which is physics in the browser, and the
+  // whole viewer is built the other way round. Six buttons say exactly what
+  // they do in the frame the number is in.
+  gustLabel();
+  el("gustn").oninput = gustLabel;
+  for (const b of document.querySelectorAll("button.gust")) {
+    b.onclick = () => {
+      const n = Number(el("gustn").value) * Number(b.dataset.sign);
+      const force = { x: [n, 0, 0], y: [0, n, 0], z: [0, 0, n] }[b.dataset.ax];
+      // Held gusts last until cleared; a timed one is measured in SIMULATED
+      // seconds by the node, so it is the same push at any playback speed.
+      post({ gust: force, duration_s: el("gusthold").checked ? 0 : 1.5 });
+    };
+  }
+  el("gustclear").onclick = () => post({ clear_gust: true });
 
   el("reset").onclick = () => {
     cam = { ...CAM_HOME, target: CAM_HOME.target.slice() };

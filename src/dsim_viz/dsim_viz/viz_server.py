@@ -39,7 +39,7 @@ Endpoints, all on one port and one origin:
     /              web/index.html and friends (static)
     /snapshot      one JSON object with the latest state  (curl-friendly)
     /state         text/event-stream, ~30 Hz of the same object
-    /control       POST: pause, playback speed, reset  (see simcontrol.py)
+    /control       POST: pause, playback speed, reset, gust  (see simcontrol.py)
 
 Almost read-only. Every GET is; /control is the single write path. It forwards
 to one ROS service with four commands -- pause, toggle pause, speed, reset --

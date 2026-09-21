@@ -127,9 +127,17 @@ Position alone cannot tell you whether the controller is working: a drone
 coasting through a gentle arc and one fighting for it trace the same line. The
 viewer draws the control action itself — one thrust arrow per rotor with a tick
 at hover thrust, coloured blue below and orange above, plus thrust, weight,
-**measured** aerodynamic force, velocity, torque and the commanded attitude axis
-next to the actual one. In a turn the thrust visibly splits across the diagonal;
-that split *is* the control action. See [docs/VIEWER.md](docs/VIEWER.md).
+**measured** aerodynamic force, velocity and torque. In a turn the thrust
+visibly splits across the diagonal; that split *is* the control action. Beside
+them, dashed, is what each loop of the cascade asked for: the position it wants
+the vehicle at, the velocity it is demanding, the attitude it is demanding. See
+[docs/VIEWER.md](docs/VIEWER.md).
+
+You can also **push the vehicle**. The gust controls apply an external force in
+newtons, world frame, that the controller is never told about — it sees only
+the state that results. A steady 5 N sideways settles the vehicle about 1 m off
+the plan and it returns to 3 cm when the gust stops, which is exactly what a PD
+loop with no integrator must do with a constant disturbance.
 
 One thing worth knowing before deciding the stack looks idle: a circle needs
 `bank = atan(4·pi²·r / (T²·g))`, so a 12 s lap on a 1 m circle is **1.6 degrees**

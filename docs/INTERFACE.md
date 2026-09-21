@@ -21,6 +21,13 @@ publish trajectories, it flies them and scores the result.**
 | sim → you | `/sim/state` | `dsim_msgs/msg/SimState` | 5 Hz |
 | **you → sim** | `/sim/control` (service) | `dsim_msgs/srv/SimControl` | on demand |
 
+`/sim/control` also carries **gusts**: an external force on the airframe, in
+newtons, world frame, applied by the simulator and never announced to anything
+downstream. A planner subscribing to `/drone/truth` sees only the state that
+results, which is the point -- it is the one disturbance in this simulator that
+is not in any model your planner could hold. `/sim/state` reports the force
+currently applied, so a run can be labelled with the disturbance it met.
+
 **Renamed:** this topic was `/drone/odom` until it was pointed out that nothing
 here is odometry — it is ground truth straight out of the simulator, with no
 dead reckoning and no drift. Calling it odom invited exactly the wrong

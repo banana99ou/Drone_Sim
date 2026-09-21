@@ -37,6 +37,7 @@ far end; this validation exists to give a person a usable error, not to be the
 last line of defence.
 """
 import threading
+import math
 from collections import namedtuple
 
 # rclpy and dsim_msgs are imported inside SimControlClient, not here. The
@@ -65,6 +66,10 @@ UNKNOWN = {
     "step_size_s": None,
     "backlog_s": None,
     "target_sim_time_s": None,
+    "gust_force_n": None,
+    "gust_remaining_s": None,
+    "max_gust_n": None,
+    "gusts": 0,
     "resets": 0,
     "step_errors": 0,
     "ticks": 0,
@@ -97,6 +102,14 @@ def state_to_dict(msg):
         "step_size_s": msg.step_size_s,
         "backlog_s": msg.backlog_s,
         "target_sim_time_s": msg.target_sim_time_s,
+        # As the node SENT it, which is not always as it was asked for: a
+        # gust over the cap arrives here smaller. The page shows this number,
+        # so what is on screen is the force the airframe is feeling.
+        "gust_force_n": [msg.gust_force_n.x, msg.gust_force_n.y,
+                         msg.gust_force_n.z],
+        "gust_remaining_s": msg.gust_remaining_s,
+        "max_gust_n": msg.max_gust_n,
+        "gusts": int(msg.gusts),
         "resets": int(msg.resets),
         "step_errors": int(msg.step_errors),
         # Cumulative counters, so two samples give a rate. The pacer is
@@ -110,9 +123,10 @@ def state_to_dict(msg):
 
 #: One parsed request. `verb` is one of VERBS; the other fields carry whatever
 #: that verb needs and are ignored otherwise.
-Command = namedtuple("Command", "verb speed paused")
+Command = namedtuple("Command", "verb speed paused force duration_s")
+Command.__new__.__defaults__ = (0.0, False, (0.0, 0.0, 0.0), 0.0)
 
-VERBS = ("speed", "paused", "toggle_pause", "reset")
+VERBS = ("speed", "paused", "toggle_pause", "reset", "gust", "clear_gust")
 
 
 def parse_command(body, limits):
@@ -147,6 +161,9 @@ def parse_command(body, limits):
         return Command("speed", _speed(body["speed"], limits), False)
     if verb == "paused":
         return Command("paused", 0.0, bool(body["paused"]))
+    if verb == "gust":
+        return Command("gust", 0.0, False, _force(body["gust"], limits),
+                       _duration(body.get("duration_s", 0.0)))
     # toggle_pause and reset carry nothing: the node holds the current state.
     return Command(verb, 0.0, False)
 
@@ -165,6 +182,45 @@ def _speed(value, limits):
     if not lo <= speed <= hi:
         raise ControlError(f"speed must be between {lo:g} and {hi:g}, got {speed:g}")
     return speed
+
+
+def _force(value, limits):
+    """A world-frame force in newtons, as [x, y, z].
+
+    Validated against the cap the CONTROL NODE published rather than a number
+    written here, for the same reason the speed range is: two copies of a
+    limit drift, and the copy in the browser is the one nobody tests. The node
+    caps as well -- this check exists to give a user a reason, not to be the
+    only thing standing between a slider and the physics.
+    """
+    if not isinstance(value, (list, tuple)) or len(value) != 3:
+        raise ControlError(f"gust must be [x, y, z] in newtons, got {value!r}")
+    try:
+        force = [float(v) for v in value]
+    except (TypeError, ValueError):
+        raise ControlError(f"gust components must be numbers, got {value!r}")
+    if any(v != v or v in (float("inf"), float("-inf")) for v in force):
+        raise ControlError("gust components must be real numbers")
+    cap = limits.get("max_gust_n")
+    if cap is None:
+        raise ControlError(
+            "the simulation control node has not reported its gust limit yet")
+    magnitude = math.sqrt(sum(v * v for v in force))
+    if magnitude > cap:
+        raise ControlError(
+            f"gust of {magnitude:.1f} N exceeds the {cap:g} N limit")
+    return tuple(force)
+
+
+def _duration(value):
+    """Gust duration in SIMULATED seconds; 0 means until cleared."""
+    try:
+        duration = float(value)
+    except (TypeError, ValueError):
+        raise ControlError(f"duration_s must be a number, got {value!r}")
+    if duration != duration or duration < 0.0:
+        raise ControlError("duration_s must be zero or a positive number")
+    return duration
 
 
 class SimControlClient:
@@ -211,9 +267,13 @@ class SimControlClient:
             "speed": Request.SET_SPEED,
             "reset": Request.RESET,
             "toggle_pause": Request.TOGGLE_PAUSED,
+            "gust": Request.GUST,
+            "clear_gust": Request.CLEAR_GUST,
         }[cmd.verb]
         req.speed = float(cmd.speed)
         req.paused = bool(cmd.paused)
+        req.force.x, req.force.y, req.force.z = (float(v) for v in cmd.force)
+        req.duration_s = float(cmd.duration_s)
         return req
 
     def _on_state(self, msg):

@@ -1,6 +1,6 @@
 // The only write path into the running simulator.
 //
-// Three verbs -- pause, speed, reset -- and nothing else. It cannot arm a
+// Four verbs -- pause, speed, reset, gust -- and nothing else. It cannot arm a
 // vehicle, retune a controller, spawn a model or run a command, and that
 // narrowness is deliberate: the HTTP server that forwards to it is reachable
 // from the whole tailnet.
@@ -31,8 +31,10 @@
 // would stop ticking the instant it paused the world and could never start it
 // again. That is why use_sim_time is checked at startup and refused.
 
+#include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -40,6 +42,8 @@
 #include <thread>
 
 #include <gz/msgs/boolean.pb.h>
+#include <gz/msgs/entity.pb.h>
+#include <gz/msgs/entity_wrench.pb.h>
 #include <gz/msgs/world_control.pb.h>
 #include <gz/msgs/world_stats.pb.h>
 #include <gz/transport/Node.hh>
@@ -68,6 +72,14 @@ public:
     cfg_.step_s = require<double>("step_size_s");
     tick_hz_ = declare_parameter("tick_hz", 20.0);
     min_speed_ = declare_parameter("min_speed", 0.05);
+    // The link a gust pushes on, and the most it may push with. The link name
+    // has no default for the same reason the world name has none: a wrong one
+    // is not an error anywhere, it is a force that silently never lands.
+    gust_link_ = require<std::string>("gust_link");
+    // 20 N against a 14.7 N weight: hard enough to shove the vehicle across
+    // the scene and lose a metre of altitude, not so hard that no controller
+    // could recover. A disturbance nothing can survive teaches nothing.
+    max_gust_n_ = declare_parameter("max_gust_n", 20.0);
     // One, and not a decision: the world is throttled to real time by its SDF,
     // and stepping does not bypass the throttle (measured: ten seconds of
     // simulated time took 10.38 s of wall clock). Raising it needs the service
@@ -88,6 +100,13 @@ public:
     pacer_ = std::make_unique<Pacer>(cfg_);
 
     control_topic_ = "/world/" + world_ + "/control";
+    // Persistent, and cleared explicitly. The one-shot topic applies a wrench
+    // for a single step, which at 1 ms is an impulse nobody can see; a gust is
+    // a force that stays until it stops.
+    wrench_pub_ = gz_.Advertise<gz::msgs::EntityWrench>(
+      "/world/" + world_ + "/wrench/persistent");
+    wrench_clear_pub_ = gz_.Advertise<gz::msgs::Entity>(
+      "/world/" + world_ + "/wrench/clear");
     if (!gz_.Subscribe(
         "/world/" + world_ + "/stats", &SimControlNode::onStats, this))
     {
@@ -224,6 +243,11 @@ private:
 
   void tick()
   {
+    // Before any early return below. Most of tick() is about pacing and bails
+    // out when the world is running natively at 1x -- which is the ordinary
+    // case, and the one in which a timed gust would otherwise never end.
+    expireGust();
+
     const auto now = std::chrono::steady_clock::now();
     double wall_dt = 0.0;
     if (have_tick_) {
@@ -272,6 +296,13 @@ private:
         break;
       case SimControlSrv::Request::RESET:
         res.ok = reset(res.message);
+        break;
+      case SimControlSrv::Request::GUST:
+        res.ok = gust(req.force.x, req.force.y, req.force.z, req.duration_s,
+                      res.message);
+        break;
+      case SimControlSrv::Request::CLEAR_GUST:
+        res.ok = clearGust(res.message);
         break;
       default:
         res.ok = false;
@@ -469,6 +500,13 @@ private:
     s.step_size_s = cfg_.step_s;
     s.backlog_s = pacing_ ? backlog_ : 0.0;
     s.target_sim_time_s = last_target_;
+    s.gust_force_n.x = gust_[0];
+    s.gust_force_n.y = gust_[1];
+    s.gust_force_n.z = gust_[2];
+    s.gust_remaining_s =
+      gust_until_sim_ > 0.0 ? std::max(0.0, gust_until_sim_ - stats_sim_s_) : 0.0;
+    s.max_gust_n = max_gust_n_;
+    s.gusts = gusts_;
     s.resets = resets_;
     s.step_errors = step_errors_;
     s.ticks = ticks_;
@@ -479,9 +517,111 @@ private:
 
   void publishState() {state_pub_->publish(buildState());}
 
+  // ---- gusts ---------------------------------------------------------------
+
+  /// Apply an external force to the airframe, in the world frame.
+  ///
+  /// The controller is not told. That is the entire value of it: a disturbance
+  /// the loop knows about is a feedforward term, and what this exists to show
+  /// is the loop meeting a force it can only infer from the state it produces.
+  ///
+  /// The magnitude is capped rather than refused, and the cap is reported both
+  /// in the reply and in SimState, so the number on screen is the force that
+  /// was actually sent. A viewer that showed the requested force next to a
+  /// vehicle feeling a smaller one would be lying about the experiment.
+  bool gust(double fx, double fy, double fz, double duration_s,
+            std::string & message)
+  {
+    if (!std::isfinite(fx) || !std::isfinite(fy) || !std::isfinite(fz) ||
+        !std::isfinite(duration_s))
+    {
+      message = "gust force and duration must be finite";
+      return false;
+    }
+    if (duration_s < 0.0) {
+      message = "gust duration cannot be negative";
+      return false;
+    }
+    const double mag = std::sqrt(fx * fx + fy * fy + fz * fz);
+    if (mag < 1e-9) {
+      // Not an error, and not a no-op either: asking for no force is how a
+      // user says "stop pushing", and routing it anywhere else would leave
+      // the old gust running under a state that says zero.
+      return clearGust(message);
+    }
+    double scale = 1.0;
+    if (mag > max_gust_n_) {
+      scale = max_gust_n_ / mag;
+      message = "gust capped at " + std::to_string(max_gust_n_) + " N";
+    }
+
+    gz::msgs::EntityWrench msg;
+    msg.mutable_entity()->set_name(gust_link_);
+    msg.mutable_entity()->set_type(gz::msgs::Entity::LINK);
+    msg.mutable_wrench()->mutable_force()->set_x(fx * scale);
+    msg.mutable_wrench()->mutable_force()->set_y(fy * scale);
+    msg.mutable_wrench()->mutable_force()->set_z(fz * scale);
+    // No torque. A gust that spun the airframe would be indistinguishable
+    // from a broken mixer in every plot this simulator draws.
+    if (!wrench_pub_.Publish(msg)) {
+      message = "the simulator refused the wrench";
+      return false;
+    }
+
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      gust_ = {fx * scale, fy * scale, fz * scale};
+      // Expiry is measured in SIMULATED time, taken from the simulator's own
+      // statistics. A wall-clock deadline would make a 3 s gust last 12 s of
+      // simulated time at 0.25x playback, and would run out while the world
+      // was paused -- the force would vanish without the world ever moving.
+      gust_until_sim_ = duration_s > 0.0 ? stats_sim_s_ + duration_s : 0.0;
+      ++gusts_;
+    }
+    RCLCPP_INFO(
+      get_logger(), "-> gust {%.2f %.2f %.2f} N on %s for %s",
+      fx * scale, fy * scale, fz * scale, gust_link_.c_str(),
+      duration_s > 0.0 ? (std::to_string(duration_s) + " s").c_str() : "until cleared");
+    return true;
+  }
+
+  bool clearGust(std::string & message)
+  {
+    gz::msgs::Entity msg;
+    msg.set_name(gust_link_);
+    msg.set_type(gz::msgs::Entity::LINK);
+    if (!wrench_clear_pub_.Publish(msg)) {
+      message = "the simulator refused to clear the wrench";
+      return false;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    gust_ = {0.0, 0.0, 0.0};
+    gust_until_sim_ = 0.0;
+    return true;
+  }
+
+  /// Ends a timed gust once simulated time has passed its deadline.
+  ///
+  /// Called from the pacing tick, which runs whatever the playback speed is.
+  /// Note what this cannot do: while the world is PAUSED simulated time does
+  /// not advance, so a gust does not expire -- which is the correct behaviour
+  /// and the reason the deadline is in simulated seconds.
+  void expireGust()
+  {
+    bool expired = false;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      expired = gust_until_sim_ > 0.0 && stats_sim_s_ >= gust_until_sim_;
+    }
+    if (expired) {
+      std::string ignored;
+      clearGust(ignored);
+    }
+  }
+
   // ---- state ---------------------------------------------------------------
 
-  std::string world_, control_topic_, error_;
+  std::string world_, control_topic_, gust_link_, error_;
   PacerConfig cfg_;
   std::unique_ptr<Pacer> pacer_;
   double tick_hz_ {20.0}, state_hz_ {5.0}, min_speed_ {0.05}, max_speed_ {4.0};
@@ -492,6 +632,10 @@ private:
   double speed_ {1.0};
   double stats_sim_s_ {0.0}, est_sim_ {0.0}, last_target_ {0.0};
   double achieved_ {0.0}, backlog_ {0.0};
+  std::array<double, 3> gust_ {{0.0, 0.0, 0.0}};
+  double gust_until_sim_ {0.0}, max_gust_n_ {20.0};
+  std::uint32_t gusts_ {0};
+  gz::transport::Node::Publisher wrench_pub_, wrench_clear_pub_;
   /// What this node believes the world is doing right now, which is what lets
   /// it send a message only when that changes rather than twenty a second.
   bool world_running_ {true};

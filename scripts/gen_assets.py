@@ -427,7 +427,14 @@ COMMON_PLUGINS = """
     <plugin filename="gz-sim-user-commands-system" name="gz::sim::systems::UserCommands"/>
     <plugin filename="gz-sim-scene-broadcaster-system" name="gz::sim::systems::SceneBroadcaster"/>
     <plugin filename="gz-sim-contact-system" name="gz::sim::systems::Contact"/>
-    <plugin filename="gz-sim-imu-system" name="gz::sim::systems::Imu"/>"""
+    <plugin filename="gz-sim-imu-system" name="gz::sim::systems::Imu"/>
+    <!-- Lets an external force be applied to the airframe at runtime, which is
+         how the viewer's gust button reaches the physics. Without this system
+         the wrench topics exist for nobody and every push is a silent no-op.
+         Only dsim_simctl publishes to them: see its header for why exactly one
+         node owns the write path into Gazebo. -->
+    <plugin filename="gz-sim-apply-link-wrench-system"
+            name="gz::sim::systems::ApplyLinkWrench"/>"""
 
 SCENE = """
     <scene>

@@ -41,10 +41,14 @@
     font-size: 12px; cursor: pointer; }
   .check input { margin: 0; accent-color: #60a5fa; }
   #gain { width: 100%; accent-color: #60a5fa; }
-  #gainrow, #speedrow { display: flex; justify-content: space-between;
+  #gustpad { display: grid; grid-template-columns: repeat(3, 1fr); gap: 4px;
+             margin: 6px 0; }
+  #gustpad button { width: 100%; }
+  #gainrow, #speedrow, #gustrow { display: flex; justify-content: space-between;
     color: #8b93a7; font-size: 10px; text-transform: uppercase;
     letter-spacing: .07em; margin-top: 6px; }
   #speed { width: 100%; accent-color: #f59e0b; }
+  #gustn { width: 100%; accent-color: #f472b6; }
   #ctl button:disabled { opacity: .45; cursor: not-allowed; }
   #legend { bottom: 12px; right: 12px; font-size: 11px; color: #a9b1c4; }
   #legend div { display: flex; align-items: center; gap: 7px; margin: 2px 0; }
@@ -80,6 +84,7 @@
     <tr><td>position err</td><td id="ctrack">—</td></tr>
     <tr><td>speed</td><td id="cspd">—</td></tr>
     <tr><td>tilt</td><td id="ctilt">—</td></tr>
+    <tr><td>gust</td><td id="gust">—</td></tr>
     <tr><td>authority</td><td id="sat">—</td></tr>
     <tr class="sep"><td colspan="2">viewer</td></tr>
     <tr><td>frame rate</td><td id="fps">—</td></tr>
@@ -106,6 +111,24 @@
        the node cannot disagree about what 4x means. -->
   <div id="speedrow"><span>speed</span><span id="speedval">1.00x</span></div>
   <input type="range" id="speed" min="0.05" max="4" step="0.05" value="1" disabled>
+  <hr>
+  <!-- An external force on the airframe. The controller is never told it
+       happened: it sees only the state that results, which is the whole point
+       of pushing the vehicle rather than changing its setpoint. The maximum
+       comes from the control node's own SimState, like the speed range. -->
+  <label class="field">gust (world frame)</label>
+  <div id="gustrow"><span>force</span><span id="gustval">5.0 N</span></div>
+  <input type="range" id="gustn" min="1" max="20" step="0.5" value="5">
+  <div id="gustpad">
+    <button class="gust" data-ax="x" data-sign="1">+x</button>
+    <button class="gust" data-ax="x" data-sign="-1">−x</button>
+    <button class="gust" data-ax="y" data-sign="1">+y</button>
+    <button class="gust" data-ax="y" data-sign="-1">−y</button>
+    <button class="gust" data-ax="z" data-sign="1">+z</button>
+    <button class="gust" data-ax="z" data-sign="-1">−z</button>
+  </div>
+  <label class="check"><input type="checkbox" id="gusthold"><span>hold until cleared</span></label>
+  <button id="gustclear">clear gust</button>
   <hr>
   <button id="reset">recentre view</button>
   <button id="clear">clear trails</button>

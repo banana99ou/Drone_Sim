@@ -30,4 +30,13 @@ uint32 step_errors          # step requests the simulator refused
 # the only way to tell was to time the world with a stopwatch.
 uint64 ticks                # pacing ticks since launch
 uint64 run_requests         # run-to-instant requests sent since launch
+# The gust currently applied to the airframe, in the world frame, as the node
+# last SENT it -- not as anyone requested it. A capped or refused gust must
+# show up here as a smaller number, not as the number that was asked for.
+geometry_msgs/Vector3 gust_force_n
+float64 gust_remaining_s    # simulated seconds left; 0 with a force means it
+                            # lasts until cleared
+float64 max_gust_n          # the cap, published so the viewer offers no force
+                            # the node would refuse
+uint32 gusts                # gusts applied since this node started
 string error                # empty when healthy
