@@ -63,14 +63,22 @@ SPEED_FRAC = 0.25
 #: gust. Tight enough that a gust which never reaches the physics (0 N) fails
 #: by a mile, loose enough to survive the vehicle's own aerodynamics.
 GUST_FRAC = 0.20
-#: How much the standing offset may still be GROWING 2.5 s into a steady gust.
-#: A PD loop with no integrator settles at F/kp and stays there; a vehicle
-#: being carried away keeps adding metres, and one sample cannot tell them
-#: apart -- which is why this is measured as a difference and not a level.
-GUST_SETTLE_M = 0.15
-#: The largest standing offset a 5 N gust may produce. 5/kp is about 0.85 m
-#: with kp = 6; twice that is a vehicle that is no longer holding station.
-GUST_OFFSET_MAX_M = 1.7
+#: What a held gust may leave as standing error once the integrator has had
+#: time to work. Without an integral term this would be F/kp = 0.83 m for a 5 N
+#: push, and the loop would hold that forever; measured with one, hover settles
+#: to 0.4 cm in about 15 s. The bound is generous against that because the
+#: check also runs while the vehicle is flying a lap, where a few centimetres
+#: of ordinary tracking error is in the number too.
+GUST_SETTLED_M = 0.15
+#: Seconds to let the integrator converge before measuring. Hover reaches
+#: 0.5 cm by 15 s; 20 s leaves margin without making this check the slowest
+#: thing in the suite.
+GUST_SETTLE_S = 20.0
+#: How closely the integral term must match the force it is cancelling. It
+#: cannot match exactly -- whatever the integral does not take, the
+#: proportional term holds with a small residual offset -- but an integrator
+#: that has converged on a 5 N gust must be within a newton of 5 N.
+GUST_INTEGRAL_N = 1.0
 #: What the residual must fall back to once a gust is cleared, in newtons.
 #: Ordinary flight sits around 0.35 N; a 5 N gust still running reads 5 N.
 GUST_CLEARED_N = 1.0
@@ -418,25 +426,39 @@ def main():
                 "a node that reports the requested force rather than the one "
                 "it sent, hiding a cap from the person running the experiment")
 
-        # What a steady side force does to THIS controller, stated before it is
-        # checked: the stack is PD with no integrator (see Scope in the
-        # README), so a constant disturbance produces a constant position
-        # offset of roughly F/kp and nothing ever removes it. Measured: 5 N
-        # gives about 1 m against kp = 6. That is correct behaviour, not a
-        # failure, so the checks below are the two things that WOULD be
-        # failures -- an offset that keeps growing, and an offset that does not
-        # go away when the force does.
-        first = snap["status"]["tracking_error_m"]
-        time.sleep(2.5)
+        # What a steady side force does to THIS controller, stated before it
+        # is checked. Until the integral term existed, a constant disturbance
+        # produced a constant offset of F/kp -- 0.83 m for this gust -- and
+        # nothing in the loop could remove it. The integrator is the only term
+        # that can, so this is its regression test: the error has to come back
+        # to nearly nothing while the force is STILL BEING APPLIED, and the
+        # integral has to be the thing holding it there.
+        time.sleep(GUST_SETTLE_S)
         snap = get()
-        second = snap["status"]["tracking_error_m"]
-        ck.that(second <= first + GUST_SETTLE_M and second < GUST_OFFSET_MAX_M,
-                "gust/the offset settles instead of running away",
-                f"tracking error {first * 100:.0f} cm then {second * 100:.0f} cm, "
-                f"2.5 s apart under a steady 5 N",
-                "a vehicle the disturbance is carrying away -- which is what a "
-                "controller that had lost authority would look like, and it "
-                "reads as a large tracking error either way at one sample")
+        settled = snap["status"]["tracking_error_m"]
+        pd_only = 5.0 / 6.0            # F/kp with the shipped position gain
+        ck.that(settled < GUST_SETTLED_M,
+                "gust/the integrator removes the standing offset",
+                f"tracking error {settled * 100:.1f} cm {GUST_SETTLE_S:.0f} s "
+                f"into a held 5 N gust, against {pd_only * 100:.0f} cm for the "
+                f"same loop with ki = 0",
+                "an integral term that is absent, too small to matter, or "
+                "wound up against its own clamp -- all three leave the vehicle "
+                "parked off the plan for as long as the gust lasts")
+        integral = snap["control"]["integral_force_n"]
+        holding = math.sqrt(sum(v * v for v in integral))
+        ck.that(abs(holding - 5.0) <= GUST_INTEGRAL_N,
+                "gust/the integral is what is holding it there",
+                f"integral term {holding:.2f} N against a 5.00 N gust",
+                "an error that came back for some other reason -- the gust "
+                "having quietly stopped, or the reference moving -- which "
+                "would pass the check above while proving nothing")
+        ck.that(not snap["control"]["integral_held"],
+                "gust/anti-windup is not engaged at this size",
+                "the integrator is free to accumulate",
+                "a gust large enough to clamp the tilt, which would make the "
+                "measurement above a test of the clamp rather than of the "
+                "integrator")
         good, measured, expected = has_weight(snap)
         ck.that(good, "gust/still holds itself up",
                 f"thrust {measured:.2f} N vs {expected:.2f} N expected",
@@ -452,14 +474,15 @@ def main():
                 f"residual back to {after:.2f} N (was {felt:.2f} N)",
                 "a gust that outlives the button that stopped it, which would "
                 "poison every run afterwards on this world")
-        recovered = snap["status"]["tracking_error_m"]
-        ck.that(recovered < TRACK_MAX_M, "gust/the vehicle comes back",
-                f"tracking error {second * 100:.0f} cm under the gust -> "
-                f"{recovered * 100:.0f} cm after it",
-                "a standing offset that survives the force that caused it. "
-                "The offset under load is expected -- PD with no integrator -- "
-                "but nothing should hold the vehicle off the plan once the "
-                "disturbance is gone")
+        integral_after = math.sqrt(
+            sum(v * v for v in snap["control"]["integral_force_n"]))
+        ck.that(integral_after < holding,
+                "gust/the integral unwinds when the force stops",
+                f"integral {holding:.2f} N under the gust -> "
+                f"{integral_after:.2f} N two seconds after clearing it",
+                "an integrator that keeps pushing against a force that is no "
+                "longer there, which is the failure that makes people afraid "
+                "of integral terms")
 
         # A timed gust is measured in SIMULATED seconds and must end by itself.
         post({"gust": [0.0, 4.0, 0.0], "duration_s": 1.0})

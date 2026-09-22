@@ -9,6 +9,21 @@ controller:
   gains:
     kp: [6.0, 6.0, 8.0]        # position   -> larger = stiffer, more overshoot
     kv: [4.0, 4.0, 5.0]        # velocity   -> damping on the position loop
+    # Integral of position error, N/(m*s). This stack was PD for a reason: with
+    # an exact model and exact state there is no steady-state error to remove.
+    # An external force is the case that reason excluded -- a gust is a
+    # constant the model knows nothing about, and a PD loop answers it with a
+    # standing offset of F/kp (0.83 m for 5 N here) that nothing ever removes.
+    #
+    # Not a free choice. With an integrator the translational loop is
+    # m*s^3 + kv*s^2 + kp*s + ki, so Routh-Hurwitz requires ki < kp*kv/m: 16 on
+    # x/y, 26.7 on z. These sit at about a tenth of that.
+    ki: [1.5, 1.5, 2.0]
+    # Anti-windup clamp on the integral's contribution, per axis, in newtons.
+    # At the 40 degree tilt clamp the vehicle has about 12 N of lateral
+    # authority; an integral past that asks for an attitude it will not be
+    # given, and every newton has to be unwound before it can come back.
+    max_integral_n: 6.0
     kR: [3.0, 3.0, 0.5]        # attitude   -> yaw is deliberately softer
     komega: [0.5, 0.5, 0.1]    # body rate  -> damping on the attitude loop
     max_tilt_rad: 0.7          # ~40 deg

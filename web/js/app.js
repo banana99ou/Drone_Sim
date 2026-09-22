@@ -287,6 +287,12 @@ function updateHudOnce() {
     el("cspd").textContent = fmt(r.cmd_speed_mps, " m/s");
     el("ctilt").textContent = fmt(r.tilt_deg, "°");
     el("ctilt").className = r.tilt_clamped ? "bad" : "";
+    // The integral term: near zero in undisturbed flight, growing to cancel a
+    // held disturbance. "held" means anti-windup has frozen it because the
+    // demand is already clamped.
+    el("integ").textContent = fmt(r.integral_n, " N") +
+      (r.integral_held ? " · held" : "");
+    el("integ").className = r.integral_held ? "bad" : "";
   }
   if (c) {
     el("thr").textContent = fmt(c.realised_thrust_n, " N");

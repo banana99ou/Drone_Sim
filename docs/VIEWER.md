@@ -131,12 +131,17 @@ Watch the **aero** arrow: it is measured from the accelerometer, so the gust
 shows up there as an orange arrow of the applied size, and the rotors visibly
 split to fight it.
 
-What a steady gust does to *this* controller, stated because it looks like a
-bug and is not: the stack is PD with no integrator, so a constant disturbance
-produces a constant position offset of about F/kp and nothing ever removes it.
-Measured, 5 N sideways on the demo lap: the vehicle settles about **1 m** off
-the plan, holds altitude, and returns to **3 cm** the moment the gust is
-cleared.
+What a steady gust does to *this* controller: the vehicle is thrown about 68 cm
+off the plan, and the position loop's integral term then walks it back to
+**0.4 cm while the force is still being applied**, holding 4.9 N of integral
+against the 5 N gust. Watch the **integral** row in the HUD grow as it does.
+
+That term exists because of this feature. Without it the loop answers a
+constant force with a standing offset of exactly `F/kp` and holds it forever —
+measured at 82 cm with `ki` set to zero, against the 83 cm the arithmetic
+predicts. It cannot help with an error that *turns* with the vehicle, though:
+the integral is accumulated in the world frame, so anything rotating averages
+to nothing over a lap.
 
 Duration is in SIMULATED seconds, so a gust is the same push at any playback
 speed, and it does not expire while the world is paused. The force is capped

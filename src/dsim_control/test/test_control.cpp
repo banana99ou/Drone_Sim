@@ -2,6 +2,8 @@
 // the implementation is correct. Each comment says what would make it fail.
 
 #include <gtest/gtest.h>
+#include <algorithm>
+#include <cmath>
 #include <cmath>
 #include <limits>
 #include "dsim_control/body_rate_source.hpp"
@@ -119,7 +121,7 @@ TEST(SE3Controller, PerfectHoverCommandsExactlyWeight)
   Reference r;
   r.position = s.position;
 
-  const Eigen::Vector4d w = c.compute(s, r);
+  const Eigen::Vector4d w = c.compute(s, r, 0.0);
   EXPECT_NEAR(w(0), kMass * kG, 1e-6);
   EXPECT_NEAR(w(1), 0.0, 1e-9);
   EXPECT_NEAR(w(2), 0.0, 1e-9);
@@ -137,7 +139,7 @@ TEST(SE3Controller, BelowSetpointCommandsMoreThanWeight)
   Reference r;
   r.position = Eigen::Vector3d(0, 0, 1.5);
 
-  EXPECT_GT(c.compute(s, r)(0), kMass * kG);
+  EXPECT_GT(c.compute(s, r, 0.0)(0), kMass * kG);
 }
 
 // FAILS IF: the horizontal error sign is flipped. A setpoint ahead in +x must
@@ -150,7 +152,7 @@ TEST(SE3Controller, SetpointAheadTiltsForward)
   r.position = s.position + Eigen::Vector3d(1.0, 0.0, 0.0);
 
   ControlDebug dbg;
-  c.compute(s, r, &dbg);
+  c.compute(s, r, 0.0, &dbg);
   EXPECT_GT(dbg.desired_force.x(), 0.0);
   EXPECT_NEAR(dbg.desired_force.y(), 0.0, 1e-9);
 }
@@ -167,7 +169,7 @@ TEST(SE3Controller, TiltIsClamped)
   r.position = s.position + Eigen::Vector3d(100.0, 0.0, 0.0);
 
   ControlDebug dbg;
-  c.compute(s, r, &dbg);
+  c.compute(s, r, 0.0, &dbg);
   EXPECT_TRUE(dbg.tilt_clamped);
   EXPECT_LE(dbg.commanded_tilt_rad, 0.5 + 1e-9);
 }
@@ -183,7 +185,7 @@ TEST(SE3Controller, AccelerationFeedforwardIsUsed)
   Reference r1 = r0;
   r1.acceleration = Eigen::Vector3d(0, 0, 2.0);
 
-  EXPECT_NEAR(c.compute(s, r1)(0) - c.compute(s, r0)(0), kMass * 2.0, 1e-6);
+  EXPECT_NEAR(c.compute(s, r1, 0.0)(0) - c.compute(s, r0, 0.0)(0), kMass * 2.0, 1e-6);
 }
 
 // FAILS IF: yaw interpolation goes the long way around the circle. Crossing
@@ -336,7 +338,7 @@ TEST(SE3Controller, DebugErrorsHaveTheDocumentedSign)
   ref.position = Eigen::Vector3d(0.0, 0.0, 1.0);
 
   ControlDebug dbg;
-  c.compute(s, ref, &dbg);
+  c.compute(s, ref, 0.0, &dbg);
 
   EXPECT_NEAR(dbg.position_error.z(), +1.0, 1e-12);   // state - reference
   EXPECT_NEAR(dbg.velocity_error.x(), +0.5, 1e-12);
@@ -360,7 +362,7 @@ TEST(SE3Controller, PerfectHoverProducesZeroErrorsAndVerticalForce)
   ref.position = s.position;
 
   ControlDebug dbg;
-  const Eigen::Vector4d wrench = c.compute(s, ref, &dbg);
+  const Eigen::Vector4d wrench = c.compute(s, ref, 0.0, &dbg);
 
   EXPECT_LT(dbg.position_error.norm(), 1e-12);
   EXPECT_LT(dbg.velocity_error.norm(), 1e-12);
@@ -393,13 +395,13 @@ TEST(SE3Controller, MatchedYawRateLeavesNoBodyRateError)
   ref.yaw_rate = 0.7;                                // ...exactly as commanded
 
   ControlDebug dbg;
-  c.compute(s, ref, &dbg);
+  c.compute(s, ref, 0.0, &dbg);
   EXPECT_NEAR(dbg.body_rate_error.z(), 0.0, 1e-12);
 
   // ...and the control must notice when they DISagree, or the test above would
   // pass for a controller that always reports zero.
   ref.yaw_rate = 0.0;
-  c.compute(s, ref, &dbg);
+  c.compute(s, ref, 0.0, &dbg);
   EXPECT_NEAR(dbg.body_rate_error.z(), 0.7, 1e-12);
 }
 
@@ -537,4 +539,265 @@ TEST(BodyRateSource, KeepsCountingWhileTheSourceStaysBroken)
     EXPECT_EQ(src.update(Eigen::Vector3d(0.0, 0.0, 626.5), 0.004), sane);
   }
   EXPECT_EQ(src.rejected(), 50u);
+}
+
+// ---------------------------------------------------------------------------
+// The integral term.
+//
+// This stack was deliberately PD: with an exact model and exact state there is
+// no steady-state error for an integrator to remove. External forces are the
+// case that argument excluded, and the tests below are about the three ways an
+// integrator goes wrong -- wrong sign, unbounded growth, and accumulating
+// while the actuator is already saturated.
+// ---------------------------------------------------------------------------
+namespace
+{
+/// Closed-loop point-mass simulation of the translational loop.
+///
+/// The controller returns a body wrench, so the honest way to close the loop
+/// would be to simulate attitude too. This instead drives a point mass with
+/// `desired_force`, which is what the attitude loop exists to realise, and is
+/// a good approximation while the tilt stays small -- the disturbances below
+/// are a few newtons against a 14.7 N weight, so the commanded tilt stays
+/// under 20 degrees. The approximation is stated because it is the one thing
+/// that could make this test agree with a controller that would not fly.
+///
+/// Returns the position error at the end of the run.
+double settleUnderDisturbance(
+  SE3Controller & c, const Eigen::Vector3d & disturbance_n,
+  double seconds, double dt = 0.004)
+{
+  State s = hoverState();
+  Reference r;
+  r.position = s.position;
+  ControlDebug dbg;
+  for (int i = 0; i < static_cast<int>(seconds / dt); ++i) {
+    c.compute(s, r, dt, &dbg);
+    // The vehicle feels what the loop asked for, its own weight, and the
+    // disturbance. desired_force already contains the gravity compensation.
+    const Eigen::Vector3d accel =
+      (dbg.desired_force - Eigen::Vector3d(0, 0, kMass * kG) + disturbance_n) / kMass;
+    s.velocity += accel * dt;
+    s.position += s.velocity * dt;
+  }
+  return (s.position - r.position).norm();
+}
+}  // namespace
+
+// FAILS IF: there is no integrator, or it is too weak to matter. This is the
+// whole reason the term exists: a PD loop answers a constant force with a
+// standing offset of F/kp -- 0.83 m for 5 N against kp = 6 -- and holds it for
+// as long as the force lasts. Both halves are asserted, because "the error is
+// small" proves nothing without the number it would otherwise have been.
+TEST(SE3Controller, AConstantDisturbanceIsDrivenOutByTheIntegrator)
+{
+  const Eigen::Vector3d gust(5.0, 0.0, 0.0);
+
+  Gains pd{};
+  pd.ki.setZero();
+  SE3Controller no_integral{pd};
+  const double pd_error = settleUnderDisturbance(no_integral, gust, 20.0);
+  EXPECT_NEAR(pd_error, 5.0 / pd.kp.x(), 0.05)
+    << "a PD loop must sit at exactly F/kp; it is not the controller under "
+       "test here, it is the baseline the integrator has to beat";
+
+  SE3Controller with_integral{Gains{}};
+  const double pid_error = settleUnderDisturbance(with_integral, gust, 20.0);
+  EXPECT_LT(pid_error, 0.05)
+    << "the integrator left " << pid_error << " m of standing error";
+  EXPECT_LT(pid_error, pd_error / 10.0);
+}
+
+// FAILS IF: someone expects the integrator to fix a tracking error that turns
+// with the vehicle. It cannot, and the reason is worth pinning down rather
+// than rediscovering: the integral accumulates in the WORLD frame, so a
+// disturbance that rotates through a full circle integrates to nothing. This
+// is not a defect, it is the boundary of what the term can do -- measured on
+// the real thing, adding this integrator removed a held gust completely (83 cm
+// of standing error to 0.4 cm) and left the circle's constant radial offset
+// where it was.
+TEST(SE3Controller, ARotatingDisturbanceIsNotSomethingTheIntegratorCanCancel)
+{
+  SE3Controller c{Gains{}};
+  State s = hoverState();
+  Reference r;
+  r.position = s.position;
+  ControlDebug dbg;
+
+  // A 5 N force turning once every 6 seconds -- the lap period of the demo
+  // circle -- applied as an error the loop sees.
+  const double dt = 0.004, period = 6.0;
+  double worst = 0.0;
+  for (int i = 0; i < static_cast<int>(60.0 / dt); ++i) {
+    const double phase = 2.0 * M_PI * (i * dt) / period;
+    s.position = r.position +
+      Eigen::Vector3d(0.05 * std::cos(phase), 0.05 * std::sin(phase), 0.0);
+    c.compute(s, r, dt, &dbg);
+    if (i * dt > 12.0) {worst = std::max(worst, dbg.integral_force.norm());}
+  }
+  // ki * e / omega is the most a rotating error of this size can ever build:
+  // 1.5 * 0.05 / (2*pi/6) = 0.072 N, against the 6 N clamp. It never
+  // accumulates, whatever the loop is doing.
+  EXPECT_LT(worst, 0.15)
+    << "the integral reached " << worst << " N against a rotating error it "
+       "cannot help with";
+}
+
+// FAILS IF: the integral has the wrong sign -- which does not look like a bug
+// at first, it looks like a slow instability. Above the reference on +x, the
+// integral force must push back along -x, the same direction the proportional
+// term already pushes.
+TEST(SE3Controller, TheIntegralPushesBackTowardsTheReference)
+{
+  SE3Controller c{Gains{}};
+  State s = hoverState();
+  s.position.x() += 0.2;                    // 20 cm past the reference
+  Reference r;
+  r.position = hoverState().position;
+
+  ControlDebug dbg;
+  for (int i = 0; i < 250; ++i) {c.compute(s, r, 0.004, &dbg);}   // 1 s held
+
+  EXPECT_LT(dbg.integral_force.x(), 0.0);
+  // ki * e * t = 1.5 * 0.2 * 1.0 = 0.3 N, and it opposes the error.
+  EXPECT_NEAR(dbg.integral_force.x(), -0.3, 1e-3);
+  EXPECT_NEAR(dbg.integral_force.y(), 0.0, 1e-12);
+}
+
+// FAILS IF: the integral can grow without bound. An integrator asking for more
+// lateral force than the tilt clamp will ever deliver is not merely useless --
+// every newton of it has to be unwound before the vehicle can come back, which
+// turns a brief excursion into a long one.
+TEST(SE3Controller, TheIntegralIsClampedInNewtons)
+{
+  SE3Controller c{Gains{}};
+  State s = hoverState();
+  // Half a metre, held. Chosen so the tilt clamp does NOT engage: 0.5 m
+  // against kp = 6 is 3 N of lateral demand, 11.5 degrees against a 40 degree
+  // clamp. The first version of this test used a 20 m error and measured
+  // nothing -- the clamp engaged on the first step, the anti-windup freeze
+  // below stopped the integrator at 0.12 N, and the newton clamp was never
+  // reached. The two mechanisms have to be tested apart or each one hides
+  // whether the other works.
+  s.position.x() += 0.5;
+  Reference r;
+  r.position = hoverState().position;
+
+  ControlDebug dbg;
+  for (int i = 0; i < 15000; ++i) {c.compute(s, r, 0.004, &dbg);}  // 60 s
+
+  const Gains g{};
+  ASSERT_FALSE(dbg.tilt_clamped) << "this test must exercise the clamp, "
+                                    "not the anti-windup freeze";
+  // Unclamped this would reach ki * e * t = 1.5 * 0.5 * 60 = 45 N.
+  EXPECT_NEAR(dbg.integral_force.x(), -g.max_integral_n, 1e-9);
+  EXPECT_LE(c.integral().cwiseAbs().maxCoeff(), g.max_integral_n + 1e-9);
+}
+
+// FAILS IF: the integrator keeps accumulating while the demand is already
+// clamped. That is the textbook windup failure, and it is invisible in normal
+// flight: it only shows up as a vehicle that overshoots badly coming out of a
+// manoeuvre it was never going to make.
+TEST(SE3Controller, TheIntegratorHoldsWhileTheTiltIsClamped)
+{
+  SE3Controller c{Gains{}};
+  State s = hoverState();
+  s.position.x() += 5.0;         // far enough that the tilt clamp engages
+  Reference r;
+  r.position = hoverState().position;
+
+  ControlDebug dbg;
+  c.compute(s, r, 0.004, &dbg);
+  ASSERT_TRUE(dbg.tilt_clamped) << "this test needs the clamp to engage";
+
+  // One more step to pick up the clamp from the previous one, then measure.
+  c.compute(s, r, 0.004, &dbg);
+  const Eigen::Vector3d held = dbg.integral_force;
+  for (int i = 0; i < 500; ++i) {c.compute(s, r, 0.004, &dbg);}
+  EXPECT_TRUE(dbg.integral_held);
+  EXPECT_NEAR((dbg.integral_force - held).norm(), 0.0, 1e-12)
+    << "the integral grew by " << (dbg.integral_force - held).norm()
+    << " N while the demand was clamped";
+}
+
+// FAILS IF: a reset leaves the disturbance estimate behind. An integral is a
+// claim about a force acting NOW; carried across a run boundary it makes the
+// new run open by leaning into a gust that is no longer there.
+TEST(SE3Controller, ResettingForgetsTheDisturbance)
+{
+  SE3Controller c{Gains{}};
+  State s = hoverState();
+  s.position.x() += 0.5;
+  Reference r;
+  r.position = hoverState().position;
+
+  ControlDebug dbg;
+  for (int i = 0; i < 500; ++i) {c.compute(s, r, 0.004, &dbg);}
+  ASSERT_GT(dbg.integral_force.norm(), 0.1);
+
+  c.resetIntegral();
+  c.compute(s, r, 0.0, &dbg);
+  EXPECT_NEAR(dbg.integral_force.norm(), 0.0, 1e-12);
+}
+
+// FAILS IF: the integral follows the number of STEPS rather than the time they
+// covered. Hardcoding the nominal 4 ms passes every test whose loop happens to
+// run at 250 Hz -- which was all of them, and the mutation harness said so:
+// "integral accumulates without regard to the step length" SURVIVED. The node
+// measures dt because the timer can be late, and an integrator that ignores
+// that is one whose behaviour depends on how busy the machine is.
+TEST(SE3Controller, TheIntegralFollowsElapsedTimeNotStepCount)
+{
+  State s = hoverState();
+  s.position.x() += 0.2;
+  Reference r;
+  r.position = hoverState().position;
+
+  SE3Controller fast{Gains{}};
+  SE3Controller slow{Gains{}};
+  ControlDebug fast_dbg, slow_dbg;
+  for (int i = 0; i < 250; ++i) {fast.compute(s, r, 0.004, &fast_dbg);}   // 1 s
+  for (int i = 0; i < 100; ++i) {slow.compute(s, r, 0.010, &slow_dbg);}   // 1 s
+
+  // Same second of the same error: the same accumulated force, whatever rate
+  // the loop happened to run at.
+  EXPECT_NEAR(fast_dbg.integral_force.x(), slow_dbg.integral_force.x(), 1e-9);
+  EXPECT_NEAR(fast_dbg.integral_force.x(), -0.3, 1e-3);
+}
+
+// FAILS IF: a zero or missing dt still integrates. The node passes dt = 0 for
+// the first step and after a stall, where there is no evidence about what
+// happened during the gap; integrating over an unmeasured interval would put a
+// step into the demand at exactly the moment the stack is least healthy.
+TEST(SE3Controller, NoTimeMeansNoIntegration)
+{
+  SE3Controller c{Gains{}};
+  State s = hoverState();
+  s.position.x() += 0.5;
+  Reference r;
+  r.position = hoverState().position;
+
+  ControlDebug dbg;
+  for (int i = 0; i < 1000; ++i) {c.compute(s, r, 0.0, &dbg);}
+  EXPECT_NEAR(dbg.integral_force.norm(), 0.0, 1e-12);
+}
+
+// FAILS IF: the shipped gains are outside the stability bound. With an
+// integrator the translational loop is m*s^3 + kv*s^2 + kp*s + ki, and
+// Routh-Hurwitz requires ki < kp*kv/m on every axis. This is a check on the
+// DEFAULTS rather than on the code: raising ki is the obvious thing to try
+// when a disturbance is rejected too slowly, and the loop goes unstable
+// without anything in the maths ever looking wrong.
+TEST(SE3Controller, TheShippedIntegralGainsAreInsideTheStabilityBound)
+{
+  const Gains g{};
+  for (int i = 0; i < 3; ++i) {
+    const double bound = g.kp(i) * g.kv(i) / g.mass;
+    EXPECT_LT(g.ki(i), bound)
+      << "axis " << i << ": ki " << g.ki(i) << " against the Routh-Hurwitz "
+      << "bound kp*kv/m = " << bound;
+    // ...and comfortably inside it, not scraping the edge, because the bound
+    // itself assumes a point mass with no actuator lag.
+    EXPECT_LT(g.ki(i), 0.5 * bound);
+  }
 }

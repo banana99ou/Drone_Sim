@@ -62,6 +62,14 @@ back-pressure the control loop.
 
 It is worth subscribing to from a planner for two reasons:
 
+* **`integral_force_n` is the force the loop is applying that your trajectory
+  does not explain.** The position loop has an integral term, so a disturbance
+  the plan knows nothing about -- a gust, in this simulator -- shows up here as
+  a steady force rather than as a permanent tracking error. A planner watching
+  it can tell "my trajectory is wrong" from "something is pushing the vehicle".
+  `integral_held` means anti-windup has frozen it because the demand is already
+  clamped, which is a stronger statement than `tilt_clamped` alone: the loop
+  has given up asking for more.
 * **`saturated` and `tilt_clamped` tell you your trajectory was infeasible.**
   Without them, an over-aggressive plan looks like a tracking failure, and you
   would tune the wrong thing. If `tilt_clamped` is true, the controller gave up

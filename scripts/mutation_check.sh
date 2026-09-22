@@ -190,6 +190,34 @@ run_mutation "moment constant ignored in allocation" \
 # like a bug. Every mutation here is one that actually happened during its
 # development.
 # ---------------------------------------------------------------------------
+# The integral term. Three ways an integrator goes wrong, and the term is new
+# enough that none of them would be caught by anything above.
+run_mutation "integral term added instead of subtracted" \
+  "src/se3_controller.cpp" \
+  "    - integral_" \
+  "    + integral_"
+
+run_mutation "integral accumulates while the tilt is clamped (windup)" \
+  "src/se3_controller.cpp" \
+  "  if (dt > 0.0 && !hold) {" \
+  "  if (dt > 0.0) {"
+
+run_mutation "anti-windup clamp removed" \
+  "src/se3_controller.cpp" \
+  "    integral_ = integral_.cwiseMax(-gains_.max_integral_n)
+      .cwiseMin(gains_.max_integral_n);" \
+  "    integral_ = integral_;"
+
+run_mutation "integral accumulates without regard to the step length" \
+  "src/se3_controller.cpp" \
+  "    integral_ += gains_.ki.cwiseProduct(e_p) * dt;" \
+  "    integral_ += gains_.ki.cwiseProduct(e_p) * 0.004;"
+
+run_mutation "integral gain raised past the Routh-Hurwitz bound" \
+  "include/dsim_control/se3_controller.hpp" \
+  "  Eigen::Vector3d ki     {1.5, 1.5, 2.0};" \
+  "  Eigen::Vector3d ki     {20.0, 20.0, 20.0};"
+
 PKG=dsim_simctl
 TEST=test/test_pacer.cpp
 

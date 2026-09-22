@@ -231,6 +231,8 @@ def _control_of(m):
         "desired_force": _v3(m.desired_force),
         "commanded_tilt_rad": m.commanded_tilt_rad,
         "tilt_clamped": bool(m.tilt_clamped),
+        "integral_force_n": _v3(m.integral_force_n),
+        "integral_held": bool(m.integral_held),
     }
 
 

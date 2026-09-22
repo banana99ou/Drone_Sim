@@ -70,3 +70,13 @@ geometry_msgs/Vector3 body_rate_error
 geometry_msgs/Vector3 desired_force
 float64 commanded_tilt_rad
 bool tilt_clamped                # the demand was more aggressive than allowed
+
+# --- the integral term, in newtons, WORLD frame ----------------------------
+# The force the loop is applying that does not follow from the state you can
+# see. Published because an integrator is otherwise invisible: a wound-up one
+# looks exactly like a mis-trimmed vehicle, and the only way to tell them apart
+# from outside is to be shown the number. In steady flight with no disturbance
+# it sits near zero; under a held gust it grows to cancel it, which is the
+# whole reason it exists.
+geometry_msgs/Vector3 integral_force_n
+bool integral_held               # true while anti-windup is holding it still

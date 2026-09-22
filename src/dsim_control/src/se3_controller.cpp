@@ -22,7 +22,7 @@ SE3Controller::SE3Controller(const Gains & gains)
 : gains_(gains) {}
 
 Eigen::Vector4d SE3Controller::compute(
-  const State & state, const Reference & ref, ControlDebug * debug) const
+  const State & state, const Reference & ref, double dt, ControlDebug * debug)
 {
   const Eigen::Matrix3d R = state.orientation.toRotationMatrix();
   const Eigen::Vector3d e3(0.0, 0.0, 1.0);
@@ -31,9 +31,34 @@ Eigen::Vector4d SE3Controller::compute(
   const Eigen::Vector3d e_p = state.position - ref.position;
   const Eigen::Vector3d e_v = state.velocity - ref.velocity;
 
+  // ---- integral of position error -----------------------------------------
+  //
+  // Why this exists, since the stack deliberately had no integrator: with an
+  // exact model and exact state there is no steady-state error for one to
+  // remove, and that was true until an external force could be applied to the
+  // airframe. A gust is a constant force nothing in the model accounts for,
+  // and a PD loop answers it with a standing offset of exactly F/kp -- 0.83 m
+  // for a 5 N push against kp = 6, held for as long as the push lasts. The
+  // integral is the only term that can drive that to zero.
+  //
+  // Accumulated BEFORE the clamps below, and frozen when the previous step hit
+  // the tilt clamp. That is conditional integration, and it is the standard
+  // answer to the standard failure: a loop that keeps integrating while the
+  // actuator is already saturated builds a demand nothing can satisfy, and
+  // every newton of it has to be unwound before the vehicle can return.
+  const bool hold = tilt_clamped_last_;
+  if (dt > 0.0 && !hold) {
+    integral_ += gains_.ki.cwiseProduct(e_p) * dt;
+    // Clamped per axis, in newtons, so the limit is a force the vehicle can
+    // actually produce rather than an abstract bound on an accumulator.
+    integral_ = integral_.cwiseMax(-gains_.max_integral_n)
+      .cwiseMin(gains_.max_integral_n);
+  }
+
   Eigen::Vector3d f_des =
     -gains_.kp.cwiseProduct(e_p)
     - gains_.kv.cwiseProduct(e_v)
+    - integral_
     + gains_.mass * gains_.gravity * e3
     + gains_.mass * ref.acceleration;
 
@@ -92,7 +117,11 @@ Eigen::Vector4d SE3Controller::compute(
     - gains_.komega.cwiseProduct(e_omega)
     + state.angular_rate.cross(gains_.inertia * state.angular_rate);
 
+  tilt_clamped_last_ = clamped;
+
   if (debug) {
+    debug->integral_force = -integral_;
+    debug->integral_held = hold;
     debug->position_error = e_p;
     debug->velocity_error = e_v;
     debug->attitude_error = e_R;

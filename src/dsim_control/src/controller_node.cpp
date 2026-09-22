@@ -75,6 +75,8 @@ public:
       };
     g.kp     = vec3("gains.kp",     {6.0, 6.0, 8.0});
     g.kv     = vec3("gains.kv",     {4.0, 4.0, 5.0});
+    g.ki     = vec3("gains.ki",     {1.5, 1.5, 2.0});
+    g.max_integral_n = declare_parameter("gains.max_integral_n", 6.0);
     g.kR     = vec3("gains.kR",     {3.0, 3.0, 0.5});
     g.komega = vec3("gains.komega", {0.5, 0.5, 0.1});
     g.max_tilt_rad = declare_parameter("gains.max_tilt_rad", 0.7);
@@ -303,6 +305,12 @@ private:
       RCLCPP_INFO(get_logger(), "simulated time went backwards — dropping the stale plan");
       buffer_.clear();
       hold_valid_ = false;
+      // The integral is a claim about a force acting NOW. Carrying one across
+      // a reset makes the new run open by correcting for a gust that belongs
+      // to the old one, and the vehicle leans into nothing for several
+      // seconds while it unwinds.
+      controller_->resetIntegral();
+      have_step_ = false;
       std::lock_guard<std::mutex> lock(state_mutex_);
       last_odom_s_ = now;
       last_imu_s_ = now;
@@ -312,6 +320,11 @@ private:
     // on a fabricated zero rate, which looks fine at hover and diverges the
     // moment the vehicle is disturbed.
     if (!armed_ || !have_state || !have_rate) {
+      // Same reasoning as a reset: a disarmed vehicle is not being pushed by
+      // anything the loop should remember, and the gap while it is disarmed is
+      // not time the integrator may accumulate over.
+      controller_->resetIntegral();
+      have_step_ = false;
       publishIdle();
       return;
     }
@@ -347,8 +360,21 @@ private:
       ref.yaw = hold_yaw_;
     }
 
+    // Measured, not assumed to be 1/rate: the timer can be late, and a step
+    // that took twice as long must integrate twice as much or the integral
+    // silently depends on how busy the machine is. A first step, or one after
+    // a gap large enough to be a stall rather than jitter, integrates nothing
+    // -- there is no evidence about what happened during a gap.
+    double dt = 0.0;
+    if (have_step_) {
+      const double measured = now - last_step_s_;
+      if (measured > 0.0 && measured < max_step_dt_s_) {dt = measured;}
+    }
+    last_step_s_ = now;
+    have_step_ = true;
+
     ControlDebug dbg;
-    const Eigen::Vector4d wrench = controller_->compute(state, ref, &dbg);
+    const Eigen::Vector4d wrench = controller_->compute(state, ref, dt, &dbg);
     // Per-rotor thrusts first, then the speeds derived from them. Calling
     // rotorSpeeds() as well would compute the same clamp a second time and let
     // the commanded speeds and the reported thrusts drift apart under a future
@@ -460,6 +486,8 @@ private:
     m.desired_force = toVec3(dbg.desired_force);
     m.commanded_tilt_rad = dbg.commanded_tilt_rad;
     m.tilt_clamped = dbg.tilt_clamped;
+    m.integral_force_n = toVec3(dbg.integral_force);
+    m.integral_held = dbg.integral_held;
 
     debug_pub_->publish(m);
   }
@@ -490,6 +518,11 @@ private:
   double last_imu_s_ {0.0};
 
   bool armed_ {true};
+  bool have_step_ {false};
+  double last_step_s_ {0.0};
+  /// Longer than this between control steps and the gap is a stall, not
+  /// jitter: 250 Hz is a 4 ms step, so 50 ms is twelve missed steps.
+  double max_step_dt_s_ {0.05};
   bool start_armed_ {true};
   bool twist_in_body_frame_ {true};
   double control_rate_hz_ {250.0};

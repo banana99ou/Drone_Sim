@@ -53,6 +53,8 @@ def control(**over):
         'attitude_error': [0.0, 0.0, 0.0],
         'body_rate_error': [0.0, 0.0, 0.0],
         'desired_force': [0.0, 0.0, WEIGHT],
+        'integral_force_n': [0.0, 0.0, 0.0],
+        'integral_held': False,
         'commanded_tilt_rad': 0.0,
         'tilt_clamped': False,
     }

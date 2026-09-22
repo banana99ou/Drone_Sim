@@ -211,6 +211,13 @@ def build(pose, control, imu):
         # What each loop is asking for, as one number per level, so the HUD
         # can show the commands even when an arrow is too short to label.
         'cmd_track_m': _norm(control['position_error']),
+        # The integral term's contribution, in newtons. It is the one part of
+        # the loop whose output does not follow from anything else on screen:
+        # under a held disturbance it grows until it cancels it, and a wound-up
+        # one looks exactly like a mis-trimmed vehicle unless you are shown the
+        # number.
+        'integral_n': _norm(control['integral_force_n']),
+        'integral_held': bool(control['integral_held']),
         'cmd_speed_mps': _norm(_sub(control['velocity_world'],
                                     control['velocity_error'])),
         'saturated': bool(control['saturated']),

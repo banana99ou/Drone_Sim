@@ -213,6 +213,8 @@ def launch_setup(context, *args, **kwargs):
     controller_params.update({
         'gains.kp': [float(v) for v in gains['gains']['kp']],
         'gains.kv': [float(v) for v in gains['gains']['kv']],
+        'gains.ki': [float(v) for v in gains['gains']['ki']],
+        'gains.max_integral_n': float(gains['gains']['max_integral_n']),
         'gains.kR': [float(v) for v in gains['gains']['kR']],
         'gains.komega': [float(v) for v in gains['gains']['komega']],
         'gains.max_tilt_rad': float(gains['gains']['max_tilt_rad']),

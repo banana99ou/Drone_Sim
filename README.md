@@ -135,9 +135,10 @@ the vehicle at, the velocity it is demanding, the attitude it is demanding. See
 
 You can also **push the vehicle**. The gust controls apply an external force in
 newtons, world frame, that the controller is never told about — it sees only
-the state that results. A steady 5 N sideways settles the vehicle about 1 m off
-the plan and it returns to 3 cm when the gust stops, which is exactly what a PD
-loop with no integrator must do with a constant disturbance.
+the state that results. A held 5 N push throws the vehicle 68 cm off the plan,
+and the integral term then walks it back to **0.4 cm while the force is still
+applied**, parking 4.9 N of integral against the 5 N gust. Turn the integral
+off and the same loop sits at 82 cm, which is `F/kp` to the centimetre.
 
 One thing worth knowing before deciding the stack looks idle: a circle needs
 `bank = atan(4·pi²·r / (T²·g))`, so a 12 s lap on a 1 m circle is **1.6 degrees**
@@ -177,9 +178,10 @@ comparable:
 | `state:=est` (default) | **1.4 cm** | 2.9 cm | −0.1 cm / +1.4 cm |
 | `state:=truth` | 7.2 cm | 7.4 cm | −5.8 cm / −4.2 cm |
 
-The perfect-state run is the *worse* one, by a constant offset — 6 cm inside
-the circle and 4 cm behind, every lap, reproducible to a millimetre across
-three runs. Nothing on its control path changed when the estimator was added
+The perfect-state run is the *worse* one, by a constant offset — about 6 cm
+inside the circle and 4–6 cm behind, every lap, reproducible to a millimetre
+across three runs (7.19 cm RMSE before the integral term, 8.36 cm after it,
+each repeatable to 0.01 mm). Nothing on its control path changed when the estimator was added
 (`git diff` on `dsim_control`, the gains and the vehicle is empty), so that
 offset was always there at this bank; the earlier table is a 3° lap, where it
 is small. It is **not explained yet**. The one hypothesis on the table is the
@@ -283,8 +285,26 @@ numbers. The controller's model of the vehicle is exactly right and its
 position is exact, which is why tracking is as good as it is: with an exact
 model and acceleration feedforward, the feedback terms have little left to do.
 The stack is a two-level cascade (position/velocity → attitude/body-rate →
-mixer) and it is **PD, not PID** — there are no integrators, because with no
-model error there is no steady-state error for one to remove.
+mixer).
+
+The position loop gained an **integral term** when gusts arrived, and the
+reason it did not have one before is the reason it needed one then: with an
+exact model and exact state there is no steady-state error for an integrator to
+remove, and an external force is precisely the case that argument excluded.
+`ki` is not a free choice — with an integrator the loop is
+`m·s³ + kv·s² + kp·s + ki`, so Routh–Hurwitz requires `ki < kp·kv/m` (16 on
+x/y, 26.7 on z); the shipped gains sit at about a tenth of that. Anti-windup is
+a clamp in newtons plus conditional integration while the tilt is clamped, and
+the integral is reset on disarm and on a run reset, because it is a claim about
+a force acting *now*.
+
+What it does **not** fix, measured rather than assumed: the circle offset
+below. The integral accumulates in the world frame, so a tracking error that
+rotates with the vehicle integrates to nothing over a lap — it removed a held
+gust entirely (82 cm → 0.4 cm) and left the radial offset at 5.6 cm. On the
+default sensor-based state it costs nothing (1.6–2.1 cm RMSE with it, 1.8–2.5
+without, three runs each); in `state:=truth` it adds about 1.2 cm of phase lag
+to an offset it cannot cancel.
 
 ### A bug worth knowing about, because it was invisible
 
