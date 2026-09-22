@@ -314,6 +314,15 @@ private:
       std::lock_guard<std::mutex> lock(state_mutex_);
       last_odom_s_ = now;
       last_imu_s_ = now;
+      // The state in hand is from the OLD run. With the plan gone the next
+      // step latches a position hold on whatever state it has, and if no
+      // post-reset odometry has arrived yet that is where the vehicle was
+      // before the reset -- measured: nine metres away, a 40 degree tilt
+      // commanded from the pad for as long as it took the planner to
+      // republish, and two collisions before the plan had even started.
+      // Forgetting the state idles the motors until a fresh one arrives.
+      have_state_ = false;
+      have_state = false;
     }
 
     // No rate feedback means no rotational loop. Commanding anyway would fly
