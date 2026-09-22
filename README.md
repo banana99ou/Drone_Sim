@@ -51,9 +51,15 @@ simulator builds the world, moves the obstacles, flies the plan and reports
 every hit with where it happened. See [docs/PLANNER.md](docs/PLANNER.md).
 
 ```bash
-make viz WORLD=fence3d PLAN=plans/fence3d_seed.json   # the seed goes THROUGH the fence, on purpose
-make plan PLAN=plans/fence3d_seed.json                # headless, graded against the plan's own prediction
+make planner-sync && make up && make planner   # build the optimiser in the container (once)
+make solve SCENARIO=fence3d N=8 NSEG=2 VMAX=3.0
+make plan  PLAN=plans/fence3d_N8_seg2.json     # headless, graded against the plan's own prediction
+make viz   WORLD=fence3d PLAN=plans/fence3d_N8_seg2.json   # watch it, and re-solve from the page
 ```
+
+A fence3d solve takes 0.20 s. `plans/fence3d_seed.json` is the optimiser's
+straight-line initial guess and goes THROUGH the fence on purpose — its file
+says where, and the referee has to agree.
 
 ## Layout
 
@@ -75,6 +81,8 @@ src/dsim_bringup/           launch, bridge, RViz
 scripts/flight_check.sh     headless "does it actually fly" gate
 scripts/plan_check.sh       headless "did the plan fly as its file predicts" gate
 scripts/check_planner.py    the grader behind it: world vs referee, feedforward, hits
+scripts/build_planner.sh    build the optimiser's Rust extension in the container
+scripts/solve_plan.py       solve a scenario into a plan, and say if the vehicle can fly it
 scripts/plot_run.py         CSV -> SVG, no dependencies
 scripts/kill_sim.sh         clear leftover sim processes
 scripts/run_sim.sh          make viz -- start sim + viewer, verify it is up
@@ -174,6 +182,8 @@ make test                         # C++ invariants + overlay geometry + viewer m
 make verify                       # mutation check + generated-asset drift (host)
 make fly                          # headless: proves it flies AND reports honestly
 make plan PLAN=plans/x.json       # headless: flies a space-time plan, grades the hits
+make planner                      # build the space-time optimiser in the container
+make solve SCENARIO=fence3d ...   # solve a scenario into a plan
 make telemetry                    # cross-check a sim that is already running
 make estimator                    # the estimate vs truth on a sim that is running
 ```
@@ -240,14 +250,16 @@ world, and it fires in the pillar field at the geometrically predicted moment
   decoupled from its rotor, a doubly-rotated velocity), the sensor models, the
   playback pacer, the restart detector, the referee's moving-obstacle
   clearance (velocity ignored, penetration clamped to zero, hits counted per
-  sample) and the space-time conversion (dp/dtau as velocity, the t'' term
-  dropped, samples spaced in tau), then fails if the tests do not notice. A green suite is only evidence if it would have gone red on a wrong
+  sample), the space-time conversion (dp/dtau as velocity, the t'' term
+  dropped, samples spaced in tau) and the solve endpoint (range checks
+  dropped, the scenario or output path taken from the request, a shell), then
+  fails if the tests do not notice. A green suite is only evidence if it would have gone red on a wrong
   implementation.
 
-  Currently **119 C++ + 108 Python + 13 viewer tests pass, 89/89 injected bugs
+  Currently **119 C++ + 127 Python + 13 viewer tests pass, 97/97 injected bugs
   caught, 0 skipped.** (C++: 39 control, 27 sensors, 21 estimation, 13 pacer,
-  11 referee geometry, 8 epoch. Python: 74 viewer overlay, 34 planner
-  conversion and bridge.)
+  11 referee geometry, 8 epoch. Python: 74 viewer overlay, 19 solve endpoint,
+  34 planner conversion and bridge.)
 
   Three rules keep the harness honest, all added after it lied. A mutation whose
   pattern no longer matches the source counts as a **failure**, not a pass:

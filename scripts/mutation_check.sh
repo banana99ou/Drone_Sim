@@ -388,7 +388,7 @@ run_py_mutation() {
 # Same treatment for the planner bridge's conversion (src/dsim_planner). The
 # tests there compare analytic derivatives against finite differences in
 # time, which is the one comparison a chain-rule slip cannot pass.
-mutate_planner() {  # $1 = name, $2 = from, $3 = to
+mutate_planner() {  # $1 = name, $2 = from, $3 = to  (spacetime.py)
   local name="$1" from="$2" to="$3"
   rm -rf "$WORK/planner"; cp -r src/dsim_planner "$WORK/planner"
   find "$WORK/planner" -name __pycache__ -type d -exec rm -rf {} + 2>/dev/null
@@ -560,6 +560,97 @@ run_planner_mutation "the arrival sample dropped" \
 run_planner_mutation "samples spaced in tau instead of time" \
   "        out.append((t, *sample_at_time(P, t)))" \
   "        out.append((de_casteljau(P, k * dt / (t1 - t0))[3], *sample_at_time(P, de_casteljau(P, k * dt / (t1 - t0))[3])))"
+
+# ---------------------------------------------------------------------------
+# The solve endpoint. It is the second write path this project exposes on a
+# port reachable across the whole tailnet, and the only one that starts a
+# process, so every bound on what a request may say gets broken on purpose.
+# ---------------------------------------------------------------------------
+mutate_solver() {   # $1 = name, $2 = from, $3 = to
+  local name="$1" from="$2" to="$3"
+  rm -rf "$WORK/viz"; cp -r src/dsim_viz "$WORK/viz"
+  find "$WORK/viz" -name __pycache__ -type d -exec rm -rf {} + 2>/dev/null
+  local target="$WORK/viz/dsim_viz/solver.py"
+  if ! grep -qF -- "$from" "$target"; then
+    echo "  [SKIP]     $name  (pattern not found -- code changed, update this script)"
+    return 1
+  fi
+  python3 -c '
+import sys
+p, a, b = sys.argv[1], sys.argv[2], sys.argv[3]
+t = open(p).read()
+open(p, "w").write(t.replace(a, b, 1))
+' "$target" "$from" "$to"
+  if PYTHONPATH="$WORK/viz" python3 -m pytest -x -q "$WORK/viz/test/test_solver.py" \
+       >"$WORK/py.log" 2>&1; then
+    echo "  [SURVIVED] $name  <-- BUG: this error would pass the test suite"
+    return 2
+  fi
+  echo "  [CAUGHT]   $name  -> $(grep -oE '[0-9]+ failed' "$WORK/py.log" | head -1)"
+  return 0
+}
+
+run_solver_mutation() {
+  mutate_solver "$@"
+  local rc=$?
+  [ $rc -eq 2 ] && survivors=$((survivors+1))
+  [ $rc -eq 1 ] && skipped=$((skipped+1))
+  return 0
+}
+
+echo
+echo "baseline (unmutated solve endpoint):"
+rm -rf "$WORK/viz"; cp -r src/dsim_viz "$WORK/viz"
+find "$WORK/viz" -name __pycache__ -type d -exec rm -rf {} + 2>/dev/null
+if PYTHONPATH="$WORK/viz" python3 -m pytest -q "$WORK/viz/test/test_solver.py" \
+     >"$WORK/py.log" 2>&1; then
+  echo "  ALL_PASS  (expected)"
+else
+  echo "  BASELINE FAILS -- fix that before trusting anything below"
+  tail -5 "$WORK/py.log"
+  exit 1
+fi
+
+echo
+echo "injected solve-endpoint bugs:"
+
+run_solver_mutation "range check dropped" \
+  "    if not lo <= v <= hi:" \
+  "    if False:"
+
+run_solver_mutation "the scenario taken from the request" \
+  "                \"--scenario\", self.scenario," \
+  "                \"--scenario\", body.get(\"scenario\", self.scenario),"
+
+run_solver_mutation "the output path taken from the request" \
+  "                \"--out\", self.plan_file]" \
+  "                \"--out\", body.get(\"out\", self.plan_file)]"
+
+run_solver_mutation "a missing field defaults instead of refusing" \
+  "    if key not in body:
+        raise SolveError(f\"missing {key}\")" \
+  "    if key not in body:
+        return lo"
+
+run_solver_mutation "run through a shell" \
+  "            proc = subprocess.run(argv, cwd=self.ws, capture_output=True," \
+  "            proc = subprocess.run(\" \".join(argv), shell=True, cwd=self.ws, capture_output=True,"
+
+run_solver_mutation "a zero speed cap passed through as a cap of zero" \
+  "        if vmax > 0.0:" \
+  "        if vmax >= 0.0:"
+
+run_solver_mutation "enabled without a plan file to write" \
+  "        self.enabled = bool(enabled and scenario and plan_file)" \
+  "        self.enabled = bool(enabled)"
+
+run_solver_mutation "an unreadable plan crashes the snapshot" \
+  "        except (OSError, ValueError):
+            return None" \
+  "        except OSError:
+            return None"
+
+echo
 
 # ---------------------------------------------------------------------------
 # The sensor models get the same treatment, and for a specific reason: a cold

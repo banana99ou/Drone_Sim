@@ -21,6 +21,14 @@ the controller drops the plan it was flying (it is stamped minutes into the
 future of the new run), and the next republish, with the same absolute stamp,
 puts it back so the new run flies the same plan at the same time.
 
+The plan FILE is re-read on the same tick when its mtime changes, so solving a
+new plan over the running one -- scripts/solve_plan.py, or the viewer's solve
+panel -- takes effect without relaunching the simulator. A file that does not
+parse, or whose control points are not a trajectory, is REFUSED and the old
+plan keeps flying: a half-written file must not be able to disarm a vehicle in
+the air. (solve_plan.py writes aside and renames, so that should never be the
+reason, but "should" is not a mechanism.)
+
 Nothing here reads /clock: with use_sim_time an rclpy node ingests the 1 kHz
 clock topic at a measured ~50% of a core, for a node that needs the sim time
 only to warn that it started late. The referee's status carries a sim-time
@@ -28,6 +36,7 @@ stamp at 20 Hz; that is enough.
 """
 import json
 import math
+import os
 import sys
 
 import rclpy
@@ -84,26 +93,75 @@ class BridgeNode(Node):
         if not plan_file:
             raise RuntimeError("plan_file is required; there is no default plan to fly")
 
-        plan = load_plan(plan_file)
-        self.msg, samples = build_trajectory(plan["control_points"], self.start_s, sample_dt, yaw)
-        s = spacetime.summarize(samples)
-        self.get_logger().info(
-            f"plan {plan_file} ({plan.get('solver', '?')}): {s['points']} samples over "
-            f"{s['duration_s']:.2f} s, max speed {s['max_speed_mps']:.2f} m/s, "
-            f"max accel {s['max_accel_mps2']:.2f} m/s^2 (needs {s['max_tilt_deg']:.1f} deg "
-            f"of tilt); scenario t=0 at sim {self.start_s:.1f} s")
+        self.plan_file = plan_file
+        self.sample_dt = sample_dt
+        self.yaw = yaw
+        self.mtime = None
 
         self.pub = self.create_publisher(Trajectory, "/drone/trajectory", 4)
-        # The whole path, once, for anything that wants to draw it before it
-        # is flown. Latched so a viewer that connects later still gets it.
+        # The whole path, for anything that wants to draw it before it is
+        # flown. Latched so a viewer that connects later still gets it.
         latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
         self.path_pub = self.create_publisher(Path, "/drone/plan_path", latched)
-        self.path_pub.publish(self._path(samples))
+        self.msg = None
+        self.load()                     # raises if the plan given at launch is bad
 
         self.warned_late = False
         self.create_subscription(FlightStatus, "/drone/eval/status", self.on_status, 10)
         self.timer = self.create_timer(period, self.republish)
         self.republish()
+
+    def load(self):
+        """(Re)read the plan file. Returns True if a new plan was installed.
+
+        Raises on the FIRST load -- a bridge given a plan it cannot fly should
+        not start -- and swallows afterwards, because by then something is
+        already flying and dropping it would be worse than ignoring a bad edit.
+        """
+        try:
+            mtime = os.path.getmtime(self.plan_file)
+        except OSError as exc:
+            if self.msg is None:
+                raise
+            self._warn_once(f"cannot stat {self.plan_file}: {exc}")
+            return False
+        if mtime == self.mtime:
+            return False
+        try:
+            plan = load_plan(self.plan_file)
+            msg, samples = build_trajectory(
+                plan["control_points"], self.start_s, self.sample_dt, self.yaw)
+        except (spacetime.PlanError, OSError, KeyError, TypeError,
+                json.JSONDecodeError) as exc:
+            if self.msg is None:
+                raise
+            self._warn_once(f"{self.plan_file} did not load ({exc}); "
+                            f"keeping the plan already flying")
+            return False
+        self.mtime = mtime
+        self.msg = msg
+        self.bad_reason = None
+        s = spacetime.summarize(samples)
+        d = plan.get("demands") or {}
+        self.get_logger().info(
+            f"plan {self.plan_file} ({plan.get('solver', '?')}"
+            f"{', ' + plan['config'] if plan.get('config') else ''}): "
+            f"{s['points']} samples over {s['duration_s']:.2f} s, "
+            f"max speed {s['max_speed_mps']:.2f} m/s, "
+            f"max accel {s['max_accel_mps2']:.2f} m/s^2 (needs {s['max_tilt_deg']:.1f} deg "
+            f"of tilt); scenario t=0 at sim {self.start_s:.1f} s")
+        if d and not d.get("flyable", True):
+            self.get_logger().warn(
+                f"this plan is NOT flyable by this vehicle: {s['max_tilt_deg']:.1f} deg "
+                f"of tilt demanded against a {d.get('tilt_limit_deg', 0):.0f} deg clamp. "
+                f"The loop will saturate and the vehicle will fall behind.")
+        self.path_pub.publish(self._path(samples))
+        return True
+
+    def _warn_once(self, text):
+        if getattr(self, "bad_reason", None) != text:
+            self.bad_reason = text
+            self.get_logger().warn(text)
 
     def _path(self, samples):
         path = Path()
@@ -117,6 +175,7 @@ class BridgeNode(Node):
         return path
 
     def republish(self):
+        self.load()
         self.pub.publish(self.msg)
 
     def on_status(self, m):

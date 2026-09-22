@@ -114,23 +114,76 @@ vehicle. Either inflate every obstacle by 0.3 m before solving or expect the
 referee to say so; the first is the planner's call, the second is a finding
 about the plan, not a bug in either.
 
-## Getting an optimised plan in
+## Solving, in the container
 
-The Rust extension (`bezier_opt`, pyo3) does not build on this host, so plans
-are solved elsewhere and checked in as JSON:
+The optimiser is a Rust extension (`bezier_opt`: pyo3 around clarabel) and the
+planner has **no Python fallback** -- `optimize_spacetime()` raises without it.
+The toolchain is in the image; the planner's source is a MacBook worktree
+rsynced in:
 
-```python
-from spacetime_bezier import optimize_scenario
-import json
-sc = json.load(open("scenarios/fence3d.json"))
-P, info = optimize_scenario(sc, ...)          # (N+1, 4) control points
-json.dump({"scenario": "fence3d", "solver": "rust", "control_points": P.tolist(),
-           "certified_clearance_m": info.get("min_clearance")}, open("plans/fence3d.json", "w"))
+```bash
+make planner-sync    # rsync the MacBook worktree -> $PLANNER_REPO (/ws/planner_src)
+make up              # (re)create the container so the mount takes
+make planner         # build bezier_opt, install into /ws/install/planner_py, import it
+make solve SCENARIO=fence3d N=8 NSEG=2 VMAX=3.0
+make plan  PLAN=plans/fence3d_N8_seg2.json
 ```
 
-Then `make plan PLAN=plans/fence3d.json`. A plan with no `expect` block must
-produce no hits. `certified_clearance_m` is optional and only reported, with
-the point-vs-vehicle caveat above.
+`make planner` ends by importing the module **from the path it installed to**
+and printing where it came from: maturin will build against a different
+interpreter and report success, and the planner's own README records being
+burned by exactly that. A fence3d solve takes **0.20 s**, a four-config sweep
+1.4 s, so replanning in the loop is not off the table.
+
+`scripts/solve_plan.py` hands the optimiser the SIM's `scenarios/<name>.json`,
+not the planner's `scenarios.py`, so the world Gazebo builds and the problem
+the solver reads are one file. When the planner ships a scenario of the same
+name both are solved and the control points must agree bit for bit -- measured
+identical for fence3d, which is the only reason to trust the copy.
+
+It also **inflates every obstacle by the vehicle radius** before solving, and
+then states what the referee should measure. Without that the numbers do not
+line up: fence3d N8_seg2 solved for a point certifies +0.1623 m, which is
+**-0.1377 m** for a 0.3 m vehicle -- a plan the optimiser certifies and the
+referee scores as a collision, with neither of them wrong. Inflating is exact
+for a sphere. Solved that way it certifies +0.2209 m; the live run measured
++0.2444 m, and `check_planner.py` holds the two together.
+
+### Two things that make a plan unflyable
+
+The optimiser constrains **speed** (`--v-max`, a hard second-order cone on the
+control-point differences) and nothing else. In particular:
+
+1. **No acceleration cap.** Uncapped, fence3d N8_seg2 returns a curve
+   demanding 15.05 m/s, 82.61 m/s² and **108.6° of tilt** against a 40° clamp:
+   the solver loiters and then darts, because nothing costs it. A speed cap
+   bounds it only indirectly and not reliably -- N10_seg8 at `--v-max 2.0`
+   still demands 40 m/s² and 89°. `solve_plan.py` samples the plan with the
+   same converter the bridge uses and prints the verdict before writing the
+   file; `check_planner.py` refuses to grade an unflyable plan, because
+   tracking error there measures the clamp rather than the plan.
+2. **No boundary velocity.** Endpoint *positions* are pinned, velocities are
+   not, so a plan opens at the speed cap from a standstill and ends still
+   moving -- it is a segment of a flight, not a flight. The vehicle hovers at
+   the start point and is handed a step: measured **92 cm** of opening error
+   on a 3.00 m/s start, decaying to under 10 cm within 3 s. The catch-up
+   distance `v0²/(2·a_max)` is 54 cm at full authority, so most of it is
+   unavoidable given the formulation. Fixing it properly is a planner-side
+   row (pin the first and last derivative control points); the sim could
+   instead fly a lead-in, which is a different claim about what was tested.
+
+### From the viewer
+
+With a plan loaded, the control panel grows a **plan** box: degree N, segments,
+v max, and a solve button. It POSTs to `/solve` -- a second write path, kept
+separate from `/control` because `/control` is documented as unable to run a
+command and solving runs the optimiser. The scenario and the output path are
+**not** request fields (the Gazebo world is generated per scenario, so solving
+another one would plan against obstacles that are not there), the three numbers
+are range-checked, and the subprocess takes an argument list, never a shell.
+The bridge notices the new file by mtime and reloads it, so a solve reaches the
+flying vehicle in about a second with nothing restarted. A plan that does not
+parse is refused and the old one keeps flying.
 
 ## What the reset path taught
 
@@ -149,11 +202,10 @@ under 2.1° of commanded tilt and 1 cm of travel in the first 2.5 s.
   avoidance; the trajectory is fixed before takeoff. The referee knows the
   obstacles because it was told, and a plan that clears them does so because
   the planner was told the same thing.
-* The seed tracks to 29 cm at worst because it opens with a 0.9 m/s velocity
-  step and no acceleration ramp; that is the seed, not the loop. The
-  `TRACK_MAX_M` gate is sized for it and will need tightening for real plans.
-* The vehicle has ~8.3 m/s² of lateral acceleration at the 40° tilt clamp and
-  the planner has no acceleration constraint. Compressing `T` until
-  `tilt_clamped` fires is the experiment that measures the cap the planner is
-  missing; the instrumentation for it is in place and the number is not yet
-  taken.
+* The opening transient is the plan's standing start, not the loop: 29 cm for
+  the 0.9 m/s seed, 92 cm for a 3.0 m/s optimised plan. The cruise figure
+  (under 10 cm after 3 s) is the one that says anything about tracking.
+* The lateral acceleration limit is ~8.3 m/s² at the 40° tilt clamp. That is
+  the number the planner is missing a constraint for, and every plan here is
+  kept under it by a speed cap chosen by hand rather than by anything in the
+  formulation.

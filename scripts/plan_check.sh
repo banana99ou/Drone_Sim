@@ -64,9 +64,21 @@ for _ in $(seq 1 60); do
   sleep 1
 done
 
-PUBS="$(timeout 20 ros2 topic info /drone/eval/clearance 2>/dev/null | sed -n 's/^Publisher count: //p')"
+# Exactly one publisher, so a stale sim cannot be the thing we grade. Retried:
+# a fresh `ros2` process has to complete DDS discovery before it can answer,
+# and asking once reported 0 publishers on a launch that was perfectly healthy
+# -- the referee was already streaming to the viewer at the time.
+PUBS=0
+for _ in $(seq 1 10); do
+  PUBS="$(timeout 20 ros2 topic info /drone/eval/clearance 2>/dev/null | sed -n 's/^Publisher count: //p')"
+  [ "${PUBS:-0}" -ge 1 ] 2>/dev/null && break
+  sleep 2
+done
 if [ "${PUBS:-0}" != "1" ]; then
-  echo "FAIL: expected exactly 1 publisher on /drone/eval/clearance, found ${PUBS:-0} (stale sim?)"
+  echo "FAIL: expected exactly 1 publisher on /drone/eval/clearance, found ${PUBS:-0}."
+  echo "      0 means the referee never came up; more than 1 means a stale sim is"
+  echo "      alive and any number sampled here could come from the wrong vehicle."
+  pgrep -af "$SIM_PROCS" | head
   exit 1
 fi
 
