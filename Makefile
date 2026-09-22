@@ -4,7 +4,8 @@ export UID := $(shell id -u)
 export GID := $(shell id -g)
 
 .PHONY: help setup build up down shell sim viz stop status test test-overlay \
-        test-viewer verify assets fly telemetry simctl sensors estimator plot clean
+        test-viewer test-planner verify assets fly plan telemetry simctl sensors \
+        estimator plot clean
 
 help:
 	@echo "make setup    one-time host setup (sudo: docker group + nvidia toolkit)"
@@ -15,6 +16,7 @@ help:
 	@echo "make test     every test suite: C++ invariants, overlay geometry, viewer"
 	@echo "make verify   mutation check + generated-asset drift check (host, no docker)"
 	@echo "make fly      headless flight check: proves it actually flies"
+	@echo "make plan     fly a space-time plan headless and grade it (PLAN=plans/...)"
 	@echo "make telemetry  cross-check a RUNNING sim's control telemetry"
 	@echo "make simctl     drive pause/speed/reset against a RUNNING sim"
 	@echo "make sensors  measure a RUNNING sim's sensor noise vs its config"
@@ -48,12 +50,21 @@ sim:
 #   dsim_control     the control maths and the mixer geometry          (C++)
 #   dsim_sensors     the rangefinder and optical-flow error models      (C++)
 #   dsim_estimation  the attitude and velocity filters                  (C++)
+#   dsim_eval        the referee's signed, moving-obstacle clearance     (C++)
+#   dsim_planner     space-time Bezier -> trajectory conversion          (Python)
 #   dsim_viz         the overlay geometry the browser is handed        (Python)
 #   web/js           the drawing maths and colour mapping in the page  (JS)
-test: test-overlay test-viewer
+test: test-overlay test-viewer test-planner
 	$(COMPOSE) exec sim bash -lc \
-		"colcon test --packages-select dsim_control dsim_sensors dsim_estimation && \
-		colcon test-result --verbose"
+		"colcon test --packages-select dsim_control dsim_sensors dsim_estimation dsim_eval && \
+		colcon test-result --verbose && \
+		cd src/dsim_planner && python3 -m pytest -q test/"
+
+# The conversion is pure Python and runs on the host. The message-building
+# test (test_bridge.py) needs dsim_msgs, so it is skipped here and run inside
+# the container by `make test` above.
+test-planner:
+	cd src/dsim_planner && python3 -m pytest -q test/
 
 # All overlay LOGIC lives on the ROS side, so this is where an arrow pointing
 # the wrong way gets caught -- before it is ever drawn.
@@ -68,7 +79,15 @@ fly:
 	$(COMPOSE) exec sim bash -lc "colcon build --symlink-install >/dev/null && \
 		bash scripts/flight_check.sh"
 
+# Flies PLAN (default: the straight seed through the fence, which must HIT)
+# headless and grades it with scripts/check_planner.py.
+#   make plan PLAN=plans/fence3d_seed.json
+plan:
+	$(COMPOSE) exec -e PLAN="$(PLAN)" sim bash -lc "colcon build --symlink-install >/dev/null && \
+		bash scripts/plan_check.sh"
+
 # WORLD/REFERENCE/RADIUS are passed straight through, e.g.
+#   make viz WORLD=fence3d PLAN=plans/fence3d_seed.json
 #   make viz WORLD=empty REFERENCE=lemniscate RADIUS=2.0
 viz:
 	bash scripts/run_sim.sh
@@ -79,6 +98,7 @@ stop:
 status:
 	bash scripts/sim_status.sh
 
+PLAN ?= plans/fence3d_seed.json
 F ?= logs/circle.csv
 plot:
 	python3 scripts/plot_run.py $(F)

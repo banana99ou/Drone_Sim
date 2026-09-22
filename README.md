@@ -45,21 +45,36 @@ Mount your planner repo and build it alongside:
 PLANNER_REPO=/path/to/my_planner docker compose -f docker/compose.yaml up -d
 ```
 
+For the space-time Bezier planner there is already a bridge: a file of
+(x, y, z, t) control points plus the scenario it was solved in, and the
+simulator builds the world, moves the obstacles, flies the plan and reports
+every hit with where it happened. See [docs/PLANNER.md](docs/PLANNER.md).
+
+```bash
+make viz WORLD=fence3d PLAN=plans/fence3d_seed.json   # the seed goes THROUGH the fence, on purpose
+make plan PLAN=plans/fence3d_seed.json                # headless, graded against the plan's own prediction
+```
+
 ## Layout
 
 ```
 scripts/gen_assets.py       ONE source for the vehicle + worlds. Edit PARAMS here.
+scenarios/*.json            space-time planning scenarios, in the planner's own format
+plans/*.json                (x, y, z, t) control points that solve one; the *_seed is generated
 config/drone.yaml           generated — what the controller assumes
-config/obstacles_*.yaml     generated — what the referee scores against
+config/obstacles_*.yaml     generated — what the referee scores against (with velocities)
 worlds/                     generated — Gazebo scenes
 src/dsim_msgs/              the planner interface
 src/dsim_description/       generated — the Gazebo model
 src/dsim_control/           SE(3) geometric controller, mixer, test trajectories
-src/dsim_eval/              the referee: collision, clearance, tracking, energy
+src/dsim_eval/              the referee: collision, signed clearance vs moving obstacles, tracking, energy
+src/dsim_planner/           space-time Bezier (x, y, z, t) -> /drone/trajectory, uniform in time
 src/dsim_sensors/           simulated rangefinder, optical flow and compass, with noise
 src/dsim_estimation/        attitude + velocity from those sensors; what the controller flies on
 src/dsim_bringup/           launch, bridge, RViz
 scripts/flight_check.sh     headless "does it actually fly" gate
+scripts/plan_check.sh       headless "did the plan fly as its file predicts" gate
+scripts/check_planner.py    the grader behind it: world vs referee, feedforward, hits
 scripts/plot_run.py         CSV -> SVG, no dependencies
 scripts/kill_sim.sh         clear leftover sim processes
 scripts/run_sim.sh          make viz -- start sim + viewer, verify it is up
@@ -68,6 +83,7 @@ scripts/check_estimator.py  the estimate against ground truth, live
 src/dsim_viz/               one-port viewer server + the overlay geometry it sends
 web/                        the browser viewer (dependency-free, draw-only)
 docs/VIEWER.md              how to watch from any tailnet device
+docs/PLANNER.md             flying a space-time plan: the clock, the conversion, the referee
 docs/reference/             a collaborator's hardware brief. Not used by this sim.
 ```
 
@@ -157,6 +173,7 @@ suspects instead of one.
 make test                         # C++ invariants + overlay geometry + viewer maths
 make verify                       # mutation check + generated-asset drift (host)
 make fly                          # headless: proves it flies AND reports honestly
+make plan PLAN=plans/x.json       # headless: flies a space-time plan, grades the hits
 make telemetry                    # cross-check a sim that is already running
 make estimator                    # the estimate vs truth on a sim that is running
 ```
@@ -221,12 +238,16 @@ world, and it fires in the pillar field at the geometrically predicted moment
   position error, faked arm length, a rotor swapped in the layout table), the
   overlay geometry (unrotated body vectors, a flipped aero residual, an arrow
   decoupled from its rotor, a doubly-rotated velocity), the sensor models, the
-  playback pacer and the restart detector, then fails if the tests do not
-  notice. A green suite is only evidence if it would have gone red on a wrong
+  playback pacer, the restart detector, the referee's moving-obstacle
+  clearance (velocity ignored, penetration clamped to zero, hits counted per
+  sample) and the space-time conversion (dp/dtau as velocity, the t'' term
+  dropped, samples spaced in tau), then fails if the tests do not notice. A green suite is only evidence if it would have gone red on a wrong
   implementation.
 
-  Currently **99 C++ + 54 Python + 10 viewer tests pass, 61/61 injected bugs
-  caught, 0 skipped.**
+  Currently **119 C++ + 108 Python + 13 viewer tests pass, 89/89 injected bugs
+  caught, 0 skipped.** (C++: 39 control, 27 sensors, 21 estimation, 13 pacer,
+  11 referee geometry, 8 epoch. Python: 74 viewer overlay, 34 planner
+  conversion and bridge.)
 
   Three rules keep the harness honest, all added after it lied. A mutation whose
   pattern no longer matches the source counts as a **failure**, not a pass:

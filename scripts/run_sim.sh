@@ -4,6 +4,7 @@
 #   scripts/run_sim.sh                                  # pillars, 1 m circle
 #   WORLD=empty REFERENCE=lemniscate scripts/run_sim.sh
 #   RADIUS=2.0 PERIOD=6 scripts/run_sim.sh
+#   WORLD=fence3d PLAN=plans/fence3d_seed.json scripts/run_sim.sh   # fly a plan
 #
 # PERIOD is the knob that decides whether there is anything to watch. A circle
 # needs bank = atan(4*pi^2*r / (T^2*g)), so the old 12 s lap on a 1 m circle
@@ -29,6 +30,10 @@ RADIUS="${RADIUS:-1.0}"
 PERIOD="${PERIOD:-3.5}"
 ALTITUDE="${ALTITUDE:-1.5}"
 GUI="${GUI:-false}"
+# A space-time plan to fly (path relative to the repo, which is /ws inside).
+# The plan names its scenario and WORLD must be that scenario; the launch
+# refuses anything else.
+PLAN="${PLAN:-}"
 WEB_PORT="${WEB_PORT:-8080}"
 COMPOSE="docker compose -f docker/compose.yaml"
 LOG="logs/sim.log"
@@ -54,12 +59,18 @@ import math
 r, t = $RADIUS, $PERIOD
 print(f'{math.degrees(math.atan2(4*math.pi**2*r/t**2, 9.80665)):.0f}')" 2>/dev/null || echo '?')"
 
-echo "==> launching  world=$WORLD reference=$REFERENCE radius=$RADIUS period=${PERIOD}s"
-echo "    (that lap needs about ${BANK} deg of bank; the tilt clamp is 40)"
+PLAN_ARG=""
+if [ -n "$PLAN" ]; then
+  PLAN_ARG="plan:=/ws/${PLAN#/ws/}"
+  echo "==> launching  world=$WORLD plan=$PLAN"
+else
+  echo "==> launching  world=$WORLD reference=$REFERENCE radius=$RADIUS period=${PERIOD}s"
+  echo "    (that lap needs about ${BANK} deg of bank; the tilt clamp is 40)"
+fi
 nohup $COMPOSE exec -T sim bash -lc \
   "cd /ws && exec ros2 launch dsim_bringup sim.launch.py \
      world:=$WORLD reference:=$REFERENCE radius:=$RADIUS altitude:=$ALTITUDE \
-     period:=$PERIOD \
+     period:=$PERIOD $PLAN_ARG \
      gui:=$GUI viz:=true web_port:=$WEB_PORT" \
   >"$LOG" 2>&1 &
 echo $! > "$PIDFILE"

@@ -1,0 +1,14 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>dsim_planner</name>
+  <version>0.1.0</version>
+  <description>Bridge from a space-time Bezier plan (x, y, z, t control points) to /drone/trajectory.</description>
+  <maintainer email="banana99ou@gmail.com">JHY</maintainer>
+  <license>MIT</license>
+  <depend>rclpy</depend>
+  <depend>nav_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>dsim_msgs</depend>
+  <test_depend>python3-pytest</test_depend>
+  <export><build_type>ament_python</build_type></export>
+</package>
