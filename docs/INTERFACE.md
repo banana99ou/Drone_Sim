@@ -102,9 +102,11 @@ reports the **slant range**, not the altitude: a tilted vehicle's downward beam
 travels `1/cos(tilt)` further. Error is `0.01 m + 1% of range`, quantised to
 whole millimetres. Out of range follows REP 117 — `+inf` for too far, `-inf`
 for too close, never a clamped limit, so saturation cannot be mistaken for a
-real reading. It sees only the flat ground plane, so it would report the floor
-straight through a pillar; the vehicle flies at 1.5 m and the pillars are 3 m,
-so that case does not arise in the shipped course.
+real reading. It sees only the flat ground plane, so it reports the floor
+straight through anything else. Nothing in the shipped scenarios is solid to
+it: the obstacles have no collision geometry and are not Gazebo bodies at all
+(see [PLANNER.md](PLANNER.md)), so the rangefinder is measuring the ground
+either way.
 
 **`/drone/optical_flow`** — a PMW3901-class module. It reports how far the
 image moved as an **angle**, not a velocity, because that is what the hardware
@@ -237,9 +239,10 @@ copied truth would pass every bound.
   The node warns once at startup and the debug message says so on every step.
 * **Flow over a flat floor only.** The optical flow is a velocity only
   because the rangefinder supplies a height, and both assume the ground
-  plane at z = 0: over a pillar top or a slope the height is wrong and so is
-  the velocity, and neither sensor can tell. The vehicle flies at 1.5 m and
-  the pillars are 3 m, so it never passes over one in the shipped course.
+  plane at z = 0: over a rooftop or a slope the height is wrong and so is the
+  velocity, and neither sensor can tell. Nothing in the shipped scenarios has
+  a top to fly over — the obstacles are not in the physics — so the case does
+  not arise here, and it would on real hardware.
 * **No accelerometer bias state.** A 0.02 m/s² bias becomes a steady
   velocity offset of `bias × flow_tau_s` horizontally (4 mm/s) and
   `bias × 2ζ/ω` vertically (14 mm/s) — below what the sensors themselves
@@ -334,7 +337,8 @@ Your repo lands at `/ws/planner_src`.
 ## Running a trial
 
 ```bash
-ros2 launch dsim_bringup sim.launch.py world:=pillars reference:=none csv:=/ws/logs/run1.csv
+ros2 launch dsim_bringup sim.launch.py world:=fence3d plan:=/ws/plans/fence3d_seed.json \
+  csv:=/ws/logs/run1.csv
 # then, in the container:
 ros2 run my_planner planner_node --ros-args -p use_sim_time:=true
 ```

@@ -2,20 +2,38 @@
 // The referee's geometry, with no ROS in it so it can be unit tested and
 // mutation-checked on the host.
 //
-// Two things live here. Obstacle is a shape that may be moving: its centre at
-// scenario time t is pos0 + vel * t, and its distance function is SIGNED, so a
-// vehicle inside it reads a negative number instead of the zero the old
-// max(0, ...) clamp returned -- a clamp that made every collision look like a
-// graze. ClearanceTracker turns a stream of (position, time) samples into the
-// running minimum and a list of HITS: one entry per excursion into an
-// obstacle, edge-triggered, carrying where the vehicle was when it went in and
-// how deep it got. "It collided" is a boolean; "it went 14 cm into F5 at
+// An obstacle is exactly what the planner's solver believes one is: a ball (or
+// a vertical column) of fixed radius whose centre follows a Bezier curve in
+// space-time, with the ACTIVE WINDOW intrinsic to the first and last control
+// point's time coordinate. Nothing here is specialised to constant velocity --
+// that is simply the degree-1 case, and two of the shipped scenarios move
+// their obstacles along cubics.
+//
+// Outside its window an obstacle DOES NOT EXIST. It is not far away and it is
+// not frozen at an endpoint: the planner clips obstacle motion to the window
+// and solves a problem in which the thing is absent, so a referee that kept
+// scoring against it would be scoring a different problem. `wall` and `door3d`
+// are built entirely on that -- the wall stands until t=5 and then is gone,
+// and waiting for it is the behaviour being demonstrated.
+//
+// Two shapes, because the scenarios come in two dimensionalities:
+//   sphere   a ball, for a scenario planned in 3 spatial dimensions
+//   column   a disc at EVERY altitude, for one planned in 2. A 2D obstacle is
+//            not a ball at the flight altitude: treating it as one would hand
+//            a 3D vehicle an escape route over the top that the 2D problem
+//            never had, and the scenario would stop being the scenario.
+//
+// ClearanceTracker turns a stream of (position, time) samples into the running
+// minimum and a list of HITS: one entry per excursion into an obstacle,
+// edge-triggered, carrying where the vehicle was when it went in and how deep
+// it got. "It collided" is a boolean; "it went 14 cm into F5 at
 // (5.21, 5.00, 0.50), t=5.2 s" is something you can act on.
 //
-// The scenario clock is the planner's t: it is zero when the plan starts
-// executing, not when the simulator starts. Callers convert; this file only
-// ever sees scenario time.
+// The scenario clock is the planner's t: zero when the plan starts executing,
+// not when the simulator starts. Callers convert; this file only ever sees
+// scenario time.
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <limits>
 #include <string>
@@ -24,56 +42,68 @@
 namespace dsim_eval
 {
 
+/// One control point: x, y, z, t. Always four wide -- a scenario planned in
+/// two spatial dimensions is imported at a fixed altitude, and its obstacles
+/// are columns, so the z it carries is where it is DRAWN and never enters a
+/// distance.
+using ControlPoint = std::array<double, 4>;
+
 struct Obstacle
 {
   std::string name;
-  std::string type;                  // "box" | "cylinder" | "sphere"
-  double x{0}, y{0}, z{0};           // centre at scenario t = 0
-  double sx{1}, sy{1}, sz{1};        // box: full extents; cylinder: radius,_,height; sphere: radius
-  double vx{0}, vy{0}, vz{0};        // constant velocity, m/s; zero for the static courses
+  std::string type {"sphere"};        ///< "sphere" | "column"
+  double radius {1.0};
+  std::vector<ControlPoint> control_points;
 
-  bool moving() const {return vx != 0.0 || vy != 0.0 || vz != 0.0;}
+  double tStart() const {return control_points.empty() ? 0.0 : control_points.front()[3];}
+  double tEnd() const {return control_points.empty() ? 0.0 : control_points.back()[3];}
 
-  /// Centre at scenario time t. Unbounded in t on purpose: the Gazebo body
-  /// keeps flying after the plan's horizon, and the referee scores the world
-  /// that is actually there. (The planner clips obstacle motion to [0, T];
-  /// inside the window the two agree exactly, and outside it only the
-  /// referee has an opinion.)
-  void centreAt(double t, double & cx, double & cy, double & cz) const
+  /// True while this obstacle exists. Outside the window it is absent, not
+  /// parked: see the header note.
+  bool activeAt(double t) const
   {
-    cx = x + vx * t; cy = y + vy * t; cz = z + vz * t;
+    return !control_points.empty() && t >= tStart() && t <= tEnd();
   }
 
-  /// SIGNED distance from a point to the surface at scenario time t.
-  /// Positive outside, negative inside by the depth of penetration.
+  /// Centre at scenario time t, by de Casteljau on the spatial coordinates.
+  ///
+  /// Time is AFFINE in the curve parameter -- that is what lifting a motion
+  /// which is polynomial in time gives -- so inverting it is a division and
+  /// not a root solve. Clamped to the window so a caller that asks outside it
+  /// gets the endpoint rather than an extrapolation off the end of the curve,
+  /// where a Bezier means nothing.
+  std::array<double, 3> centreAt(double t) const
+  {
+    std::array<double, 3> out {0.0, 0.0, 0.0};
+    if (control_points.empty()) {return out;}
+    const double span = tEnd() - tStart();
+    const double s = (span > 1e-15)
+      ? std::max(0.0, std::min(1.0, (t - tStart()) / span))
+      : 0.0;
+    std::vector<ControlPoint> pts = control_points;
+    while (pts.size() > 1) {
+      for (size_t i = 0; i + 1 < pts.size(); ++i) {
+        for (int k = 0; k < 4; ++k) {
+          pts[i][k] = (1.0 - s) * pts[i][k] + s * pts[i + 1][k];
+        }
+      }
+      pts.pop_back();
+    }
+    return {pts[0][0], pts[0][1], pts[0][2]};
+  }
+
+  /// SIGNED distance from a point to the surface at scenario time t: positive
+  /// outside, negative inside by the depth of penetration, and +infinity when
+  /// the obstacle is not there at all.
   double signedDistance(double px, double py, double pz, double t) const
   {
-    double cx, cy, cz;
-    centreAt(t, cx, cy, cz);
-    const double dx = px - cx, dy = py - cy, dz = pz - cz;
-    if (type == "sphere") {
-      return std::sqrt(dx * dx + dy * dy + dz * dz) - sx;
+    if (!activeAt(t)) {return std::numeric_limits<double>::infinity();}
+    const auto c = centreAt(t);
+    const double dx = px - c[0], dy = py - c[1], dz = pz - c[2];
+    if (type == "column") {
+      return std::sqrt(dx * dx + dy * dy) - radius;
     }
-    if (type == "cylinder") {
-      // Radial and axial excess; the usual box-style combination outside,
-      // and the least distance to a face inside.
-      const double er = std::sqrt(dx * dx + dy * dy) - sx;
-      const double ez = std::abs(dz) - sz / 2.0;
-      if (er > 0.0 || ez > 0.0) {
-        const double a = std::max(er, 0.0), b = std::max(ez, 0.0);
-        return std::sqrt(a * a + b * b);
-      }
-      return std::max(er, ez);
-    }
-    // box, axis aligned
-    const double ex = std::abs(dx) - sx / 2.0;
-    const double ey = std::abs(dy) - sy / 2.0;
-    const double ez = std::abs(dz) - sz / 2.0;
-    if (ex > 0.0 || ey > 0.0 || ez > 0.0) {
-      const double a = std::max(ex, 0.0), b = std::max(ey, 0.0), c = std::max(ez, 0.0);
-      return std::sqrt(a * a + b * b + c * c);
-    }
-    return std::max({ex, ey, ez});
+    return std::sqrt(dx * dx + dy * dy + dz * dz) - radius;
   }
 };
 

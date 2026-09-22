@@ -40,347 +40,114 @@
   },
   "worlds": {
     "empty": {
-      "obstacles": []
+      "title": "Bare world",
+      "spatial_dim": 3,
+      "colors": {},
+      "start": null,
+      "end": null
     },
-    "pillars": {
-      "obstacles": [
-        {
-          "name": "pillar_a",
-          "type": "cylinder",
-          "pose": [
-            -3.0,
-            1.2,
-            1.5
-          ],
-          "size": [
-            0.3,
-            0.3,
-            3.0
-          ]
-        },
-        {
-          "name": "pillar_b",
-          "type": "cylinder",
-          "pose": [
-            -1.0,
-            -1.5,
-            1.5
-          ],
-          "size": [
-            0.3,
-            0.3,
-            3.0
-          ]
-        },
-        {
-          "name": "pillar_c",
-          "type": "cylinder",
-          "pose": [
-            1.2,
-            1.8,
-            1.5
-          ],
-          "size": [
-            0.3,
-            0.3,
-            3.0
-          ]
-        },
-        {
-          "name": "pillar_d",
-          "type": "cylinder",
-          "pose": [
-            3.2,
-            -1.0,
-            1.5
-          ],
-          "size": [
-            0.3,
-            0.3,
-            3.0
-          ]
-        },
-        {
-          "name": "wall_gap_l",
-          "type": "box",
-          "pose": [
-            0.0,
-            3.2,
-            1.2
-          ],
-          "size": [
-            0.3,
-            2.4,
-            2.4
-          ]
-        },
-        {
-          "name": "wall_gap_r",
-          "type": "box",
-          "pose": [
-            0.0,
-            -3.2,
-            1.2
-          ],
-          "size": [
-            0.3,
-            2.4,
-            2.4
-          ]
-        },
-        {
-          "name": "low_beam",
-          "type": "box",
-          "pose": [
-            5.0,
-            0.0,
-            2.2
-          ],
-          "size": [
-            0.4,
-            6.0,
-            0.4
-          ]
-        }
-      ]
+    "curve": {
+      "title": "Curved Obstacle Path",
+      "spatial_dim": 2,
+      "colors": {
+        "arc": "#e74c3c",
+        "B": "#2980b9"
+      },
+      "start": [
+        0.5,
+        1.0,
+        1.5,
+        0.0
+      ],
+      "end": [
+        9.5,
+        9.0,
+        1.5,
+        10.0
+      ],
+      "duration_s": 10.0
+    },
+    "diverse": {
+      "title": "Diverse Moving Obstacles",
+      "spatial_dim": 2,
+      "colors": {
+        "A": "#e74c3c",
+        "B": "#2980b9",
+        "C": "#27ae60",
+        "D": "#9b59b6",
+        "E": "#e67e22",
+        "F": "#1abc9c",
+        "G": "#f39c12"
+      },
+      "start": [
+        0.5,
+        0.5,
+        1.5,
+        0.0
+      ],
+      "end": [
+        9.0,
+        9.0,
+        1.5,
+        10.0
+      ],
+      "duration_s": 10.0
+    },
+    "door3d": {
+      "title": "Door in 3D \u2014 Wait for the Opening (t>5)",
+      "spatial_dim": 3,
+      "colors": {
+        "D0": "#8e44ad",
+        "D1": "#8e44ad",
+        "D2": "#8e44ad",
+        "D3": "#8e44ad",
+        "D4": "#8e44ad",
+        "D5": "#8e44ad",
+        "D6": "#8e44ad",
+        "D7": "#8e44ad",
+        "D8": "#8e44ad",
+        "D9": "#8e44ad",
+        "D10": "#8e44ad",
+        "D11": "#8e44ad",
+        "D12": "#8e44ad",
+        "D13": "#8e44ad",
+        "D14": "#8e44ad",
+        "D15": "#8e44ad",
+        "D16": "#8e44ad",
+        "D17": "#8e44ad"
+      },
+      "start": [
+        0.5,
+        5.0,
+        0.5,
+        0.0
+      ],
+      "end": [
+        8.0,
+        5.0,
+        0.5,
+        10.0
+      ],
+      "duration_s": 10.0
     },
     "fence3d": {
-      "obstacles": [
-        {
-          "name": "F0",
-          "type": "sphere",
-          "pose": [
-            4.0,
-            0.5,
-            0.0
-          ],
-          "size": [
-            0.9
-          ],
-          "vel": [
-            0.25,
-            0.0,
-            0.0
-          ],
-          "color": "#e67e22"
-        },
-        {
-          "name": "F1",
-          "type": "sphere",
-          "pose": [
-            4.0,
-            1.4000000000000001,
-            0.0
-          ],
-          "size": [
-            0.9
-          ],
-          "vel": [
-            0.25,
-            0.0,
-            0.0
-          ],
-          "color": "#e67e22"
-        },
-        {
-          "name": "F2",
-          "type": "sphere",
-          "pose": [
-            4.0,
-            2.3000000000000003,
-            0.0
-          ],
-          "size": [
-            0.9
-          ],
-          "vel": [
-            0.25,
-            0.0,
-            0.0
-          ],
-          "color": "#e67e22"
-        },
-        {
-          "name": "F3",
-          "type": "sphere",
-          "pose": [
-            4.0,
-            3.2,
-            0.0
-          ],
-          "size": [
-            0.9
-          ],
-          "vel": [
-            0.25,
-            0.0,
-            0.0
-          ],
-          "color": "#e67e22"
-        },
-        {
-          "name": "F4",
-          "type": "sphere",
-          "pose": [
-            4.0,
-            4.1000000000000005,
-            0.0
-          ],
-          "size": [
-            0.9
-          ],
-          "vel": [
-            0.25,
-            0.0,
-            0.0
-          ],
-          "color": "#e67e22"
-        },
-        {
-          "name": "F5",
-          "type": "sphere",
-          "pose": [
-            4.0,
-            5.0,
-            0.0
-          ],
-          "size": [
-            0.9
-          ],
-          "vel": [
-            0.25,
-            0.0,
-            0.0
-          ],
-          "color": "#e67e22"
-        },
-        {
-          "name": "F6",
-          "type": "sphere",
-          "pose": [
-            4.0,
-            5.9,
-            0.0
-          ],
-          "size": [
-            0.9
-          ],
-          "vel": [
-            0.25,
-            0.0,
-            0.0
-          ],
-          "color": "#e67e22"
-        },
-        {
-          "name": "F7",
-          "type": "sphere",
-          "pose": [
-            4.0,
-            6.8,
-            0.0
-          ],
-          "size": [
-            0.9
-          ],
-          "vel": [
-            0.25,
-            0.0,
-            0.0
-          ],
-          "color": "#e67e22"
-        },
-        {
-          "name": "F8",
-          "type": "sphere",
-          "pose": [
-            4.0,
-            7.7,
-            0.0
-          ],
-          "size": [
-            0.9
-          ],
-          "vel": [
-            0.25,
-            0.0,
-            0.0
-          ],
-          "color": "#e67e22"
-        },
-        {
-          "name": "F9",
-          "type": "sphere",
-          "pose": [
-            4.0,
-            8.600000000000001,
-            0.0
-          ],
-          "size": [
-            0.9
-          ],
-          "vel": [
-            0.25,
-            0.0,
-            0.0
-          ],
-          "color": "#e67e22"
-        },
-        {
-          "name": "F10",
-          "type": "sphere",
-          "pose": [
-            4.0,
-            9.5,
-            0.0
-          ],
-          "size": [
-            0.9
-          ],
-          "vel": [
-            0.25,
-            0.0,
-            0.0
-          ],
-          "color": "#e67e22"
-        },
-        {
-          "name": "M1",
-          "type": "sphere",
-          "pose": [
-            7.5,
-            2.0,
-            0.8
-          ],
-          "size": [
-            0.7
-          ],
-          "vel": [
-            -0.15,
-            0.35,
-            0.02
-          ],
-          "color": "#2980b9"
-        },
-        {
-          "name": "M2",
-          "type": "sphere",
-          "pose": [
-            8.5,
-            8.5,
-            0.2
-          ],
-          "size": [
-            0.6
-          ],
-          "vel": [
-            -0.2,
-            -0.4,
-            0.05
-          ],
-          "color": "#27ae60"
-        }
-      ],
+      "title": "Moving Fence, 3 Spatial Dimensions",
+      "spatial_dim": 3,
+      "colors": {
+        "F0": "#e67e22",
+        "F1": "#e67e22",
+        "F2": "#e67e22",
+        "F3": "#e67e22",
+        "F4": "#e67e22",
+        "F5": "#e67e22",
+        "F6": "#e67e22",
+        "F7": "#e67e22",
+        "F8": "#e67e22",
+        "F9": "#e67e22",
+        "F10": "#e67e22",
+        "M1": "#2980b9",
+        "M2": "#27ae60"
+      },
       "start": [
         0.5,
         5.0,
@@ -392,7 +159,95 @@
         5.0,
         0.5,
         10.0
-      ]
+      ],
+      "duration_s": 10.0
+    },
+    "loiter": {
+      "title": "Body Orbiting the Ground Station",
+      "spatial_dim": 3,
+      "colors": {
+        "orbit_q1": "#e74c3c",
+        "orbit_q2": "#e74c3c",
+        "orbit_q3": "#e74c3c",
+        "orbit_q4": "#e74c3c"
+      },
+      "start": [
+        -100.0,
+        37.5,
+        62.5,
+        0.0
+      ],
+      "end": [
+        100.0,
+        37.5,
+        62.5,
+        80.0
+      ],
+      "duration_s": 80.0
+    },
+    "original": {
+      "title": "3 Moving Obstacles",
+      "spatial_dim": 2,
+      "colors": {
+        "A": "#e74c3c",
+        "B": "#2980b9",
+        "C": "#27ae60"
+      },
+      "start": [
+        0.5,
+        1.0,
+        1.5,
+        0.0
+      ],
+      "end": [
+        8.5,
+        8.5,
+        1.5,
+        10.0
+      ],
+      "duration_s": 10.0
+    },
+    "wall": {
+      "title": "Disappearing Wall (t<5)",
+      "spatial_dim": 2,
+      "colors": {
+        "W0": "#e67e22",
+        "W1": "#e67e22",
+        "W2": "#e67e22",
+        "W3": "#e67e22",
+        "W4": "#e67e22",
+        "W5": "#e67e22",
+        "W6": "#e67e22",
+        "W7": "#e67e22",
+        "W8": "#e67e22",
+        "W9": "#e67e22",
+        "W10": "#e67e22",
+        "W11": "#e67e22",
+        "W12": "#e67e22",
+        "W13": "#e67e22",
+        "W14": "#e67e22",
+        "W15": "#e67e22",
+        "W16": "#e67e22",
+        "W17": "#e67e22",
+        "W18": "#e67e22",
+        "W19": "#e67e22",
+        "W20": "#e67e22",
+        "M1": "#2980b9",
+        "M2": "#27ae60"
+      },
+      "start": [
+        1.0,
+        5.0,
+        1.5,
+        0.0
+      ],
+      "end": [
+        8.0,
+        5.0,
+        1.5,
+        10.0
+      ],
+      "duration_s": 10.0
     }
   }
 }

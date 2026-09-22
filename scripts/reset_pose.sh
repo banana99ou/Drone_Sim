@@ -3,7 +3,7 @@
 #
 #   scripts/reset_pose.sh                    # back to origin at 0.1 m
 #   scripts/reset_pose.sh -2 0 1.5           # to x=-2, y=0, z=1.5
-#   WORLD=drone_pillars scripts/reset_pose.sh
+#   WORLD=drone_fence3d scripts/reset_pose.sh
 #
 # This talks to Gazebo directly rather than through ROS, because the pose
 # service is a gz-transport service with no ROS bridge by default.

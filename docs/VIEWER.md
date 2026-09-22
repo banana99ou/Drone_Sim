@@ -15,7 +15,7 @@ make stop         # stop everything
 
 ```bash
 make viz WORLD=empty REFERENCE=lemniscate RADIUS=2.0
-make viz WORLD=pillars RADIUS=1.0        # 1.0 m clears the whole pillar course
+make viz WORLD=fence3d PLAN=plans/fence3d_seed.json   # a space-time scenario
 make viz PERIOD=3.5                      # a lap that actually demands bank
 ```
 

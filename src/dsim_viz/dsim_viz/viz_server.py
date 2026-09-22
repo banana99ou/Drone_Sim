@@ -230,10 +230,15 @@ def _clearance_of(m):
         return None
     return {
         "scenario_time_s": m.scenario_time_s,
+        # The obstacle FIELD, live. This is the only account of where anything
+        # is: they are not Gazebo bodies, because two scenarios move theirs
+        # along cubics and three switch them off partway through.
         "obstacles": [
-            {"name": n, "pos": [p.x, p.y, p.z], "r": r}
-            for n, p, r in zip(m.names, m.positions, m.radii)
+            {"name": n, "pos": [p.x, p.y, p.z], "r": r, "active": bool(a), "type": ty}
+            for n, p, r, a, ty in zip(m.names, m.positions, m.radii, m.active, m.types)
         ],
+        "scenario": m.scenario,
+        "duration_s": m.scenario_duration_s,
         "clearance_m": _finite_or_none(m.clearance_m),
         "nearest": m.nearest,
         "min_clearance_m": _finite_or_none(m.min_clearance_m),
@@ -241,8 +246,6 @@ def _clearance_of(m):
             {"pos": [p.x, p.y, p.z], "with": w, "t": t, "depth_m": d}
             for p, w, t, d in zip(m.hit_positions, m.hit_with, m.hit_times_s, m.hit_depths_m)
         ],
-        "world_mismatch_m": _finite_or_none(m.world_mismatch_m),
-        "world_poses_seen": int(m.world_poses_seen),
     }
 
 

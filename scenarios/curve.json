@@ -1,0 +1,61 @@
+{
+ "_generated_by": "scripts/import_scenarios.py from the planner's SCENARIO_MAP -- do not edit; edit the planner and re-import",
+ "name": "curve",
+ "title": "Curved Obstacle Path",
+ "spatial_dim": 2,
+ "start": [
+  0.5,
+  1.0,
+  1.5,
+  0.0
+ ],
+ "end": [
+  9.5,
+  9.0,
+  1.5,
+  10.0
+ ],
+ "T": 10.0,
+ "configs": [
+  [
+   8,
+   4
+  ],
+  [
+   8,
+   8
+  ],
+  [
+   8,
+   16
+  ],
+  [
+   10,
+   8
+  ]
+ ],
+ "sim": {
+  "start_s": 5.0,
+  "spawn": [
+   0.5,
+   1.0,
+   1.5
+  ]
+ },
+ "lift_z": 1.5,
+ "init_curve": {
+  "mode": "straight"
+ },
+ "obstacles": [
+  {"name": "arc", "type": "column", "radius": 0.9, "color": "#e74c3c", "control_points": [
+    [8.5, 1.0, 1.5, 0.0],
+    [1.0, 3.5, 1.5, 3.3],
+    [1.0, 6.5, 1.5, 6.7],
+    [8.5, 9.0, 1.5, 10.0]
+  ]},
+  {"name": "B", "type": "column", "radius": 0.5, "color": "#2980b9", "control_points": [
+    [3.0, 8.5, 1.5, 0.0],
+    [6.5, 4.0, 1.5, 10.0]
+  ]}
+ ]
+}

@@ -134,12 +134,29 @@ export function droneFaces(pose, drone) {
   return faces;
 }
 
-/// name -> [x, y, z] from the referee's report, or {} without one.
-export function obstaclePositions(clearance) {
-  const out = {};
-  if (!clearance || !clearance.obstacles) return out;
-  for (const o of clearance.obstacles) out[o.name] = o.pos;
-  return out;
+/// The obstacles the referee says exist RIGHT NOW, as faces.
+///
+/// Drawn from the referee's report rather than from scene.json, because the
+/// report is the only account of where they are: they are not Gazebo bodies,
+/// their centres follow Bezier curves, and outside its window an obstacle is
+/// ABSENT rather than parked somewhere. An inactive one is skipped entirely --
+/// drawing a ghost would say the vehicle is threading a gap that is not there.
+///
+/// A "column" is a disc at every altitude, which is what an obstacle from a
+/// scenario planned in two spatial dimensions is. It is drawn as a tall
+/// cylinder because a disc at every altitude has no top to draw.
+export function obstacleFaces(clearance, colors, camAz, columnHeight = 6) {
+  const faces = [];
+  if (!clearance || !clearance.obstacles) return faces;
+  for (const o of clearance.obstacles) {
+    if (!o.active) continue;
+    const [x, y, z] = o.pos;
+    const fill = (colors && colors[o.name]) || "#e67e22";
+    faces.push(...(o.type === "column"
+      ? cylinderFaces(x, y, columnHeight / 2, o.r, columnHeight, fill, camAz)
+      : sphereFaces(x, y, z, o.r, fill, camAz)));
+  }
+  return faces;
 }
 
 /// Every analytic hit as a red three-axis cross at the vehicle position it

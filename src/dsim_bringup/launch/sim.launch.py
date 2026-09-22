@@ -1,7 +1,7 @@
 """Bring up the quadrotor simulator.
 
     ros2 launch dsim_bringup sim.launch.py
-    ros2 launch dsim_bringup sim.launch.py world:=pillars reference:=none
+    ros2 launch dsim_bringup sim.launch.py world:=empty reference:=lemniscate
     ros2 launch dsim_bringup sim.launch.py state:=truth gui:=false
     ros2 launch dsim_bringup sim.launch.py world:=fence3d plan:=/ws/plans/fence3d_seed.json
 
@@ -203,15 +203,10 @@ def launch_setup(context, *args, **kwargs):
                   f'(the plan is the reference)')
             reference = 'none'
 
-    # The moving obstacles of this world, if any, by name: the bridge carries
-    # one pose topic for each and the referee listens to the same list, both
-    # read from the generated config/obstacles_<world>.yaml.
+    # The referee's obstacle list for this world, if it has one. The obstacles
+    # are not Gazebo bodies -- see the header of dsim_eval/obstacle.hpp -- so
+    # this file is the only place they exist outside the planner.
     obstacles_file = os.path.join(CONFIG_DIR, f'obstacles_{world}.yaml')
-    moving_obstacles = []
-    if os.path.exists(obstacles_file):
-        obs = _load_yaml(obstacles_file)['/**']['ros__parameters']['obstacles']
-        moving_obstacles = [n for n in obs['names']
-                            if any(float(v) != 0.0 for v in obs[n].get('vel', [0, 0, 0]))]
 
     vehicle, raw_cfg = _vehicle_params()
     gains = _load_yaml(
@@ -241,21 +236,10 @@ def launch_setup(context, *args, **kwargs):
             '/drone/command/motor_speed@actuator_msgs/msg/Actuators]gz.msgs.Actuators',
             f'{contact_topic}@ros_gz_interfaces/msg/Contacts[gz.msgs.Contacts',
             '/drone/imu@sensor_msgs/msg/Imu[gz.msgs.IMU',
-        ] + [
-            # Where Gazebo says each MOVING obstacle is (OdometryPublisher in
-            # the generated world, 20 Hz). The referee holds these against its
-            # own pos0 + vel*t; see ClearanceReport.world_mismatch_m. One
-            # topic per body because the world-wide Pose_V loses the names in
-            # the bridge, and a pose with no name cannot be checked.
-            f'/model/{name}/odometry@nav_msgs/msg/Odometry[gz.msgs.Odometry'
-            for name in moving_obstacles
         ],
         remappings=[
             ('/model/drone/odometry_truth', '/drone/truth'),
             (contact_topic, '/drone/contacts'),
-        ] + [
-            (f'/model/{name}/odometry', f'/drone/obstacle_pose/{name}')
-            for name in moving_obstacles
         ],
         parameters=[{'use_sim_time': True}],
     )
@@ -378,8 +362,8 @@ def launch_setup(context, *args, **kwargs):
         ))
 
     # Tell the viewer which world is actually running. Without this its world
-    # selector is cosmetic, and it could happily draw the pillar course while
-    # the sim flies an empty one -- showing obstacles that are not there.
+    # selector is cosmetic, and it could happily draw one scenario's obstacles
+    # while the sim flies another -- showing a fence that is not there.
     if viz == 'true':
         try:
             with open(os.path.join(WEB_DIR, 'current.json'), 'w') as fh:
@@ -449,8 +433,11 @@ def generate_launch_description():
         get_package_share_directory('dsim_description'), 'models')
     return LaunchDescription([
         DeclareLaunchArgument('world', default_value='empty',
-                              description='world file stem in worlds/ (empty, '
-                                          'pillars, or a scenario such as fence3d)'),
+                              description='world file stem in worlds/: empty, or a '
+                                          'space-time scenario (fence3d, door3d, wall, '
+                                          'original, curve, diverse, loiter). Scenario '
+                                          'worlds are generated from scenarios/*.json, '
+                                          'which come from the planner.'),
         DeclareLaunchArgument('gui', default_value='true',
                               description='run the Gazebo GUI'),
         DeclareLaunchArgument('reference', default_value='circle',
@@ -473,9 +460,8 @@ def generate_launch_description():
                               'read-only. It can pause/resume and set a '
                               'range-checked real-time factor, nothing else.'),
         DeclareLaunchArgument('radius', default_value='2.0',
-                              description='built-in trajectory radius (m). '
-                              'A 2 m circle collides with pillar_c in the '
-                              'pillars world; 1.0 clears the whole course.'),
+                              description='built-in trajectory radius (m), for '
+                              'reference:=circle | lemniscate in the empty world.'),
         DeclareLaunchArgument('altitude', default_value='1.5'),
         DeclareLaunchArgument('sensors', default_value='true',
                               description='publish the simulated downward '

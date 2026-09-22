@@ -123,7 +123,7 @@ test("colourFor routes rotors to the diverging scale and unknowns to a default",
   assert.ok(widthFor({ kind: "something_new" }) > 0);
 });
 
-import { sphereFaces, obstaclePositions, hitMarkers } from "../shapes.js";
+import { sphereFaces, obstacleFaces, hitMarkers } from "../shapes.js";
 
 // FAILS IF: sphereFaces stops describing a sphere of the requested radius at
 // the requested centre -- every vertex must sit exactly r from the centre,
@@ -144,15 +144,49 @@ test("sphereFaces vertices all lie on the sphere", () => {
   assert.ok(above > 0 && below > 0, "sphere is missing a cap");
 });
 
-// FAILS IF: the live position lookup keys on the wrong field or drops
-// entries, so a moving obstacle would be drawn at its t=0 pose forever.
-test("obstaclePositions maps referee names to live positions", () => {
-  const rep = { obstacles: [{ name: "F5", pos: [5.2, 5, 0], r: 0.9 },
-                            { name: "M1", pos: [7, 2.3, 0.81], r: 0.7 }] };
-  const live = obstaclePositions(rep);
-  assert.deepEqual(live.F5, [5.2, 5, 0]);
-  assert.deepEqual(live.M1, [7, 2.3, 0.81]);
-  assert.deepEqual(obstaclePositions(null), {});
+// FAILS IF: an obstacle is drawn somewhere other than where the referee says
+// it is. The report is the only account of that -- these are not Gazebo
+// bodies -- so a page that drew a cached pose would show a gap that is not
+// there while the referee scored a collision.
+test("obstacleFaces draws each sphere at the referee's live position", () => {
+  const rep = { obstacles: [{ name: "F5", pos: [5.2, 5, 0], r: 0.9, active: true, type: "sphere" }] };
+  const faces = obstacleFaces(rep, { F5: "#e67e22" }, 0.3);
+  assert.ok(faces.length > 0);
+  for (const f of faces) {
+    for (const [x, y, z] of f.pts) {
+      const d = Math.hypot(x - 5.2, y - 5, z - 0);
+      assert.ok(Math.abs(d - 0.9) < 1e-9, `vertex at ${d} from the reported centre`);
+    }
+  }
+  assert.deepEqual(obstacleFaces(null, {}, 0), []);
+});
+
+// FAILS IF: an obstacle outside its active window is still drawn. `wall` and
+// `door3d` are built on obstacles that switch off; a ghost would say the
+// vehicle is threading a gap that does not exist.
+test("obstacleFaces skips inactive obstacles", () => {
+  const rep = { obstacles: [
+    { name: "W0", pos: [2.5, 0, 1.5], r: 0.5, active: false, type: "column" },
+    { name: "W1", pos: [2.5, 1, 1.5], r: 0.5, active: true, type: "column" },
+  ] };
+  const faces = obstacleFaces(rep, {}, 0);
+  assert.ok(faces.length > 0, "the active one must still be drawn");
+  for (const f of faces) {
+    for (const [, y] of f.pts) {
+      assert.ok(Math.abs(y - 1) <= 0.5 + 1e-9, "a face from the inactive obstacle was drawn");
+    }
+  }
+});
+
+// FAILS IF: a column is drawn as a ball. A 2D scenario's obstacle is a disc at
+// every altitude, and drawing it as a sphere at the flight altitude shows an
+// over-the-top route that the planned problem never had.
+test("obstacleFaces draws a column as something tall, not a ball", () => {
+  const rep = { obstacles: [{ name: "c", pos: [0, 0, 1.5], r: 1.0, active: true, type: "column" }] };
+  const zs = obstacleFaces(rep, {}, 0).flatMap((f) => f.pts.map((p) => p[2]));
+  assert.ok(Math.max(...zs) - Math.min(...zs) > 3, "a column must span more than its radius");
+  const xs = obstacleFaces(rep, {}, 0).flatMap((f) => f.pts.map((p) => p[0]));
+  assert.ok(Math.max(...xs) <= 1 + 1e-9, "and must not be wider than its radius");
 });
 
 // FAILS IF: a hit marker is not centred on the hit position, or is drawn at

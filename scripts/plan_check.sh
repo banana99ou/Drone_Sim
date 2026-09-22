@@ -13,6 +13,10 @@
 set -o pipefail
 
 PLAN="${PLAN:-plans/fence3d_seed.json}"
+# est is the default everywhere else, and it is the honest one: the controller
+# flies on what the sensors can work out. A plan that climbs above the optical
+# flow's height band has no velocity aiding, so it needs truth -- the grader
+# says so explicitly when it sees one, and `loiter` is the shipped example.
 STATE="${STATE:-est}"
 WEB_PORT="${WEB_PORT:-8080}"
 

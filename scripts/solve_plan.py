@@ -12,12 +12,18 @@ own verdict, and the numbers a run should be judged against. Then:
 
     make plan PLAN=plans/fence3d_N8_seg2.json
 
-The scenario handed to the optimiser is the SIM's scenarios/<name>.json, not
-the planner's own scenarios.py -- one source, so the world Gazebo builds and
-the problem the solver reads cannot drift apart. When the planner ships a
-scenario of the same name, both are solved and the control points must agree
-bit for bit; a disagreement means the copy has drifted and is a hard failure,
-not a warning. That check is the only reason to trust the copy at all.
+The scenario handed to the optimiser is the SIM's scenarios/<name>.json, which
+scripts/import_scenarios.py generates from the planner's own SCENARIO_MAP and
+`--check` holds to it. One source, so the world Gazebo builds, the obstacles
+the referee scores against and the problem the solver reads cannot drift
+apart. (An earlier version solved the planner's copy too and compared; once
+the file became generated that was solving the same input twice.)
+
+Four of the seven scenarios are planned in TWO spatial dimensions plus time.
+They are solved that way -- lifting them into 3D would hand the solver an
+escape over the top that the 2D problem never had -- and the resulting curve
+is lifted to the scenario's flight altitude afterwards, which is exact
+because the altitude is constant.
 
 Nothing here is a ROS node. The plan is a file; dsim_planner's bridge reads it.
 """
@@ -28,6 +34,13 @@ import sys
 import time
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
+
+#: Seconds of closed-loop lag: the peak position error a velocity STEP of v0
+#: produces is about this times v0. Fitted from six flown plans between 0.70
+#: and 3.00 m/s (0.322 s, residuals under 5 cm). It matters because the
+#: optimiser pins endpoint positions and not velocities, so every plan opens
+#: with such a step.
+OPENING_LAG_S = 0.322
 
 
 def vehicle():
@@ -87,45 +100,57 @@ def feasibility(control_points, veh, dt=0.02):
     # attached to the plan instead of being rediscovered as a mystery overshoot.
     s["start_speed_mps"] = math.dist(samples[0][2], [0, 0, 0])
     s["end_speed_mps"] = math.dist(samples[-1][2], [0, 0, 0])
-    # How far the reference gets while the vehicle uses every bit of its lateral
-    # authority to reach that speed: a floor on the opening error, not an
-    # estimate of it.
-    s["standing_start_deficit_m"] = s["start_speed_mps"] ** 2 / (2 * veh["max_lateral_accel"])
+    # The opening error that step implies. MEASURED, not derived from the
+    # acceleration limit: the loop is not acceleration-limited here, it is
+    # bandwidth-limited, and the peak position error of a velocity step turns
+    # out to be almost exactly proportional to the step. Fitted across six
+    # runs spanning 0.70 to 3.00 m/s: 0.322 s, residuals under 5 cm. (The
+    # full-authority catch-up distance v0^2/(2a) is not it -- it is quadratic,
+    # and it under-predicted by 3x at the low end.)
+    s["opening_error_m"] = OPENING_LAG_S * s["start_speed_mps"]
     return s
 
 
 def load_scenario(name):
-    """The sim's scenario, with its obstacles lifted to the canonical form.
+    """The sim's scenario as the solver wants it, at the solver's own dimension.
 
-    scenarios/*.json writes obstacles the readable way -- pos0, vel, r -- which
-    is what the world generator and the referee need. The solver only knows the
-    lifted form (control points in (x, y, z, t), the active window intrinsic to
-    the first and last of them), and the planner's own scenarios are converted
-    by its @_canonical decorator on the way out of scenarios.py. So the same
-    conversion is applied here, by the planner's OWN normalize_obstacle rather
-    than by a second implementation of it: a scenario that means one thing to
-    the solver and another to the referee is the entire failure this file
-    exists to prevent.
+    scenarios/*.json always carries four coordinates per control point, because
+    the referee and the viewer work in three dimensions whatever the plan was
+    solved in. For a 2D scenario the z column is the flight altitude and is not
+    part of the problem, so it is dropped here and put back on the answer.
     """
-    from spacetime_bezier.geometry import normalize_obstacle
-
     path = ROOT / "scenarios" / f"{name}.json"
     if not path.exists():
         raise SystemExit(f"no such scenario: {path}\n"
                          f"have: {sorted(p.stem for p in (ROOT / 'scenarios').glob('*.json'))}")
     sc = json.loads(path.read_text())
-    duration = float(sc["T"])
-    lifted = []
-    for obs in sc.get("obstacles", []):
-        norm = normalize_obstacle(obs, duration)
-        out = {"control_points": [[float(c) for c in row] for row in norm["control_points"]],
-               "radius": float(norm["radius"])}
-        for key in ("name", "color"):
-            if obs.get(key) is not None:
-                out[key] = obs[key]
-        lifted.append(out)
-    sc["obstacles"] = lifted
-    return sc
+    spatial = int(sc["spatial_dim"])
+
+    def drop(point):
+        p = [float(v) for v in point]
+        return p if spatial == 3 else [p[0], p[1], p[3]]
+
+    solved = dict(sc)
+    solved["start"] = drop(sc["start"])
+    solved["end"] = drop(sc["end"])
+    solved["obstacles"] = [
+        {"control_points": [drop(row) for row in o["control_points"]],
+         "radius": float(o["radius"]),
+         **{k: o[k] for k in ("name", "color") if o.get(k) is not None}}
+        for o in sc["obstacles"]]
+    return sc, solved
+
+
+def lift_plan(control_points, sc):
+    """Put the flight altitude back into a plan solved in two dimensions.
+
+    Exact: the altitude is a constant, so a Bezier in (x, y, t) with every
+    control point given the same z is the same curve flown level.
+    """
+    if int(sc["spatial_dim"]) == 3:
+        return [[float(c) for c in row] for row in control_points]
+    z = float(sc["lift_z"])
+    return [[float(row[0]), float(row[1]), z, float(row[2])] for row in control_points]
 
 
 def inflate(scenario, by):
@@ -148,13 +173,6 @@ def inflate(scenario, by):
     return out
 
 
-def planner_scenario(name):
-    """The planner's own version of this scenario, or None if it has none."""
-    from spacetime_bezier import SCENARIO_MAP
-    entry = SCENARIO_MAP.get(name)
-    return (entry[0](), list(entry[1])) if entry else (None, None)
-
-
 def solve(scenario, configs, **kw):
     from spacetime_bezier import optimize_scenario
     t0 = time.time()
@@ -162,23 +180,17 @@ def solve(scenario, configs, **kw):
     return out, time.time() - t0
 
 
-def compare(a, b, tol=0.0):
-    """Max |difference| between two control-point tables, or None if shaped
-    differently (which is itself a disagreement)."""
-    if len(a) != len(b) or any(len(x) != len(y) for x, y in zip(a, b)):
-        return None
-    return max(abs(x - y) for ra, rb in zip(a, b) for x, y in zip(ra, rb))
-
-
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--scenario", required=True)
+    ap.add_argument("--scenario", help="which scenario to solve; see --list")
     ap.add_argument("-N", type=int, default=8, help="Bezier degree (default 8)")
     ap.add_argument("--n-seg", type=int, default=2, help="keep-out segments (default 2)")
     ap.add_argument("--sweep", action="store_true",
                     help="solve every (N, n_seg) the planner records for this "
                          "scenario and keep the best, instead of one config")
+    ap.add_argument("--list", action="store_true",
+                    help="list the scenarios and their recorded configs, and stop")
     ap.add_argument("--v-max", type=float, default=None,
                     help="hard speed cap, m/s. The optimiser has NO acceleration "
                          "cap, so this is the only physical bound available; the "
@@ -193,11 +205,18 @@ def main(argv=None):
     ap.add_argument("--max-iter", type=int, default=200)
     ap.add_argument("--time-weight", type=float, default=0.0)
     ap.add_argument("--out", default=None, help="output path (default plans/<name>_N<N>_seg<s>.json)")
-    ap.add_argument("--no-cross-check", action="store_true",
-                    help="skip the agreement check against the planner's own copy "
-                         "of this scenario. Only for a scenario that exists here "
-                         "and not there.")
     args = ap.parse_args(argv)
+
+    if not args.list and not args.scenario:
+        ap.error("--scenario is required (or --list to see what there is)")
+
+    if args.list:
+        for path in sorted((ROOT / "scenarios").glob("*.json")):
+            sc = json.loads(path.read_text())
+            print(f"  {sc['name']:9} {sc['spatial_dim']}D+t  T={sc['T']:>5g}s  "
+                  f"{len(sc['obstacles']):>2} obstacles  "
+                  f"configs {[f'N{a}_seg{b}' for a, b in sc['configs']]}   {sc['title']}")
+        return 0
 
     try:
         import spacetime_bezier  # noqa: F401
@@ -210,16 +229,16 @@ def main(argv=None):
     veh = vehicle()
     radius = veh["radius_m"]
     grow = radius if args.inflate is None else args.inflate
-    scenario = load_scenario(args.scenario)
-    ref, ref_configs = planner_scenario(args.scenario)
+    sc, scenario = load_scenario(args.scenario)
     configs = ([(args.N, args.n_seg)] if not args.sweep
-               else (ref_configs or [(args.N, args.n_seg)]))
+               else [(int(a), int(b)) for a, b in sc["configs"]])
 
     kw = dict(min_dt=args.min_dt, max_iter=args.max_iter, time_weight=args.time_weight)
     if args.v_max is not None:
         kw["v_max"] = args.v_max
 
-    print(f"solving {args.scenario}: {len(scenario['obstacles'])} obstacles, "
+    print(f"solving {args.scenario} ({sc['spatial_dim']}D+t): "
+          f"{len(scenario['obstacles'])} obstacles, "
           f"{scenario['start']} -> {scenario['end']}, configs {configs}")
     print(f"  obstacles inflated by {grow:.2f} m"
           + (f" (the vehicle radius)" if args.inflate is None else "")
@@ -227,24 +246,6 @@ def main(argv=None):
              "; the certificate below is about a POINT"))
     out, elapsed = solve(inflate(scenario, grow), configs, **kw)
     print(f"  {elapsed:.2f} s for {len(configs)} config(s)")
-
-    # --- the drift check ---------------------------------------------------
-    if ref is not None and not args.no_cross_check:
-        ref_out, _ = solve(inflate(ref, grow), configs, **kw)
-        for key in out["results"]:
-            d = compare(out["results"][key]["control_points"],
-                        ref_out["results"][key]["control_points"])
-            if d is None or d > 0.0:
-                raise SystemExit(
-                    f"DRIFT: scenarios/{args.scenario}.json and the planner's own "
-                    f"scenario_{args.scenario}() do not describe the same problem "
-                    f"({key}: {'different shapes' if d is None else f'max |diff| {d:.3e}'}).\n"
-                    f"The world Gazebo builds would not be the world that was solved. "
-                    f"Reconcile the two before flying this.")
-        print(f"  cross-check: identical to the planner's own scenario_{args.scenario}()")
-    elif ref is None:
-        print(f"  cross-check: the planner ships no scenario named {args.scenario!r}; "
-              f"nothing to compare against")
 
     best = out["best"]
     if best is None:
@@ -262,7 +263,7 @@ def main(argv=None):
               + ("   <- best" if key == best else ""))
 
     r = out["results"][best]
-    P = [[float(c) for c in row] for row in r["control_points"]]
+    P = lift_plan(r["control_points"], sc)
     # What the referee should report, stated BEFORE the run so the run can
     # disagree with it. The optimiser certifies a point against the INFLATED
     # obstacles; the referee measures the real ones and subtracts the vehicle
@@ -300,8 +301,8 @@ def main(argv=None):
         print(f"     The optimiser pins endpoint POSITIONS only, so this is a segment "
               f"of a flight, not a flight.")
         print(f"     The vehicle hovers at the start point and must chase that step: "
-              f"at least {fz['standing_start_deficit_m']:.2f} m of opening error even "
-              f"at full authority.")
+              f"about {fz['opening_error_m']:.2f} m of opening error, which is "
+              f"{OPENING_LAG_S:.3f} s of closed-loop lag at that speed.")
 
     out_path = pathlib.Path(args.out) if args.out else (
         ROOT / "plans" / f"{args.scenario}_{best}.json")
@@ -310,6 +311,7 @@ def main(argv=None):
                          f"-N {r['N']} --n-seg {r['n_seg']}"
                          + (f" --v-max {args.v_max}" if args.v_max is not None else ""),
         "scenario": args.scenario,
+        "spatial_dim": int(sc["spatial_dim"]),
         "solver": r["backend"],
         "config": best,
         # The solver's own verdict, carried so a run can be read against what

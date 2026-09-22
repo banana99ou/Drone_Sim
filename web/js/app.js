@@ -22,8 +22,7 @@
 //   app.js        state, HUD, input, the frame loop       (this file)
 
 import { add, scale } from "./vec3.js";
-import { boxFaces, cylinderFaces, droneFaces, sphereFaces, obstaclePositions, hitMarkers }
-  from "./shapes.js";
+import { droneFaces, obstacleFaces, hitMarkers } from "./shapes.js";
 import { GROUP_LABEL, LEGEND, PALETTE, TICK_COLOUR, colourFor, widthFor }
   from "./palette.js";
 import { Renderer } from "./render.js";
@@ -52,7 +51,7 @@ const el = (id) => document.getElementById(id);
 
 const S = {
   scene: null,
-  world: "pillars",
+  world: "empty",
   pose: null,
   status: null,
   control: null,
@@ -206,23 +205,12 @@ function renderOnce() {
   if (!S.scene) return;
   renderer.grid();
 
-  const faces = [];
-  const world = S.scene.worlds[S.world] || { obstacles: [] };
-  // Moving obstacles are drawn where the REFEREE says they are now, not at
-  // the scene file's t=0 pose: the referee's report is the same pos0 + vel*t
-  // it scores against, so what you see hit is what was scored as a hit.
-  const live = obstaclePositions(S.clearance);
-  for (const o of world.obstacles) {
-    const [x, y, z] = live[o.name] || o.pose;
-    const [sx, sy, sz] = o.size;
-    if (o.type === "sphere") {
-      faces.push(...sphereFaces(x, y, z, sx, o.color || "#e67e22", cam.az));
-    } else if (o.type === "cylinder") {
-      faces.push(...cylinderFaces(x, y, z, sx, sz, "#8d5a3c", cam.az));
-    } else {
-      faces.push(...boxFaces(x, y, z, sx, sy, sz, "#8d5a3c"));
-    }
-  }
+  // The obstacles come from the REFEREE, live, not from the scene file: it is
+  // the only account of where they are, and the only one that knows which of
+  // them exist at this instant. scene.json supplies the colours and nothing
+  // else about them.
+  const world = S.scene.worlds[S.world] || {};
+  const faces = obstacleFaces(S.clearance, world.colors, cam.az);
   faces.push(...droneFaces(S.pose, S.scene.drone));
   renderer.faces(faces);
 
@@ -413,14 +401,16 @@ function updateHudOnce() {
       ? `${last.with} @ (${last.pos.map((v) => v.toFixed(2)).join(", ")}) t=${last.t.toFixed(2)} s`
       : "none";
     el("hit").className = last ? "bad" : "good";
-    // Does the physics agree with the referee about where the fence is?
-    // null means no pose for a moving obstacle has arrived -- in a scenario
-    // world that is a broken bridge, not a clean bill.
-    const mm = cl.world_mismatch_m;
-    const moving = cl.obstacles.length > 0;
-    el("wmm").textContent = mm === null ? (moving ? "unheard" : "n/a") : fmt(1000 * mm, " mm", 1);
-    el("wmm").className = mm === null ? (moving ? "bad" : "") : (mm > 0.02 ? "bad" : "good");
-    el("stime").textContent = fmt(cl.scenario_time_s, " s", 1);
+    // How much of the obstacle field exists right now. `wall` and `door3d`
+    // are built on obstacles that switch off, so "18 of 23" is the scenario
+    // working rather than a fault -- and 0 of anything means the referee was
+    // given no obstacles and every clearance below is vacuously infinite.
+    const n = cl.obstacles.length;
+    const live = cl.obstacles.filter((o) => o.active).length;
+    el("obst").textContent = n === 0 ? "none" : `${live} of ${n}`;
+    el("obst").className = n > 0 && live === 0 ? "bad" : "";
+    el("stime").textContent = fmt(cl.scenario_time_s, " s", 1) +
+      (cl.duration_s ? ` of ${cl.duration_s.toFixed(0)}` : "");
   }
 }
 

@@ -12,7 +12,7 @@ PLANNER_PATH ?= code/bezier-trajectory-merge
 
 .PHONY: help setup build up down shell sim viz stop status test test-overlay \
         test-viewer test-planner verify assets fly plan planner solve telemetry \
-        simctl sensors estimator plot clean planner planner-sync solve
+        simctl sensors estimator plot clean planner planner-sync scenarios solve
 
 help:
 	@echo "make setup    one-time host setup (sudo: docker group + nvidia toolkit)"
@@ -26,6 +26,7 @@ help:
 	@echo "make plan     fly a space-time plan headless and grade it (PLAN=plans/...)"
 	@echo "make planner-sync  pull the planner worktree from the MacBook"
 	@echo "make planner  build the space-time optimiser's Rust extension"
+	@echo "make scenarios  re-import scenarios/ from the planner, then regenerate"
 	@echo "make solve    solve a scenario into a plan (SCENARIO= N= NSEG= VMAX=)"
 	@echo "make planner-sync  rsync the planner worktree from the MacBook"
 	@echo "make planner  build the planner's Rust solver inside the container"
@@ -120,6 +121,12 @@ planner:
 # solve returns a curve demanding 15 m/s, 83 m/s^2 and 109 degrees of tilt,
 # against a 40 degree clamp. Measured, and printed by solve_plan.py before the
 # plan is written.
+# Re-import scenarios/*.json from the planner's SCENARIO_MAP, then regenerate
+# everything that follows from them. Needs the planner (make planner).
+scenarios:
+	$(COMPOSE) exec sim bash -lc "cd /ws && python3 scripts/import_scenarios.py"
+	python3 scripts/gen_assets.py
+
 SCENARIO ?= fence3d
 N ?= 8
 NSEG ?= 2

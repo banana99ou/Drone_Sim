@@ -305,15 +305,34 @@ TEST=test/test_control.cpp
 PKG=dsim_eval
 TEST=test/test_obstacle.cpp
 
-run_mutation "obstacle velocity ignored (scored where it was at t=0)" \
+run_mutation "obstacle motion ignored (scored where it started)" \
   "include/dsim_eval/obstacle.hpp" \
-  "    cx = x + vx * t; cy = y + vy * t; cz = z + vz * t;" \
-  "    cx = x; cy = y; cz = z;"
+  "      ? std::max(0.0, std::min(1.0, (t - tStart()) / span))" \
+  "      ? 0.0"
+
+run_mutation "de Casteljau stops one step early (a cubic read as its hull)" \
+  "include/dsim_eval/obstacle.hpp" \
+  "    while (pts.size() > 1) {" \
+  "    while (pts.size() > 2) {"
+
+run_mutation "the active window ignored (an absent obstacle still scored)" \
+  "include/dsim_eval/obstacle.hpp" \
+  "    if (!activeAt(t)) {return std::numeric_limits<double>::infinity();}" \
+  "    if (false) {return std::numeric_limits<double>::infinity();}"
+
+run_mutation "a column treated as a ball (an over-the-top route the 2D plan never had)" \
+  "include/dsim_eval/obstacle.hpp" \
+  "    if (type == \"column\") {
+      return std::sqrt(dx * dx + dy * dy) - radius;
+    }" \
+  "    if (false) {
+      return std::sqrt(dx * dx + dy * dy) - radius;
+    }"
 
 run_mutation "sphere distance clamped at zero (penetration reads as a graze)" \
   "include/dsim_eval/obstacle.hpp" \
-  "      return std::sqrt(dx * dx + dy * dy + dz * dz) - sx;" \
-  "      return std::max(0.0, std::sqrt(dx * dx + dy * dy + dz * dz) - sx);"
+  "    return std::sqrt(dx * dx + dy * dy + dz * dz) - radius;" \
+  "    return std::max(0.0, std::sqrt(dx * dx + dy * dy + dz * dz) - radius);"
 
 run_mutation "vehicle radius not subtracted from the clearance" \
   "include/dsim_eval/obstacle.hpp" \
@@ -332,11 +351,6 @@ run_mutation "leaving an obstacle never clears the inside flag (no re-entry)" \
       }" \
   "      } else {
       }"
-
-run_mutation "box signed distance loses its sign inside" \
-  "include/dsim_eval/obstacle.hpp" \
-  "    return std::max({ex, ey, ez});" \
-  "    return 0.0;"
 
 run_mutation "reset keeps the old hits" \
   "include/dsim_eval/obstacle.hpp" \

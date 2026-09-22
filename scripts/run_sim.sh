@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Start the simulator and the remote viewer. Run on the HOST.
 #
-#   scripts/run_sim.sh                                  # pillars, 1 m circle
+#   scripts/run_sim.sh                                  # empty world, 1 m circle
 #   WORLD=empty REFERENCE=lemniscate scripts/run_sim.sh
 #   RADIUS=2.0 PERIOD=6 scripts/run_sim.sh
 #   WORLD=fence3d PLAN=plans/fence3d_seed.json scripts/run_sim.sh   # fly a plan
@@ -24,7 +24,7 @@
 set -o pipefail
 cd "$(dirname "$0")/.."
 
-WORLD="${WORLD:-pillars}"
+WORLD="${WORLD:-empty}"
 REFERENCE="${REFERENCE:-circle}"
 RADIUS="${RADIUS:-1.0}"
 PERIOD="${PERIOD:-3.5}"

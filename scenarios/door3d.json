@@ -1,0 +1,114 @@
+{
+ "_generated_by": "scripts/import_scenarios.py from the planner's SCENARIO_MAP -- do not edit; edit the planner and re-import",
+ "name": "door3d",
+ "title": "Door in 3D \u2014 Wait for the Opening (t>5)",
+ "spatial_dim": 3,
+ "start": [
+  0.5,
+  5.0,
+  0.5,
+  0.0
+ ],
+ "end": [
+  8.0,
+  5.0,
+  0.5,
+  10.0
+ ],
+ "T": 10.0,
+ "configs": [
+  [
+   8,
+   4
+  ],
+  [
+   8,
+   8
+  ]
+ ],
+ "sim": {
+  "start_s": 5.0,
+  "spawn": [
+   0.5,
+   5.0,
+   0.5
+  ]
+ },
+ "init_curve": {
+  "mode": "straight"
+ },
+ "obstacles": [
+  {"name": "D0", "type": "sphere", "radius": 1.6, "color": "#8e44ad", "control_points": [
+    [4.0, -2.0, 0.9, 0.0],
+    [4.0, -2.0, 0.9, 5.0]
+  ]},
+  {"name": "D1", "type": "sphere", "radius": 1.6, "color": "#8e44ad", "control_points": [
+    [4.0, -1.176470588, 0.9, 0.0],
+    [4.0, -1.176470588, 0.9, 5.0]
+  ]},
+  {"name": "D2", "type": "sphere", "radius": 1.6, "color": "#8e44ad", "control_points": [
+    [4.0, -0.352941176, 0.9, 0.0],
+    [4.0, -0.352941176, 0.9, 5.0]
+  ]},
+  {"name": "D3", "type": "sphere", "radius": 1.6, "color": "#8e44ad", "control_points": [
+    [4.0, 0.470588235, 0.9, 0.0],
+    [4.0, 0.470588235, 0.9, 5.0]
+  ]},
+  {"name": "D4", "type": "sphere", "radius": 1.6, "color": "#8e44ad", "control_points": [
+    [4.0, 1.294117647, 0.9, 0.0],
+    [4.0, 1.294117647, 0.9, 5.0]
+  ]},
+  {"name": "D5", "type": "sphere", "radius": 1.6, "color": "#8e44ad", "control_points": [
+    [4.0, 2.117647059, 0.9, 0.0],
+    [4.0, 2.117647059, 0.9, 5.0]
+  ]},
+  {"name": "D6", "type": "sphere", "radius": 1.6, "color": "#8e44ad", "control_points": [
+    [4.0, 2.941176471, 0.9, 0.0],
+    [4.0, 2.941176471, 0.9, 5.0]
+  ]},
+  {"name": "D7", "type": "sphere", "radius": 1.6, "color": "#8e44ad", "control_points": [
+    [4.0, 3.764705882, 0.9, 0.0],
+    [4.0, 3.764705882, 0.9, 5.0]
+  ]},
+  {"name": "D8", "type": "sphere", "radius": 1.6, "color": "#8e44ad", "control_points": [
+    [4.0, 4.588235294, 0.9, 0.0],
+    [4.0, 4.588235294, 0.9, 5.0]
+  ]},
+  {"name": "D9", "type": "sphere", "radius": 1.6, "color": "#8e44ad", "control_points": [
+    [4.0, 5.411764706, 0.9, 0.0],
+    [4.0, 5.411764706, 0.9, 5.0]
+  ]},
+  {"name": "D10", "type": "sphere", "radius": 1.6, "color": "#8e44ad", "control_points": [
+    [4.0, 6.235294118, 0.9, 0.0],
+    [4.0, 6.235294118, 0.9, 5.0]
+  ]},
+  {"name": "D11", "type": "sphere", "radius": 1.6, "color": "#8e44ad", "control_points": [
+    [4.0, 7.058823529, 0.9, 0.0],
+    [4.0, 7.058823529, 0.9, 5.0]
+  ]},
+  {"name": "D12", "type": "sphere", "radius": 1.6, "color": "#8e44ad", "control_points": [
+    [4.0, 7.882352941, 0.9, 0.0],
+    [4.0, 7.882352941, 0.9, 5.0]
+  ]},
+  {"name": "D13", "type": "sphere", "radius": 1.6, "color": "#8e44ad", "control_points": [
+    [4.0, 8.705882353, 0.9, 0.0],
+    [4.0, 8.705882353, 0.9, 5.0]
+  ]},
+  {"name": "D14", "type": "sphere", "radius": 1.6, "color": "#8e44ad", "control_points": [
+    [4.0, 9.529411765, 0.9, 0.0],
+    [4.0, 9.529411765, 0.9, 5.0]
+  ]},
+  {"name": "D15", "type": "sphere", "radius": 1.6, "color": "#8e44ad", "control_points": [
+    [4.0, 10.352941176, 0.9, 0.0],
+    [4.0, 10.352941176, 0.9, 5.0]
+  ]},
+  {"name": "D16", "type": "sphere", "radius": 1.6, "color": "#8e44ad", "control_points": [
+    [4.0, 11.176470588, 0.9, 0.0],
+    [4.0, 11.176470588, 0.9, 5.0]
+  ]},
+  {"name": "D17", "type": "sphere", "radius": 1.6, "color": "#8e44ad", "control_points": [
+    [4.0, 12.0, 0.9, 0.0],
+    [4.0, 12.0, 0.9, 5.0]
+  ]}
+ ]
+}

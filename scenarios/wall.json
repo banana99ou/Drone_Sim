@@ -1,0 +1,151 @@
+{
+ "_generated_by": "scripts/import_scenarios.py from the planner's SCENARIO_MAP -- do not edit; edit the planner and re-import",
+ "name": "wall",
+ "title": "Disappearing Wall (t<5)",
+ "spatial_dim": 2,
+ "start": [
+  1.0,
+  5.0,
+  1.5,
+  0.0
+ ],
+ "end": [
+  8.0,
+  5.0,
+  1.5,
+  10.0
+ ],
+ "T": 10.0,
+ "configs": [
+  [
+   8,
+   2
+  ],
+  [
+   8,
+   3
+  ],
+  [
+   8,
+   4
+  ],
+  [
+   8,
+   16
+  ],
+  [
+   10,
+   16
+  ],
+  [
+   10,
+   24
+  ]
+ ],
+ "sim": {
+  "start_s": 5.0,
+  "spawn": [
+   1.0,
+   5.0,
+   1.5
+  ]
+ },
+ "lift_z": 1.5,
+ "init_curve": {
+  "mode": "straight"
+ },
+ "obstacles": [
+  {"name": "W0", "type": "column", "radius": 0.5, "color": "#e67e22", "control_points": [
+    [2.5, 0.0, 1.5, 0.0],
+    [2.5, 0.0, 1.5, 5.0]
+  ]},
+  {"name": "W1", "type": "column", "radius": 0.5, "color": "#e67e22", "control_points": [
+    [2.5, 0.5, 1.5, 0.0],
+    [2.5, 0.5, 1.5, 5.0]
+  ]},
+  {"name": "W2", "type": "column", "radius": 0.5, "color": "#e67e22", "control_points": [
+    [2.5, 1.0, 1.5, 0.0],
+    [2.5, 1.0, 1.5, 5.0]
+  ]},
+  {"name": "W3", "type": "column", "radius": 0.5, "color": "#e67e22", "control_points": [
+    [2.5, 1.5, 1.5, 0.0],
+    [2.5, 1.5, 1.5, 5.0]
+  ]},
+  {"name": "W4", "type": "column", "radius": 0.5, "color": "#e67e22", "control_points": [
+    [2.5, 2.0, 1.5, 0.0],
+    [2.5, 2.0, 1.5, 5.0]
+  ]},
+  {"name": "W5", "type": "column", "radius": 0.5, "color": "#e67e22", "control_points": [
+    [2.5, 2.5, 1.5, 0.0],
+    [2.5, 2.5, 1.5, 5.0]
+  ]},
+  {"name": "W6", "type": "column", "radius": 0.5, "color": "#e67e22", "control_points": [
+    [2.5, 3.0, 1.5, 0.0],
+    [2.5, 3.0, 1.5, 5.0]
+  ]},
+  {"name": "W7", "type": "column", "radius": 0.5, "color": "#e67e22", "control_points": [
+    [2.5, 3.5, 1.5, 0.0],
+    [2.5, 3.5, 1.5, 5.0]
+  ]},
+  {"name": "W8", "type": "column", "radius": 0.5, "color": "#e67e22", "control_points": [
+    [2.5, 4.0, 1.5, 0.0],
+    [2.5, 4.0, 1.5, 5.0]
+  ]},
+  {"name": "W9", "type": "column", "radius": 0.5, "color": "#e67e22", "control_points": [
+    [2.5, 4.5, 1.5, 0.0],
+    [2.5, 4.5, 1.5, 5.0]
+  ]},
+  {"name": "W10", "type": "column", "radius": 0.5, "color": "#e67e22", "control_points": [
+    [2.5, 5.0, 1.5, 0.0],
+    [2.5, 5.0, 1.5, 5.0]
+  ]},
+  {"name": "W11", "type": "column", "radius": 0.5, "color": "#e67e22", "control_points": [
+    [2.5, 5.5, 1.5, 0.0],
+    [2.5, 5.5, 1.5, 5.0]
+  ]},
+  {"name": "W12", "type": "column", "radius": 0.5, "color": "#e67e22", "control_points": [
+    [2.5, 6.0, 1.5, 0.0],
+    [2.5, 6.0, 1.5, 5.0]
+  ]},
+  {"name": "W13", "type": "column", "radius": 0.5, "color": "#e67e22", "control_points": [
+    [2.5, 6.5, 1.5, 0.0],
+    [2.5, 6.5, 1.5, 5.0]
+  ]},
+  {"name": "W14", "type": "column", "radius": 0.5, "color": "#e67e22", "control_points": [
+    [2.5, 7.0, 1.5, 0.0],
+    [2.5, 7.0, 1.5, 5.0]
+  ]},
+  {"name": "W15", "type": "column", "radius": 0.5, "color": "#e67e22", "control_points": [
+    [2.5, 7.5, 1.5, 0.0],
+    [2.5, 7.5, 1.5, 5.0]
+  ]},
+  {"name": "W16", "type": "column", "radius": 0.5, "color": "#e67e22", "control_points": [
+    [2.5, 8.0, 1.5, 0.0],
+    [2.5, 8.0, 1.5, 5.0]
+  ]},
+  {"name": "W17", "type": "column", "radius": 0.5, "color": "#e67e22", "control_points": [
+    [2.5, 8.5, 1.5, 0.0],
+    [2.5, 8.5, 1.5, 5.0]
+  ]},
+  {"name": "W18", "type": "column", "radius": 0.5, "color": "#e67e22", "control_points": [
+    [2.5, 9.0, 1.5, 0.0],
+    [2.5, 9.0, 1.5, 5.0]
+  ]},
+  {"name": "W19", "type": "column", "radius": 0.5, "color": "#e67e22", "control_points": [
+    [2.5, 9.5, 1.5, 0.0],
+    [2.5, 9.5, 1.5, 5.0]
+  ]},
+  {"name": "W20", "type": "column", "radius": 0.5, "color": "#e67e22", "control_points": [
+    [2.5, 10.0, 1.5, 0.0],
+    [2.5, 10.0, 1.5, 5.0]
+  ]},
+  {"name": "M1", "type": "column", "radius": 0.6, "color": "#2980b9", "control_points": [
+    [7.0, 3.0, 1.5, 0.0],
+    [7.0, 6.0, 1.5, 10.0]
+  ]},
+  {"name": "M2", "type": "column", "radius": 0.5, "color": "#27ae60", "control_points": [
+    [6.5, 8.0, 1.5, 0.0],
+    [8.5, 6.0, 1.5, 10.0]
+  ]}
+ ]
+}

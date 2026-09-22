@@ -9,8 +9,9 @@
 //   tracking error   | truth position vs the setpoint the controller tracked
 //   collision        | contact sensor on the guard envelope, AND the analytic
 //                    | clearance going negative (edge-triggered, with position)
-//   clearance        | analytic SIGNED distance to obstacles listed in the world
-//                    | config, which may be moving: centre = pos0 + vel * t
+//   clearance        | analytic SIGNED distance to the scenario's obstacles,
+//                    | whose centres follow a Bezier in space-time and which
+//                    | exist only inside their own active window
 //   path length      | integrated ground-truth travel
 //   energy           | momentum-theory estimate anchored to the data sheet
 //
@@ -18,16 +19,21 @@
 // sensor, on purpose: this is the referee, and the referee must not share the
 // planner's blind spots.
 //
-// Moving obstacles run on the SCENARIO clock: t = sim time - scenario.start_s,
-// zero when the plan begins executing. The referee also listens to the poses
-// Gazebo reports for those bodies and keeps the worst disagreement with its own
-// pos0 + vel * t, so "the world being flown is the world being scored" is a
-// measured number on /drone/eval/clearance rather than an assumption.
+// Obstacles run on the SCENARIO clock: t = sim time - scenario.start_s, zero
+// when the plan begins executing. They are NOT Gazebo bodies -- they have no
+// collision geometry and two of the shipped scenarios move theirs along cubics
+// while three switch them off partway through, none of which a constant-velocity
+// rigid body can express. What this node publishes IS the obstacle field, and
+// the viewer draws from it. scripts/check_planner.py holds those positions
+// against the planner's own obstacle_positions_at(), which is an independent
+// implementation of the same motion -- a stronger check than comparing the
+// simulator against its own staging.
 
 #include <cmath>
 #include <fstream>
 #include <memory>
 #include <limits>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -70,6 +76,7 @@ public:
     // static courses, where nothing moves and the clock is unused.
     scenario_start_s_ = declare_parameter("scenario.start_s", 0.0);
     scenario_duration_s_ = declare_parameter("scenario.duration_s", 0.0);
+    scenario_name_ = declare_parameter("scenario.name", std::string(""));
 
     loadObstacles();
     tracker_ = std::make_unique<ClearanceTracker>(obstacles_, vehicle_radius_);
@@ -88,17 +95,6 @@ public:
     cmd_sub_ = create_subscription<actuator_msgs::msg::Actuators>(
       "/drone/command/motor_speed", rclcpp::QoS(1),
       [this](actuator_msgs::msg::Actuators::SharedPtr m) {onCommand(*m);});
-
-    // Gazebo's own report of where each MOVING body is, one topic per
-    // obstacle (the world's OdometryPublisher, bridged by the launch). Static
-    // ones cannot disagree with themselves and get no subscription.
-    for (const auto & o : obstacles_) {
-      if (!o.moving()) {continue;}
-      const Obstacle * which = &o;
-      pose_subs_.push_back(create_subscription<nav_msgs::msg::Odometry>(
-        "/drone/obstacle_pose/" + o.name, rclcpp::SensorDataQoS(),
-        [this, which](nav_msgs::msg::Odometry::SharedPtr m) {onObstaclePose(*which, *m);}));
-    }
 
     status_pub_ = create_publisher<dsim_msgs::msg::FlightStatus>(
       "/drone/eval/status", rclcpp::QoS(10));
@@ -128,60 +124,54 @@ public:
         RCLCPP_WARN(get_logger(), "could not open %s for writing", csv_path_.c_str());
       }
     }
-    size_t moving = 0;
-    for (const auto & o : obstacles_) {moving += o.moving() ? 1 : 0;}
     RCLCPP_INFO(get_logger(),
-      "eval up: %zu obstacles (%zu moving), vehicle radius %.2f m, scenario t=0 at sim %.1f s",
-      obstacles_.size(), moving, vehicle_radius_, scenario_start_s_);
+      "eval up: scenario '%s', %zu obstacles, vehicle radius %.2f m, "
+      "scenario t=0 at sim %.1f s, horizon %.1f s",
+      scenario_name_.c_str(), obstacles_.size(), vehicle_radius_,
+      scenario_start_s_, scenario_duration_s_);
   }
 
 private:
   void loadObstacles()
   {
     // Obstacles are declared as a flat list because ROS 2 parameters have no
-    // native array-of-struct type:
-    //   obstacles.names: ["pillar_a", ...]
-    //   obstacles.pillar_a.type / .pose / .size
+    // native array-of-struct type, and each one's motion is a Bezier in
+    // space-time flattened to a single array of doubles:
+    //   obstacles.names: ["F0", ...]
+    //   obstacles.F0.type   "sphere" | "column"
+    //   obstacles.F0.radius
+    //   obstacles.F0.control_points: [x,y,z,t, x,y,z,t, ...]
+    // Four numbers per control point, at least two points. This is the
+    // planner's own canonical form, not a translation of it, so the referee
+    // and the solver cannot disagree about where anything is or when.
     const auto names = declare_parameter<std::vector<std::string>>(
       "obstacles.names", std::vector<std::string>{});
     for (const auto & n : names) {
       Obstacle o;
       o.name = n;
-      o.type = declare_parameter("obstacles." + n + ".type", std::string("box"));
-      const auto pose = declare_parameter<std::vector<double>>(
-        "obstacles." + n + ".pose", {0.0, 0.0, 0.0});
-      const auto size = declare_parameter<std::vector<double>>(
-        "obstacles." + n + ".size", {1.0, 1.0, 1.0});
-      o.x = pose.at(0); o.y = pose.at(1); o.z = pose.at(2);
-      o.sx = size.at(0);
-      o.sy = size.size() > 1 ? size.at(1) : size.at(0);
-      o.sz = size.size() > 2 ? size.at(2) : size.at(0);
-      // Optional: the static courses declare none and stay put.
-      const auto vel = declare_parameter<std::vector<double>>(
-        "obstacles." + n + ".vel", {0.0, 0.0, 0.0});
-      o.vx = vel.at(0); o.vy = vel.at(1); o.vz = vel.at(2);
+      o.type = declare_parameter("obstacles." + n + ".type", std::string("sphere"));
+      o.radius = declare_parameter("obstacles." + n + ".radius", 1.0);
+      const auto flat = declare_parameter<std::vector<double>>(
+        "obstacles." + n + ".control_points", std::vector<double>{});
+      if (flat.size() < 8 || flat.size() % 4 != 0) {
+        // Refuse rather than score against half an obstacle. A truncated
+        // control polygon still produces a number, and that number is the
+        // thing this node exists to be trusted about.
+        throw std::runtime_error(
+          "obstacle " + n + " has " + std::to_string(flat.size()) +
+          " control-point numbers; need a multiple of 4, at least 8 (x,y,z,t per point)");
+      }
+      for (size_t i = 0; i < flat.size(); i += 4) {
+        o.control_points.push_back({flat[i], flat[i + 1], flat[i + 2], flat[i + 3]});
+      }
+      if (o.tEnd() < o.tStart()) {
+        throw std::runtime_error("obstacle " + n + " has control point times running backwards");
+      }
       obstacles_.push_back(o);
     }
   }
 
   double scenarioTime(double sim_s) const {return sim_s - scenario_start_s_;}
-
-  void onObstaclePose(const Obstacle & o, const nav_msgs::msg::Odometry & m)
-  {
-    // Evaluate the analytic centre at the time the pose was TAKEN, not at
-    // the time it arrived: at 0.25 m/s a 30 ms delay is 7.5 mm, which is the
-    // size of the thing being measured.
-    double stamp = static_cast<double>(m.header.stamp.sec) +
-      1e-9 * static_cast<double>(m.header.stamp.nanosec);
-    if (stamp <= 0.0) {stamp = get_clock()->now().seconds();}
-    double cx, cy, cz;
-    o.centreAt(scenarioTime(stamp), cx, cy, cz);
-    const auto & p = m.pose.pose.position;
-    const double d = std::sqrt(
-      (p.x - cx) * (p.x - cx) + (p.y - cy) * (p.y - cy) + (p.z - cz) * (p.z - cz));
-    if (!std::isfinite(world_mismatch_m_) || d > world_mismatch_m_) {world_mismatch_m_ = d;}
-    ++world_poses_seen_;
-  }
 
   static bool isDrone(const std::string & name)
   {
@@ -280,10 +270,12 @@ private:
     // position it happened at -- see dsim_eval/obstacle.hpp.
     const size_t hits_before = tracker_->hits().size();
     const auto sample = tracker_->update(px, py, pz, scenarioTime(now));
-    if (std::isfinite(sample.clearance)) {
-      last_clearance_ = sample.clearance;
-      nearest_ = sample.nearest;
-    }
+    // Taken unconditionally, infinity included. Keeping the last finite value
+    // when every obstacle has gone left `door3d` reporting 0.82 m of clearance
+    // to a door that had opened five seconds earlier -- a stale number that
+    // looks exactly like a live one.
+    last_clearance_ = sample.clearance;
+    nearest_ = sample.nearest;
     if (tracker_->hits().size() > hits_before) {
       const auto & h = tracker_->hits().back();
       RCLCPP_ERROR(
@@ -310,7 +302,9 @@ private:
            << (have_sp_ ? sp_.position.x : 0.0) << ','
            << (have_sp_ ? sp_.position.y : 0.0) << ','
            << (have_sp_ ? sp_.position.z : 0.0) << ','
-           << err_ << ',' << rmse() << ',' << last_clearance_ << ','
+           << err_ << ',' << rmse() << ','
+           << (std::isfinite(last_clearance_) ? last_clearance_
+               : std::numeric_limits<double>::quiet_NaN()) << ','
            << (collided_ ? 1 : 0) << ',' << energy_wh_ << '\n';
     }
   }
@@ -350,11 +344,14 @@ private:
     const double now = get_clock()->now().seconds();
     r.scenario_time_s = scenarioTime(now);
     for (const auto & o : tracker_->obstacles()) {
+      const auto centre = o.centreAt(r.scenario_time_s);
       geometry_msgs::msg::Point c;
-      o.centreAt(r.scenario_time_s, c.x, c.y, c.z);
+      c.x = centre[0]; c.y = centre[1]; c.z = centre[2];
       r.names.push_back(o.name);
       r.positions.push_back(c);
-      r.radii.push_back(o.sx);
+      r.radii.push_back(o.radius);
+      r.active.push_back(o.activeAt(r.scenario_time_s));
+      r.types.push_back(o.type);
     }
     r.clearance_m = last_clearance_;
     r.nearest = nearest_;
@@ -367,8 +364,8 @@ private:
       r.hit_times_s.push_back(h.t);
       r.hit_depths_m.push_back(h.depth);
     }
-    r.world_mismatch_m = world_mismatch_m_;
-    r.world_poses_seen = static_cast<uint32_t>(world_poses_seen_);
+    r.scenario = scenario_name_;
+    r.scenario_duration_s = scenario_duration_s_;
     clearance_pub_->publish(r);
   }
 
@@ -379,8 +376,6 @@ private:
     tracker_->reset();
     nearest_.clear();
     last_clearance_ = std::numeric_limits<double>::infinity();
-    world_mismatch_m_ = std::numeric_limits<double>::quiet_NaN();
-    world_poses_seen_ = 0;
     collided_ = false; collision_count_ = 0; ground_contacts_ = 0;
     have_last_pos_ = false; was_airborne_ = false;
     RCLCPP_INFO(get_logger(), "metrics reset");
@@ -392,9 +387,7 @@ private:
   std::vector<Obstacle> obstacles_;
   std::unique_ptr<ClearanceTracker> tracker_;
   double scenario_start_s_ {0.0}, scenario_duration_s_ {0.0};
-  std::string nearest_;
-  double world_mismatch_m_ {std::numeric_limits<double>::quiet_NaN()};
-  size_t world_poses_seen_ {0};
+  std::string scenario_name_, nearest_;
   double vehicle_radius_, hover_power_w_, mass_, motor_constant_, publish_hz_;
   std::string csv_path_;
   std::ofstream csv_;
@@ -413,7 +406,6 @@ private:
   rclcpp::Subscription<dsim_msgs::msg::TrajectorySetpoint>::SharedPtr sp_sub_;
   rclcpp::Subscription<ros_gz_interfaces::msg::Contacts>::SharedPtr contact_sub_;
   rclcpp::Subscription<actuator_msgs::msg::Actuators>::SharedPtr cmd_sub_;
-  std::vector<rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr> pose_subs_;
   rclcpp::Publisher<dsim_msgs::msg::FlightStatus>::SharedPtr status_pub_;
   rclcpp::Publisher<dsim_msgs::msg::ClearanceReport>::SharedPtr clearance_pub_;
   rclcpp::Service<dsim_msgs::srv::ResetRun>::SharedPtr reset_srv_;

@@ -6,9 +6,11 @@
 Polls /snapshot from before the plan starts until after it ends and checks,
 in order, the things that have to hold for the run to mean anything:
 
-  1. the world being flown is the world being scored -- Gazebo's own poses for
-     the moving obstacles agree with the referee's pos0 + vel*t to within
-     WORLD_MISMATCH_M, and at least one pose was actually heard (None fails);
+  1. the referee's obstacle field agrees with the PLANNER's own
+     obstacle_positions_at() -- two independent implementations, in two
+     languages, of the same Bezier motion, sampled across the whole window.
+     That is what "the world being scored is the world that was planned"
+     reduces to now that the obstacles are not Gazebo bodies at all;
   2. the vehicle reached the plan's start point before the scenario clock hit
      zero, so the plan was flown from where the planner assumed;
   3. the velocity feedforward reached the controller: during the cruise the
@@ -16,12 +18,14 @@ in order, the things that have to hold for the run to mean anything:
      feedforward zeroed the vehicle still tracks a gentle plan, late, and
      nothing else here would notice;
   4. tracking stayed inside TRACK_MAX_M for the whole window, and inside the
-     tighter CRUISE_MAX_M over the cruise -- the last 40% of the plan, which
-     is after the opening transient and before the stop;
+     tighter cruise allowance over the last 40% of the plan, which is after
+     the opening transient and before the stop;
   5. the hits are the hits the plan predicts. A plan file may declare
      `expect` -- the seed does, because it is a straight line through the
-     fence and a referee that lets it through is broken; an optimised plan
-     declares none and must produce none;
+     obstacles and a referee that lets it through is broken. An optimised plan
+     declares none, and then whether hits are allowed is decided by its own
+     `predicted_clearance_m`: a plan the optimiser could not certify says so,
+     and a hit is agreement rather than a surprise;
   6. and if the plan carries `predicted_clearance_m` -- what the optimiser's
      certificate implies for THIS vehicle on the real obstacles -- the
      referee's measured minimum agrees with it. Those are two independent
@@ -38,7 +42,12 @@ import sys
 import time
 import urllib.request
 
-WORLD_MISMATCH_M = 0.02    # 20 mm; gravity left on drifts a body 10 mm/s, caught in 2 s
+#: The referee (C++ de Casteljau) against the planner (Python, via numpy).
+#: Two implementations of the same curve: they should agree to floating point,
+#: so this is a round-off bound and not a tolerance for being approximately
+#: right. A frame offset, a clock offset or a dropped control point all land
+#: orders of magnitude above it.
+OBSTACLE_AGREEMENT_M = 1e-6
 START_TOL_M = 0.15         # must be at the start point, not merely near it
 CRUISE_SPEED_TOL = 0.15    # fraction: |v_ref| against the plan's own speed
 #: The cruise window is the last CRUISE_FROM_FRAC of the plan, never starting
@@ -54,30 +63,36 @@ CRUISE_SPEED_TOL = 0.15    # fraction: |v_ref| against the plan's own speed
 #: error shows up across the whole window, not just at its start.
 CRUISE_FROM_FRAC = 0.4
 CRUISE_MIN_S = 3.0
-CRUISE_MAX_M = 0.10        # the loop holds a plan to a few cm; 10 cm is a real loss
-#: The vehicle's lateral acceleration at the tilt clamp, g*tan(0.7) -- used
-#: only to size the standing-start allowance for a plan that carries no
-#: feasibility record of its own. solve_plan.py computes the same number from
-#: config/drone.yaml and gains.yaml.
-LATERAL_ACCEL_LIMIT = 8.26
-#: Peak tracking error allowed in the window for a plan that STARTS FROM REST.
-#: A plan that opens at speed is a different question -- see below.
+#: Cruise tracking allowance, as a fraction of the PLAN's top speed times a
+#: lag. The loop's steady error is velocity-proportional -- it flies on an
+#: estimated velocity that lags the true one -- so a fixed number is calibrated
+#: at one speed and wrong at every other: measured 2.8 cm on a 0.9 m/s plan,
+#: 8.0 on a 3.0 m/s one and 10.3 on a 2.5 m/s plan that does its fastest work
+#: at the end. 50 ms of lag covers all of those with room, and a feedforward
+#: that stopped arriving would double or triple them.
+CRUISE_LAG_S = 0.05
+CRUISE_MIN_M = 0.05        # ...and a floor, so a slow plan is not held to millimetres
+#: Peak tracking error allowed in the window for a plan that starts from rest.
 TRACK_MAX_M = 0.30
-#: For a plan with a standing start, the peak is bounded by the catch-up
-#: distance the plan's own opening speed implies, times this. The optimiser
-#: pins endpoint positions and not velocities, so the vehicle hovering at the
-#: start point is handed a velocity step; v0^2/(2 a_max) is the distance the
-#: reference gains while the vehicle reaches v0 using every bit of its lateral
-#: authority, and the loop does not use all of it immediately. Measured: 0.92 m
-#: against a 0.545 m floor on a 3.00 m/s start, i.e. 1.7x.
-STANDING_START_FACTOR = 2.5
+#: For a plan that opens at speed, the peak scales with that speed: the
+#: optimiser pins endpoint positions and not velocities, so the vehicle
+#: hovering at the start point is handed a velocity STEP, and the loop is
+#: bandwidth-limited rather than acceleration-limited in answering it.
+#: Measured peak / v0 across six flown plans from 0.70 to 3.00 m/s: 0.322 s,
+#: with residuals under 5 cm and no trend. This is that, with margin.
+#:
+#: The first version of this used the full-authority catch-up distance
+#: v0^2/(2 a_max), which is quadratic and under-predicted by 3x at the low end
+#: -- it passed fence3d and failed diverse and loiter for no reason to do with
+#: either plan.
+OPENING_LAG_S = 0.5
 HIT_TIME_TOL_S = 0.30      # entry time vs the planned-trajectory prediction
 HIT_DEPTH_TOL_M = 0.10
 #: How far the measured minimum clearance may fall below the certificate. The
 #: certificate is about the PLANNED curve; the vehicle flies the tracking error
 #: away from it, so the measured margin is smaller by up to that error. Sized
-#: against the cruise tracking limit above, not picked round.
-CLEARANCE_SLACK_M = CRUISE_MAX_M
+#: against the tracking the loop actually achieves, not picked round.
+CLEARANCE_SLACK_M = 0.10
 
 
 def fetch(url):
@@ -96,6 +111,60 @@ class Checks:
         print(f"  FAIL  {name}: {detail}")
         print(f"        would catch: {would_catch}")
         self.failures += 1
+
+
+def obstacle_agreement(url, scenario, samples=41):
+    """Compare the referee's live obstacle field against the planner's own.
+
+    The referee is polled at whatever scenario time it happens to be at, and
+    the planner's obstacle_positions_at() -- an independent implementation of
+    the same lifted-control-point motion -- is evaluated at that same instant.
+    Repeated across the window so a disagreement that only appears mid-curve
+    (a cubic read as a straight line, say) cannot hide.
+
+    Returns (worst distance, which obstacle, at what time, window mismatches).
+    """
+    from spacetime_bezier.geometry import obstacle_positions_at
+    import numpy as np
+
+    by_name = {o["name"]: o for o in scenario["obstacles"]}
+    worst, worst_name, worst_t, window = 0.0, "", 0.0, []
+    seen = 0
+    for _ in range(samples):
+        cl = fetch(url).get("clearance")
+        if not cl or not cl["obstacles"]:
+            time.sleep(0.05)
+            continue
+        seen += 1
+        t = cl["scenario_time_s"]
+        for o in cl["obstacles"]:
+            ref = by_name.get(o["name"])
+            if ref is None:
+                window.append(f"{o['name']}: not in the scenario file")
+                continue
+            cps = np.asarray(ref["control_points"], dtype=float)
+            # The scenario file is always 4-wide; the planner's routine works
+            # in whatever dimension the scenario was planned in, so a 2D
+            # obstacle's z column is dropped before the comparison and its
+            # z is not compared at all (a column has no meaningful z).
+            spatial = int(scenario["spatial_dim"])
+            if spatial == 2:
+                cps = cps[:, [0, 1, 3]]
+            active = cps[0, -1] <= t <= cps[-1, -1]
+            if active != bool(o["active"]):
+                window.append(f"{o['name']} at t={t:.2f}: referee says "
+                              f"{'active' if o['active'] else 'absent'}, planner says "
+                              f"{'active' if active else 'absent'}")
+                continue
+            if not active:
+                continue
+            want = obstacle_positions_at(cps, np.array([t]))[0]
+            got = o["pos"][:spatial]
+            d = float(np.linalg.norm(np.asarray(got) - want))
+            if d > worst:
+                worst, worst_name, worst_t = d, o["name"], t
+        time.sleep(0.05)
+    return (worst if seen else None), worst_name, worst_t, window
 
 
 def scenario_time(snap):
@@ -119,6 +188,7 @@ def main(plan_file, url):
     c = Checks()
     plan = json.load(open(plan_file))
     scenario = json.load(open(f"scenarios/{plan['scenario']}.json"))
+    sys.path.insert(0, "src/dsim_planner")
     T = float(scenario["T"])
     start_p = scenario["start"][:3]
     expect = plan.get("expect", {})
@@ -144,6 +214,26 @@ def main(plan_file, url):
     # returns a curve demanding 108 degrees of tilt; grading the tracking of
     # such a plan measures the clamp, not the plan. scripts/solve_plan.py
     # records the demand in the file.
+    # Is the plan inside the vehicle's SENSING envelope? The estimator's only
+    # velocity aiding is optical flow, which needs the ground in a height band,
+    # and a rangefinder with a few metres of range. Above that band there is
+    # nothing correcting the accelerometer and the state estimate walks away:
+    # measured on `loiter`, which flies at 62.5 m -- 48 m of tracking error on
+    # state:=est, 2.2 cm on state:=truth, same plan. Said here, before the
+    # tracking checks, so four failures read as one fact.
+    try:
+        import yaml
+        sensors = yaml.safe_load(open("config/drone.yaml"))["drone"]["sensors"]
+        ceiling = float(sensors["optical_flow"]["max_height_m"])
+        alt = [row[2] for row in P]
+        if max(alt) > ceiling:
+            print(f"  note  this plan reaches {max(alt):.1f} m and the optical flow "
+                  f"works to {ceiling:.1f} m. Above that the estimator has no velocity "
+                  f"aiding at all, so state:=est cannot fly it; use state:=truth and "
+                  f"read the result as a statement about the PLAN, not the vehicle.")
+    except (OSError, KeyError, ValueError, ImportError):
+        pass
+
     demands = plan.get("demands")
     if demands is None:
         print("  note  this plan carries no feasibility record (it predates "
@@ -222,22 +312,31 @@ def main(plan_file, url):
     print(f"  window done at scenario t = {cl['scenario_time_s']:.1f} s, "
           f"{len(speed_samples)} cruise samples")
 
-    # ---- 1. world vs referee ----------------------------------------------
-    mm = cl["world_mismatch_m"]
-    moving = any(any(v != 0 for v in o.get("vel", [0, 0, 0]))
-                 for o in scenario["obstacles"])
-    if not moving:
-        c.ok("world vs referee", "no moving obstacles; nothing to disagree about")
-    elif mm is None or cl["world_poses_seen"] == 0:
-        c.bad("world vs referee", "no obstacle pose was ever heard from Gazebo",
-              "a missing PosePublisher or bridge entry -- the check is off, not passing")
-    elif mm <= WORLD_MISMATCH_M:
-        c.ok("world vs referee", f"max |gazebo - analytic| {mm * 1000:.2f} mm over "
-             f"{cl['world_poses_seen']} poses (limit {WORLD_MISMATCH_M * 1000:.0f} mm)")
+    # ---- 1. referee vs planner --------------------------------------------
+    worst, worst_name, worst_t, active_disagreements = obstacle_agreement(
+        url, scenario, samples=41)
+    if worst is None:
+        c.bad("referee agrees with the planner about the obstacles",
+              "the referee published no obstacle field",
+              "a referee that was given no obstacle list -- the scenario's "
+              "config/obstacles_<name>.yaml is missing or empty, and every "
+              "clearance number below would be vacuously infinite")
+    elif active_disagreements:
+        c.bad("referee agrees with the planner about which obstacles exist",
+              f"{len(active_disagreements)} disagree: {active_disagreements[:4]}",
+              "an active window read differently on the two sides -- the referee "
+              "would score against an obstacle the planner solved without, or "
+              "ignore one it solved around")
+    elif worst <= OBSTACLE_AGREEMENT_M:
+        c.ok("referee agrees with the planner about the obstacles",
+             f"max |referee - planner| {worst:.2e} m over {len(scenario['obstacles'])} "
+             f"obstacles x 41 instants (limit {OBSTACLE_AGREEMENT_M:g})")
     else:
-        c.bad("world vs referee", f"max |gazebo - analytic| {mm * 1000:.1f} mm",
-              "a world generated with a different start_s than the referee uses, "
-              "or gravity acting on a body that is supposed to move at constant velocity")
+        c.bad("referee agrees with the planner about the obstacles",
+              f"max |referee - planner| {worst:.3e} m on {worst_name} at t={worst_t:.2f} s",
+              "a scenario clock offset between the referee and the plan, a control "
+              "point dropped in the parameter flattening, or de Casteljau implemented "
+              "differently on the two sides")
 
     # ---- 3. feedforward reached the controller ----------------------------
     if not speed_samples:
@@ -270,17 +369,12 @@ def main(plan_file, url):
     # statement the grader had no business making.
     if demands and "start_speed_mps" in demands:
         v0 = demands["start_speed_mps"]
-        deficit = demands.get("standing_start_deficit_m", 0.0)
     else:
         v0 = math.dist(spacetime.sample_at_time(P, P[0][3])[1], [0, 0, 0])
-        deficit = v0 ** 2 / (2 * LATERAL_ACCEL_LIMIT)
-    if v0 > 0.05:
-        limit = max(TRACK_MAX_M, STANDING_START_FACTOR * deficit)
-        why = (f"a {v0:.2f} m/s standing start implies at least {deficit * 100:.0f} cm "
-               f"of catch-up even at full authority")
-    else:
-        limit = TRACK_MAX_M
-        why = "the plan starts from rest, so nothing excuses a large peak"
+    limit = max(TRACK_MAX_M, OPENING_LAG_S * v0)
+    why = (f"a {v0:.2f} m/s standing start, at {OPENING_LAG_S:.2f} s of closed-loop lag"
+           if OPENING_LAG_S * v0 > TRACK_MAX_M
+           else "the plan barely moves at t=0, so nothing excuses a large peak")
     if max_err <= limit:
         c.ok("tracking through the window", f"max error {max_err * 100:.1f} cm "
              f"(limit {limit * 100:.0f} cm -- {why})")
@@ -288,12 +382,16 @@ def main(plan_file, url):
         c.bad("tracking through the window",
               f"max error {max_err * 100:.1f} cm against {limit * 100:.0f} cm ({why})",
               "a plan the vehicle cannot follow, or feedforward with the wrong sign")
-    if max_err_cruise <= CRUISE_MAX_M:
+    v_top = (demands or {}).get("max_speed_mps") or max(
+        (s[2] for s in speed_samples), default=1.0)
+    cruise_limit = max(CRUISE_MIN_M, CRUISE_LAG_S * v_top)
+    if max_err_cruise <= cruise_limit:
         c.ok("tracking in the cruise", f"max error {max_err_cruise * 100:.1f} cm over "
-             f"t={cruise_from:.1f}..{T:.0f} s (limit {CRUISE_MAX_M * 100:.0f} cm)")
+             f"t={cruise_from:.1f}..{T:.0f} s (limit {cruise_limit * 100:.1f} cm = "
+             f"{CRUISE_LAG_S * 1000:.0f} ms of lag at the plan's {v_top:.2f} m/s)")
     else:
         c.bad("tracking in the cruise", f"max error {max_err_cruise * 100:.1f} cm over "
-              f"t={cruise_from:.1f}..{T:.0f} s",
+              f"t={cruise_from:.1f}..{T:.0f} s against {cruise_limit * 100:.1f} cm",
               "acceleration feedforward missing or wrong on a plan that turns, or a "
               "loop that never settles after the start")
     v_end = ((demands or {}).get("end_speed_mps")
@@ -332,7 +430,23 @@ def main(plan_file, url):
                       "obstacles moving at the wrong speed or from the wrong place, "
                       "or a scenario clock offset between world, referee and bridge")
     else:
-        if not hits:
+        # An optimised plan declares no expected hit, so what decides whether
+        # one is a failure is the plan's OWN certificate. A solve that came
+        # back uncertified with a negative margin is a plan that says it
+        # collides; the referee agreeing with it is the system working.
+        promised = plan.get("predicted_clearance_m")
+        certified = (plan.get("solver_info") or {}).get("certified")
+        if promised is not None and promised < 0.0:
+            if hits:
+                c.ok("hits only where the plan admits it will",
+                     f"the optimiser promised {promised:+.4f} m "
+                     f"(certified={certified}) and the run hit: {summary}")
+            else:
+                c.bad("hits only where the plan admits it will",
+                      f"the optimiser promised {promised:+.4f} m and nothing was hit",
+                      "a referee that cannot see the obstacles it was given -- a plan "
+                      "with a negative margin must show up as a collision somewhere")
+        elif not hits:
             c.ok("no collision", f"min clearance {cl['min_clearance_m'] * 100:.1f} cm")
         else:
             c.bad("no collision", f"hits: {summary}",

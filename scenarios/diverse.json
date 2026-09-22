@@ -1,0 +1,83 @@
+{
+ "_generated_by": "scripts/import_scenarios.py from the planner's SCENARIO_MAP -- do not edit; edit the planner and re-import",
+ "name": "diverse",
+ "title": "Diverse Moving Obstacles",
+ "spatial_dim": 2,
+ "start": [
+  0.5,
+  0.5,
+  1.5,
+  0.0
+ ],
+ "end": [
+  9.0,
+  9.0,
+  1.5,
+  10.0
+ ],
+ "T": 10.0,
+ "configs": [
+  [
+   8,
+   4
+  ],
+  [
+   8,
+   8
+  ],
+  [
+   8,
+   16
+  ],
+  [
+   10,
+   4
+  ],
+  [
+   10,
+   16
+  ]
+ ],
+ "sim": {
+  "start_s": 5.0,
+  "spawn": [
+   0.5,
+   0.5,
+   1.5
+  ]
+ },
+ "lift_z": 1.5,
+ "init_curve": {
+  "mode": "straight"
+ },
+ "obstacles": [
+  {"name": "A", "type": "column", "radius": 0.6, "color": "#e74c3c", "control_points": [
+    [1.0, 6.0, 1.5, 0.0],
+    [9.0, 5.0, 1.5, 10.0]
+  ]},
+  {"name": "B", "type": "column", "radius": 1.0, "color": "#2980b9", "control_points": [
+    [5.0, 5.0, 1.5, 0.0],
+    [5.5, 3.5, 1.5, 10.0]
+  ]},
+  {"name": "C", "type": "column", "radius": 0.5, "color": "#27ae60", "control_points": [
+    [8.0, 1.0, 1.5, 0.0],
+    [2.0, 5.0, 1.5, 10.0]
+  ]},
+  {"name": "D", "type": "column", "radius": 0.4, "color": "#9b59b6", "control_points": [
+    [3.0, 1.5, 1.5, 0.0],
+    [6.0, 7.5, 1.5, 10.0]
+  ]},
+  {"name": "E", "type": "column", "radius": 0.9, "color": "#e67e22", "control_points": [
+    [4.0, 8.0, 1.5, 0.0],
+    [5.0, 3.0, 1.5, 10.0]
+  ]},
+  {"name": "F", "type": "column", "radius": 0.35, "color": "#1abc9c", "control_points": [
+    [7.0, 7.0, 1.5, 0.0],
+    [3.0, 4.0, 1.5, 10.0]
+  ]},
+  {"name": "G", "type": "column", "radius": 0.7, "color": "#f39c12", "control_points": [
+    [2.5, 4.0, 1.5, 0.0],
+    [2.5, 4.0, 1.5, 10.0]
+  ]}
+ ]
+}

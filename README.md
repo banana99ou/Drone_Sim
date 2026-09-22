@@ -57,19 +57,23 @@ make plan  PLAN=plans/fence3d_N8_seg2.json     # headless, graded against the pl
 make viz   WORLD=fence3d PLAN=plans/fence3d_N8_seg2.json   # watch it, and re-solve from the page
 ```
 
-A fence3d solve takes 0.20 s. `plans/fence3d_seed.json` is the optimiser's
-straight-line initial guess and goes THROUGH the fence on purpose — its file
-says where, and the referee has to agree.
+Seven scenarios come straight from the planner (`original`, `curve`,
+`diverse`, `wall`, `fence3d`, `door3d`, `loiter`) — `scripts/solve_plan.py
+--list` shows them. A fence3d solve takes 0.20 s.
+`plans/<name>_seed.json` is the optimiser's straight-line initial guess and on
+six of the seven goes THROUGH something on purpose — its file says what and
+when, and the referee has to agree.
 
 ## Layout
 
 ```
 scripts/gen_assets.py       ONE source for the vehicle + worlds. Edit PARAMS here.
-scenarios/*.json            space-time planning scenarios, in the planner's own format
+scripts/import_scenarios.py generated scenarios/ from the planner's SCENARIO_MAP
+scenarios/*.json            generated — obstacles as control points in (x, y, z, t)
 plans/*.json                (x, y, z, t) control points that solve one; the *_seed is generated
 config/drone.yaml           generated — what the controller assumes
-config/obstacles_*.yaml     generated — what the referee scores against (with velocities)
-worlds/                     generated — Gazebo scenes
+config/obstacles_*.yaml     generated — the referee's obstacle field
+worlds/                     generated — Gazebo scenes (ground and the vehicle; obstacles are NOT here)
 src/dsim_msgs/              the planner interface
 src/dsim_description/       generated — the Gazebo model
 src/dsim_control/           SE(3) geometric controller, mixer, test trajectories
@@ -106,10 +110,11 @@ break, so `--check` exists to catch drift.
 ```bash
 # built-in trajectories, no planner needed
 ros2 launch dsim_bringup sim.launch.py reference:=circle
-ros2 launch dsim_bringup sim.launch.py reference:=lemniscate world:=pillars
+ros2 launch dsim_bringup sim.launch.py reference:=lemniscate world:=empty
 
 # your planner drives, metrics to CSV
-ros2 launch dsim_bringup sim.launch.py world:=pillars reference:=none csv:=/ws/logs/run1.csv
+ros2 launch dsim_bringup sim.launch.py world:=fence3d plan:=/ws/plans/fence3d_seed.json \
+  csv:=/ws/logs/run1.csv
 
 # headless
 ros2 launch dsim_bringup sim.launch.py gui:=false
@@ -237,9 +242,12 @@ compares numbers produced by *different* paths, so agreement is evidence:
 On a 13° banked lap those agree to 0.15%, and dropping the `cos(tilt)` term
 makes the third one fail — so it is not vacuous.
 
-The collision detector is checked in both directions — silent in the empty
-world, and it fires in the pillar field at the geometrically predicted moment
-(0.489 m from `pillar_c`'s centre, needing 0.60 m).
+The collision detector is checked in both directions — silent on a plan that
+clears, and firing on the straight seed at the moment the arithmetic predicts.
+On `fence3d` that is sphere `F5` at t = 3.707 s, 0.70 m deep, computed three
+ways that must agree: closed form in the C++ test's comment (3.7064), Python
+in the generator, and the live C++ referee (3.67, the difference being the
+tracking error).
 
 `make verify` runs two things:
 
@@ -249,16 +257,17 @@ world, and it fires in the pillar field at the geometrically predicted moment
   overlay geometry (unrotated body vectors, a flipped aero residual, an arrow
   decoupled from its rotor, a doubly-rotated velocity), the sensor models, the
   playback pacer, the restart detector, the referee's moving-obstacle
-  clearance (velocity ignored, penetration clamped to zero, hits counted per
-  sample), the space-time conversion (dp/dtau as velocity, the t'' term
+  clearance (motion ignored, de Casteljau stopped a step early, an obstacle's
+  active window ignored, a column scored as a ball, penetration clamped to
+  zero, hits counted per sample), the space-time conversion (dp/dtau as velocity, the t'' term
   dropped, samples spaced in tau) and the solve endpoint (range checks
   dropped, the scenario or output path taken from the request, a shell), then
   fails if the tests do not notice. A green suite is only evidence if it would have gone red on a wrong
   implementation.
 
-  Currently **119 C++ + 127 Python + 13 viewer tests pass, 97/97 injected bugs
+  Currently **120 C++ + 127 Python + 15 viewer tests pass, 99/99 injected bugs
   caught, 0 skipped.** (C++: 39 control, 27 sensors, 21 estimation, 13 pacer,
-  11 referee geometry, 8 epoch. Python: 74 viewer overlay, 19 solve endpoint,
+  12 referee geometry, 8 epoch. Python: 74 viewer overlay, 19 solve endpoint,
   34 planner conversion and bridge.)
 
   Three rules keep the harness honest, all added after it lied. A mutation whose
@@ -271,6 +280,8 @@ world, and it fires in the pillar field at the geometrically predicted moment
   must be either compiled by the harness or **declared untestable on the host**,
   so that failure cannot recur quietly.
 - **`gen_assets.py --check`** — fails if any generated file drifted from source.
+  `import_scenarios.py --check` does the same one step further up, against the
+  planner's own scenario definitions.
 
 ## Scope
 
