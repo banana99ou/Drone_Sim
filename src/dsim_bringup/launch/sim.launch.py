@@ -420,8 +420,15 @@ def launch_setup(context, *args, **kwargs):
             package='dsim_viz', executable='viz_server', name='dsim_viz',
             output='screen',
             parameters=[{'use_sim_time': False}],
+            # --scenario/--plan-file enable POST /solve, which re-solves THIS
+            # scenario over THIS plan file. The bridge reloads it by mtime, so
+            # a solve lands on the running vehicle without a relaunch. Both are
+            # empty for a run with no plan, and the endpoint is then refused
+            # rather than present and useless.
             arguments=(['--port', web_port, '--bind', bind,
-                        '--directory', WEB_DIR]
+                        '--directory', WEB_DIR, '--ws', WS,
+                        '--scenario', scenario['name'] if scenario else '',
+                        '--plan-file', plan]
                        + (['--allow-control'] if control == 'true' else [])),
         ))
 

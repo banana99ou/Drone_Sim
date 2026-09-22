@@ -18,6 +18,19 @@
     font: 13px/1.45 ui-sans-serif, -apple-system, "SF Pro Text", system-ui, sans-serif; }
   #view { display: block; width: 100vw; height: 100vh; touch-action: none; cursor: grab; }
   #view.dragging { cursor: grabbing; }
+  .hint { margin-top: 8px; color: #5d647a; font-size: 10px; line-height: 1.4; }
+  .solvegrid { display: grid; grid-template-columns: 1fr 62px; gap: 5px 8px;
+               align-items: center; margin-top: 7px; }
+  .solvegrid label { color: #8b93a7; font-size: 11px; }
+  .solvegrid input { width: 100%; background: #10131a; color: #e8ecf4; font: inherit;
+                     border: 1px solid #2a2f3d; border-radius: 4px; padding: 3px 5px;
+                     font-variant-numeric: tabular-nums; }
+  .planline { color: #9aa3b8; font-size: 11px; line-height: 1.45; margin-top: 4px;
+              font-variant-numeric: tabular-nums; }
+  .planline.bad { color: #f87171; }
+  #solvelog { margin: 7px 0 0; padding: 6px; max-height: 150px; overflow: auto;
+              background: #10131a; border: 1px solid #2a2f3d; border-radius: 4px;
+              color: #9aa3b8; font-size: 10px; line-height: 1.35; white-space: pre-wrap; }
   .panel { position: fixed; background: rgba(18,21,28,.86); border: 1px solid #2a2f3d;
     border-radius: 10px; padding: 10px 12px; backdrop-filter: blur(8px); }
   #hud { top: 12px; left: 12px; min-width: 226px; }
@@ -136,8 +149,27 @@
   <label class="check"><input type="checkbox" id="gusthold"><span>hold until cleared</span></label>
   <button id="gustclear">clear gust</button>
   <hr>
+  <!-- Re-solve the scenario this run is flying. The scenario is NOT a field:
+       the Gazebo world is generated from it, so solving a different one would
+       plan against obstacles that are not here. The bridge reloads the plan
+       file by mtime, so a solve reaches the vehicle without a relaunch. -->
+  <div id="solvebox" hidden>
+    <label class="field">plan <span id="solvescen"></span></label>
+    <div class="planline" id="planline">—</div>
+    <div class="solvegrid">
+      <label for="sN">degree N</label><input type="number" id="sN" value="8" min="2" max="20" step="1">
+      <label for="sSeg">segments</label><input type="number" id="sSeg" value="2" min="1" max="16" step="1">
+      <label for="sV">v max m/s</label><input type="number" id="sV" value="3" min="0" max="20" step="0.5">
+    </div>
+    <div class="hint">v max 0 means no cap. The optimiser has no acceleration
+      cap at all, so uncapped solves can demand more tilt than the vehicle has.</div>
+    <button id="solve">solve &amp; fly</button>
+    <pre id="solvelog" hidden></pre>
+    <hr>
+  </div>
   <button id="reset">recentre view</button>
   <button id="clear">clear trails</button>
+  <div class="hint">drag orbits · right-drag, shift-drag or two fingers pan · wheel or pinch zooms</div>
 </div>
 
 <div id="legend" class="panel"></div>

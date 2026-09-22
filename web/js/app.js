@@ -32,6 +32,20 @@ import { Telemetry } from "./telemetry.js";
 const TRAIL_MAX = 4000;                 // ~2 min of trail at 30 Hz
 const BACKGROUND = "#0d0f14";
 const CAM_HOME = { az: -0.9, el: 0.42, dist: 11, target: [0, 0, 1.0] };
+
+/// Where "recentre" looks: the origin for the built-in courses, the middle
+/// of the plan for a scenario world (it has a start and an end), zoomed out
+/// enough to see both. fence3d's action is around (5, 5), and the default
+/// home put its whole fence off the right edge of the screen.
+function homeFor(world) {
+  const home = { ...CAM_HOME, target: CAM_HOME.target.slice() };
+  if (world && world.start && world.end) {
+    home.target = [0, 1, 2].map((i) => 0.5 * (world.start[i] + world.end[i]));
+    home.dist = Math.max(11, 1.5 * Math.hypot(
+      world.end[0] - world.start[0], world.end[1] - world.start[1]));
+  }
+  return home;
+}
 const PREFS_KEY = "dsim.prefs";
 
 const el = (id) => document.getElementById(id);
@@ -44,6 +58,7 @@ const S = {
   control: null,
   overlay: null,
   sim: null,
+  solver: null,        // the planner panel: what can be solved, and what is loaded
   clearance: null,     // the referee's obstacle report: live positions, hits
   planPath: null,      // the planner's whole path, before it is flown
   flown: [],
@@ -83,8 +98,18 @@ function savePrefs() {
 }
 
 // ---- incoming state ------------------------------------------------------
+let lastStreamT = null;
 function ingest(snap) {
   if (!snap) return;
+  // Simulated time going backwards is a reset, whoever asked for it -- this
+  // page's button, another tab, or a gate script. The trails belong to the
+  // run that just ended. Clearing only on this page's own button left a
+  // reset from anywhere else drawing the old run's path under the new one.
+  if (typeof snap.t === "number" && lastStreamT !== null && snap.t < lastStreamT - 0.5) {
+    S.flown = [];
+    S.planned = [];
+  }
+  if (typeof snap.t === "number") lastStreamT = snap.t;
   if (snap.pose) {
     const p = snap.pose.p;
     const last = S.flown[S.flown.length - 1];
@@ -110,6 +135,7 @@ function ingest(snap) {
   if (snap.plan_path !== undefined) S.planPath = snap.plan_path;
   if (snap.overlay !== undefined) S.overlay = snap.overlay;
   if (snap.sim) S.sim = snap.sim;
+  if (snap.solver !== undefined) S.solver = snap.solver;
 }
 
 // ---- frame rate ----------------------------------------------------------
@@ -359,6 +385,8 @@ function updateHudOnce() {
     el("gust").className = mag < 1e-6 ? "" : "bad";
   }
 
+  updateSolvePanel();
+
   const st = S.status;
   if (st) {
     // Already in centimetres when it arrives: the page does not convert
@@ -394,6 +422,41 @@ function updateHudOnce() {
     el("wmm").className = mm === null ? (moving ? "bad" : "") : (mm > 0.02 ? "bad" : "good");
     el("stime").textContent = fmt(cl.scenario_time_s, " s", 1);
   }
+}
+
+/// The plan panel: shown only when this run is actually flying a plan.
+/// Describing the loaded plan is the point -- "certified +0.22 m, needs 10 deg
+/// of tilt" is what makes the solve knobs mean something, and a plan the
+/// vehicle cannot fly says so in red rather than being discovered as a
+/// mysterious 90 cm of tracking error.
+function updateSolvePanel() {
+  const sv = S.solver;
+  const box = el("solvebox");
+  if (!sv || !sv.enabled) { box.hidden = true; return; }
+  box.hidden = false;
+  el("solvescen").textContent = `· ${sv.scenario}`;
+  const p = sv.plan;
+  const line = el("planline");
+  if (!p) {
+    line.textContent = "no plan loaded";
+    line.className = "planline";
+    return;
+  }
+  const bits = [];
+  if (p.config) bits.push(p.config);
+  if (p.predicted_clearance_m !== null && p.predicted_clearance_m !== undefined) {
+    bits.push(`clearance ${p.predicted_clearance_m >= 0 ? "+" : ""}${p.predicted_clearance_m.toFixed(3)} m`);
+  }
+  if (p.max_speed_mps !== null && p.max_speed_mps !== undefined) {
+    bits.push(`${p.max_speed_mps.toFixed(2)} m/s`);
+  }
+  if (p.max_tilt_deg !== null && p.max_tilt_deg !== undefined) {
+    bits.push(`${p.max_tilt_deg.toFixed(1)}° tilt` +
+      (p.tilt_limit_deg ? ` of ${p.tilt_limit_deg.toFixed(0)}°` : ""));
+  }
+  if (p.flyable === false) bits.push("NOT FLYABLE");
+  line.textContent = bits.join(" · ");
+  line.className = p.flyable === false ? "planline bad" : "planline";
 }
 
 // ---- controls ------------------------------------------------------------
@@ -442,10 +505,14 @@ function bindInput() {
 
   let drag = null;
   canvas.addEventListener("pointerdown", (e) => {
-    drag = { x: e.clientX, y: e.clientY, pan: e.shiftKey };
+    // Left drag orbits; right or middle drag pans, and so does shift+left
+    // for a trackpad with one button. Shift alone was the only way before,
+    // and nothing on the page said so.
+    drag = { x: e.clientX, y: e.clientY, pan: e.shiftKey || e.button === 1 || e.button === 2 };
     canvas.classList.add("dragging");
     canvas.setPointerCapture(e.pointerId);
   });
+  canvas.addEventListener("contextmenu", (e) => e.preventDefault());
   canvas.addEventListener("pointermove", (e) => {
     if (!drag) return;
     const dx = e.clientX - drag.x;
@@ -477,14 +544,24 @@ function bindInput() {
   const spread = (e) => Math.hypot(
     e.touches[0].clientX - e.touches[1].clientX,
     e.touches[0].clientY - e.touches[1].clientY);
+  const centre = (e) => [
+    0.5 * (e.touches[0].clientX + e.touches[1].clientX),
+    0.5 * (e.touches[0].clientY + e.touches[1].clientY)];
   canvas.addEventListener("touchstart", (e) => {
-    if (e.touches.length === 2) pinch = spread(e);
+    if (e.touches.length === 2) pinch = { d: spread(e), c: centre(e) };
   });
   canvas.addEventListener("touchmove", (e) => {
     if (e.touches.length === 2 && pinch) {
+      // Two fingers: the spread zooms, the centroid pans. Before, two fingers
+      // could only zoom and there was no way to pan on a phone at all.
       const d = spread(e);
-      zoom(pinch / d);
-      pinch = d;
+      const c = centre(e);
+      zoom(pinch.d / d);
+      const k = cam.dist * 0.0016;
+      const v = renderer.view || { right: [1, 0, 0], up: [0, 0, 1] };
+      cam.target = add(cam.target,
+        add(scale(v.right, -(c[0] - pinch.c[0]) * k), scale(v.up, (c[1] - pinch.c[1]) * k)));
+      pinch = { d, c };
       e.preventDefault();
     }
   }, { passive: false });
@@ -537,11 +614,47 @@ function bindInput() {
   el("gustclear").onclick = () => post({ clear_gust: true });
 
   el("reset").onclick = () => {
-    cam = { ...CAM_HOME, target: CAM_HOME.target.slice() };
+    cam = homeFor(S.scene && S.scene.worlds[S.world]);
   };
   el("clear").onclick = () => { S.flown = []; S.planned = []; };
+
+  // Solving goes to its OWN endpoint, not /control. The simulator's write
+  // path is documented as unable to run a command; this one runs the
+  // optimiser, and keeping them apart is what keeps that sentence true.
+  el("solve").onclick = () => {
+    const btn = el("solve");
+    const log = el("solvelog");
+    btn.disabled = true;
+    btn.textContent = "solving…";
+    log.hidden = false;
+    log.textContent = "solving…";
+    fetch("/solve", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        N: Number(el("sN").value),
+        n_seg: Number(el("sSeg").value),
+        v_max: Number(el("sV").value),
+      }),
+    }).then((r) => r.json()).then((r) => {
+      if (r.error) {
+        log.textContent = r.error;
+        hudError = "solve refused";
+      } else {
+        S.solver = r;
+        hudError = "";
+        // The trails belong to the plan that was flying; the new one is a
+        // different path through the same fence.
+        S.flown = [];
+        S.planned = [];
+        log.textContent = (r.last && r.last.log) || r.message || "solved";
+      }
+    }).catch((e) => { log.textContent = `solve: ${e.message}`; })
+      .finally(() => { btn.disabled = false; btn.textContent = "solve & fly"; });
+  };
   el("world").onchange = (e) => {
     S.world = e.target.value;
+    cam = homeFor(S.scene && S.scene.worlds[S.world]);
     savePrefs();
   };
 }
@@ -571,6 +684,7 @@ function loadScene() {
             S.world = cur.world;
             sel.value = S.world;
           }
+          cam = homeFor(scene.worlds[S.world]);
         })
         .catch(() => { /* viz launched without it; the dropdown stays manual */ });
     })

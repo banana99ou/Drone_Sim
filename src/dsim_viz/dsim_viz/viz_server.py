@@ -40,8 +40,12 @@ Endpoints, all on one port and one origin:
     /snapshot      one JSON object with the latest state  (curl-friendly)
     /state         text/event-stream, ~30 Hz of the same object
     /control       POST: pause, playback speed, reset, gust  (see simcontrol.py)
+    /solve         POST: re-solve the running scenario         (see solver.py)
 
-Almost read-only. Every GET is; /control is the single write path. It forwards
+Almost read-only. Every GET is. There are two write paths, kept apart on
+purpose: /control reaches the simulator, /solve reaches the planner and
+nothing else. Widening /control to run the solver would have falsified the
+paragraph below while leaving it on the page. It forwards
 to one ROS service with four commands -- pause, toggle pause, speed, reset --
 and can express nothing else. It cannot arm a vehicle, retune a controller,
 move the drone or run a command. That narrowness is the point: this port is
@@ -74,6 +78,7 @@ from nav_msgs.msg import Path
 
 from . import overlay
 from .simcontrol import UNKNOWN, ControlError, SimControlClient
+from .solver import SolveError, Solver
 
 
 def _v3(v):
@@ -113,6 +118,9 @@ class State:
         # a copy, forgot to refresh it, and the viewer reported "waiting for
         # the simulation control node" while the node published happily.
         self.sim_source = lambda: dict(UNKNOWN)
+        # Read through like sim_source, and for the same reason: the plan on
+        # disk changes without any message arriving here.
+        self.solver_source = lambda: None
         self._cache = None
         self._cache_seq = -1
 
@@ -129,7 +137,8 @@ class State:
             if self._cache_seq == self.seq:
                 # The memo holds vehicle state; the simulator's pause/speed
                 # arrives on its own topic, so it is read fresh here.
-                return dict(self._cache, sim=self.sim_source())
+                return dict(self._cache, sim=self.sim_source(),
+                            solver=self.solver_source())
             seq, odom, sp = self.seq, self.odom, self.setpoint
             status, control, imu = self.status, self.control, self.imu
             consumed = self.consumed
@@ -159,7 +168,7 @@ class State:
             # the memo is only valid for the seq it was built from.
             if self._cache_seq < seq:
                 self._cache, self._cache_seq = snap, seq
-            snap = dict(snap, sim=self.sim_source())
+            snap = dict(snap, sim=self.sim_source(), solver=self.solver_source())
         return snap
 
 
@@ -372,6 +381,7 @@ class VizNode(Node):
 class Handler(SimpleHTTPRequestHandler):
     state = None          # set via partial()
     sim_control = None    # set via partial()
+    solver = None         # set via partial()
     logger = None         # set via partial(): the node's logger
     rate_hz = 30.0
     # Refuse a body larger than this outright. The only legitimate request is a
@@ -411,25 +421,37 @@ class Handler(SimpleHTTPRequestHandler):
         self.wfile.write(body)
 
     def _audit(self, outcome, detail=""):
-        """One line per write attempt, whatever the outcome."""
+        """One line per write attempt, whatever the outcome.
+
+        The route is part of the detail the callers pass, so this says which
+        write path was used -- it hard-coded "/control" while logging /solve
+        requests, which is exactly the kind of log that makes an incident
+        harder to reconstruct rather than easier.
+        """
         if self.logger is not None:
             self.logger.info(
-                f"/control from {self.client_address[0]}: {outcome}"
+                f"write from {self.client_address[0]}: {outcome}"
                 + (f" — {detail}" if detail else ""))
 
     def do_POST(self):
-        """The one write path: pause, playback speed and reset.
+        """The write paths: /control drives the simulator, /solve the planner.
 
-        Everything the request can express is parsed in simcontrol.py and
-        applied by dsim_simctl, and the reply reports what was OBSERVED
-        afterwards rather than what was asked for.
+        Everything a /control request can express is parsed in simcontrol.py
+        and applied by dsim_simctl, and the reply reports what was OBSERVED
+        afterwards rather than what was asked for. /solve is in solver.py and
+        can express three range-checked numbers.
         """
-        if self.path.split("?")[0] != "/control":
+        route = self.path.split("?")[0]
+        if route not in ("/control", "/solve"):
             self._json({"error": "not found"}, 404)
             return
-        if self.sim_control is None or not self.sim_control.enabled:
+        if route == "/control" and (self.sim_control is None or not self.sim_control.enabled):
             self._audit("refused", "control disabled")
             self._json({"error": "simulation control is disabled"}, 403)
+            return
+        if route == "/solve" and (self.solver is None or not self.solver.enabled):
+            self._audit("refused", "solving disabled")
+            self._json({"error": "this run has no plan to re-solve"}, 403)
             return
 
         # Require a JSON content type. This is not pedantry: without it the
@@ -465,15 +487,16 @@ class Handler(SimpleHTTPRequestHandler):
             return
 
         try:
-            result = self.sim_control.command(body)
-        except ControlError as exc:
+            result = (self.sim_control.command(body) if route == "/control"
+                      else self.solver.solve(body))
+        except (ControlError, SolveError) as exc:
             # A refused request is a normal outcome, not a server fault: 400 so
             # the page can show the reason instead of a generic failure.
-            self._audit("refused", f"{body} — {exc}")
+            self._audit("refused", f"{route} {body} — {exc}")
             self._json({"error": str(exc)}, 400)
             return
 
-        self._audit("applied", f"{body} — {result.get('message', '')}")
+        self._audit("applied", f"{route} {body} — {result.get('message', '')}")
         self._json(result)
 
     def do_GET(self):
@@ -519,7 +542,13 @@ def main():
     # No --world-name: this process no longer talks to Gazebo at all. The world
     # name belongs to dsim_simctl, which is the only thing that does.
     parser.add_argument("--allow-control", action="store_true",
-                        help="expose POST /control (pause, speed, reset)")
+                        help="expose POST /control (pause, speed, reset) and, "
+                             "when this run is flying a plan, POST /solve")
+    parser.add_argument("--scenario", default="",
+                        help="the space-time scenario this run is flying, if any")
+    parser.add_argument("--plan-file", default="",
+                        help="the plan file the bridge reads; /solve overwrites it")
+    parser.add_argument("--ws", default="/ws", help="workspace root, for the solver")
     args, ros_args = parser.parse_known_args()
 
     rclpy.init(args=ros_args)
@@ -534,8 +563,13 @@ def main():
     sim_control = SimControlClient(node, enabled=bool(args.allow_control))
     state.sim_source = lambda: sim_control.state
 
+    solver = Solver(args.ws, args.scenario, args.plan_file,
+                    enabled=bool(args.allow_control))
+    state.solver_source = lambda: solver.state
+
     Handler.state = state
     Handler.sim_control = sim_control
+    Handler.solver = solver
     Handler.logger = node.get_logger()
     Handler.rate_hz = args.rate
     handler = partial(Handler, directory=args.directory)
@@ -547,7 +581,8 @@ def main():
     node.get_logger().info(
         f"viewer on http://{args.bind}:{args.port}  "
         f"(static {args.directory}, SSE /state at {args.rate:.0f} Hz, "
-        f"control {'ON' if args.allow_control else 'OFF'})")
+        f"control {'ON' if args.allow_control else 'OFF'}, "
+        f"solve {'ON for ' + args.scenario if solver.enabled else 'OFF'})")
 
     try:
         rclpy.spin(node)
