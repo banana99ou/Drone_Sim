@@ -22,7 +22,8 @@
 //   app.js        state, HUD, input, the frame loop       (this file)
 
 import { add, scale } from "./vec3.js";
-import { boxFaces, cylinderFaces, droneFaces } from "./shapes.js";
+import { boxFaces, cylinderFaces, droneFaces, sphereFaces, obstaclePositions, hitMarkers }
+  from "./shapes.js";
 import { GROUP_LABEL, LEGEND, PALETTE, TICK_COLOUR, colourFor, widthFor }
   from "./palette.js";
 import { Renderer } from "./render.js";
@@ -43,6 +44,8 @@ const S = {
   control: null,
   overlay: null,
   sim: null,
+  clearance: null,     // the referee's obstacle report: live positions, hits
+  planPath: null,      // the planner's whole path, before it is flown
   flown: [],
   planned: [],
 };
@@ -103,6 +106,8 @@ function ingest(snap) {
   }
   if (snap.status) S.status = snap.status;
   if (snap.control) S.control = snap.control;
+  if (snap.clearance !== undefined) S.clearance = snap.clearance;
+  if (snap.plan_path !== undefined) S.planPath = snap.plan_path;
   if (snap.overlay !== undefined) S.overlay = snap.overlay;
   if (snap.sim) S.sim = snap.sim;
 }
@@ -177,19 +182,29 @@ function renderOnce() {
 
   const faces = [];
   const world = S.scene.worlds[S.world] || { obstacles: [] };
+  // Moving obstacles are drawn where the REFEREE says they are now, not at
+  // the scene file's t=0 pose: the referee's report is the same pos0 + vel*t
+  // it scores against, so what you see hit is what was scored as a hit.
+  const live = obstaclePositions(S.clearance);
   for (const o of world.obstacles) {
-    const [x, y, z] = o.pose;
+    const [x, y, z] = live[o.name] || o.pose;
     const [sx, sy, sz] = o.size;
-    faces.push(...(o.type === "cylinder"
-      ? cylinderFaces(x, y, z, sx, sz, "#8d5a3c", cam.az)
-      : boxFaces(x, y, z, sx, sy, sz, "#8d5a3c")));
+    if (o.type === "sphere") {
+      faces.push(...sphereFaces(x, y, z, sx, o.color || "#e67e22", cam.az));
+    } else if (o.type === "cylinder") {
+      faces.push(...cylinderFaces(x, y, z, sx, sz, "#8d5a3c", cam.az));
+    } else {
+      faces.push(...boxFaces(x, y, z, sx, sy, sz, "#8d5a3c"));
+    }
   }
   faces.push(...droneFaces(S.pose, S.scene.drone));
   renderer.faces(faces);
 
+  if (S.planPath) renderer.polyline(S.planPath, "rgba(250,204,21,.7)", 1.5, true);
   renderer.polyline(S.planned, "rgba(248,113,113,.85)", 2, true);
   renderer.polyline(S.flown, "rgba(96,165,250,.95)", 2, false);
   if (S.pose) renderer.envelope(S.pose, S.scene.drone.radius);
+  renderer.segments(hitMarkers(S.clearance));
 
   const draw = overlayToDraw();
   renderer.segments(draw.ticks);
@@ -356,6 +371,28 @@ function updateHudOnce() {
     el("col").textContent = st.collided ? `HIT (${st.collision_count})` : "clear";
     el("col").className = st.collided ? "bad" : "good";
     el("ela").textContent = fmt(st.elapsed_s, " s", 1);
+  }
+
+  const cl = S.clearance;
+  if (cl) {
+    // Live clearance and who is nearest, so a shrinking margin can be
+    // watched before it goes negative.
+    el("clrnow").textContent = cl.clearance_m === null
+      ? "n/a" : `${fmt(cl.clearance_m, " m")} · ${cl.nearest}`;
+    el("clrnow").className = cl.clearance_m !== null && cl.clearance_m < 0 ? "bad" : "";
+    const last = cl.hits[cl.hits.length - 1];
+    el("hit").textContent = last
+      ? `${last.with} @ (${last.pos.map((v) => v.toFixed(2)).join(", ")}) t=${last.t.toFixed(2)} s`
+      : "none";
+    el("hit").className = last ? "bad" : "good";
+    // Does the physics agree with the referee about where the fence is?
+    // null means no pose for a moving obstacle has arrived -- in a scenario
+    // world that is a broken bridge, not a clean bill.
+    const mm = cl.world_mismatch_m;
+    const moving = cl.obstacles.length > 0;
+    el("wmm").textContent = mm === null ? (moving ? "unheard" : "n/a") : fmt(1000 * mm, " mm", 1);
+    el("wmm").className = mm === null ? (moving ? "bad" : "") : (mm > 0.02 ? "bad" : "good");
+    el("stime").textContent = fmt(cl.scenario_time_s, " s", 1);
   }
 }
 

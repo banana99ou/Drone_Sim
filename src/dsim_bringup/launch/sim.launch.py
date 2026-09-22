@@ -3,6 +3,7 @@
     ros2 launch dsim_bringup sim.launch.py
     ros2 launch dsim_bringup sim.launch.py world:=pillars reference:=none
     ros2 launch dsim_bringup sim.launch.py state:=truth gui:=false
+    ros2 launch dsim_bringup sim.launch.py world:=fence3d plan:=/ws/plans/fence3d_seed.json
 
 Vehicle parameters are read from ONE file (config/drone.yaml) and handed to
 every node that needs them, so the controller, the referee and the Gazebo model
@@ -27,6 +28,7 @@ from launch_ros.actions import Node
 WS = os.environ.get('DSIM_WS', '/ws')
 CONFIG_DIR = os.path.join(WS, 'config')
 WORLD_DIR = os.path.join(WS, 'worlds')
+SCENARIO_DIR = os.path.join(WS, 'scenarios')
 WEB_DIR = os.path.join(WS, 'web')
 
 
@@ -171,6 +173,46 @@ def launch_setup(context, *args, **kwargs):
             'estimate from. Either enable the sensors or fly on ground truth '
             'explicitly with state:=truth.')
 
+    # ---- a planner's trajectory ------------------------------------------
+    # plan:= names a file of space-time control points (see plans/). The plan
+    # declares which scenario it solves, and the scenario IS the world: the
+    # obstacles the planner avoided are the ones worlds/<scenario>.sdf moves
+    # and config/obstacles_<scenario>.yaml scores. Flying a plan in any other
+    # world would be measuring it against obstacles it never saw, so that is
+    # refused rather than allowed to produce a number.
+    plan = LaunchConfiguration('plan').perform(context)
+    scenario = None
+    if plan:
+        with open(plan) as fh:
+            plan_doc = json.load(fh)
+        scenario_name = plan_doc.get('scenario')
+        scenario_file = os.path.join(SCENARIO_DIR, f'{scenario_name}.json')
+        if not scenario_name or not os.path.exists(scenario_file):
+            raise RuntimeError(
+                f'{plan} names scenario {scenario_name!r} but {scenario_file} does not exist')
+        with open(scenario_file) as fh:
+            scenario = json.load(fh)
+        if world != scenario_name:
+            raise RuntimeError(
+                f'plan {plan} solves scenario {scenario_name!r}; launch it with '
+                f'world:={scenario_name}, not world:={world}')
+        if reference != 'none':
+            # Two publishers on /drone/trajectory would take turns owning the
+            # vehicle. The plan wins; say so rather than silently dropping one.
+            print(f'[sim.launch] plan:= given, ignoring reference:={reference} '
+                  f'(the plan is the reference)')
+            reference = 'none'
+
+    # The moving obstacles of this world, if any, by name: the bridge carries
+    # one pose topic for each and the referee listens to the same list, both
+    # read from the generated config/obstacles_<world>.yaml.
+    obstacles_file = os.path.join(CONFIG_DIR, f'obstacles_{world}.yaml')
+    moving_obstacles = []
+    if os.path.exists(obstacles_file):
+        obs = _load_yaml(obstacles_file)['/**']['ros__parameters']['obstacles']
+        moving_obstacles = [n for n in obs['names']
+                            if any(float(v) != 0.0 for v in obs[n].get('vel', [0, 0, 0]))]
+
     vehicle, raw_cfg = _vehicle_params()
     gains = _load_yaml(
         os.path.join(get_package_share_directory('dsim_bringup'),
@@ -199,10 +241,21 @@ def launch_setup(context, *args, **kwargs):
             '/drone/command/motor_speed@actuator_msgs/msg/Actuators]gz.msgs.Actuators',
             f'{contact_topic}@ros_gz_interfaces/msg/Contacts[gz.msgs.Contacts',
             '/drone/imu@sensor_msgs/msg/Imu[gz.msgs.IMU',
+        ] + [
+            # Where Gazebo says each MOVING obstacle is (OdometryPublisher in
+            # the generated world, 20 Hz). The referee holds these against its
+            # own pos0 + vel*t; see ClearanceReport.world_mismatch_m. One
+            # topic per body because the world-wide Pose_V loses the names in
+            # the bridge, and a pose with no name cannot be checked.
+            f'/model/{name}/odometry@nav_msgs/msg/Odometry[gz.msgs.Odometry'
+            for name in moving_obstacles
         ],
         remappings=[
             ('/model/drone/odometry_truth', '/drone/truth'),
             (contact_topic, '/drone/contacts'),
+        ] + [
+            (f'/model/{name}/odometry', f'/drone/obstacle_pose/{name}')
+            for name in moving_obstacles
         ],
         parameters=[{'use_sim_time': True}],
     )
@@ -251,7 +304,6 @@ def launch_setup(context, *args, **kwargs):
         'vehicle.motor_constant': vehicle['vehicle.motor_constant'],
         'csv_path': csv_path,
     }]
-    obstacles_file = os.path.join(CONFIG_DIR, f'obstacles_{world}.yaml')
     if os.path.exists(obstacles_file):
         eval_params.append(obstacles_file)
     referee = Node(
@@ -293,6 +345,19 @@ def launch_setup(context, *args, **kwargs):
                          'period_s': float(period)}],
         ))
 
+    # ---- the planner bridge -----------------------------------------------
+    # Samples the plan uniform in time and publishes it as /drone/trajectory,
+    # stamped to start at the scenario's sim-time origin. See
+    # dsim_planner/bridge_node.py for why it republishes.
+    if scenario is not None:
+        nodes.append(Node(
+            package='dsim_planner', executable='bridge_node', name='dsim_planner_bridge',
+            output='screen',
+            parameters=[{'use_sim_time': False,
+                         'plan_file': plan,
+                         'start_s': float(scenario['sim']['start_s'])}],
+        ))
+
     # ---- the one write path into the simulator ----------------------------
     # Separate from the viewer on purpose. It owns a persistent gz-transport
     # connection, and it is the only thing in the system that sends Gazebo a
@@ -318,7 +383,8 @@ def launch_setup(context, *args, **kwargs):
     if viz == 'true':
         try:
             with open(os.path.join(WEB_DIR, 'current.json'), 'w') as fh:
-                json.dump({'world': world, 'reference': reference}, fh)
+                json.dump({'world': world, 'reference': reference,
+                           'plan': os.path.basename(plan) if plan else None}, fh)
         except OSError as exc:
             print(f'[sim.launch] could not write current.json: {exc}')
 
@@ -376,7 +442,8 @@ def generate_launch_description():
         get_package_share_directory('dsim_description'), 'models')
     return LaunchDescription([
         DeclareLaunchArgument('world', default_value='empty',
-                              description='world file stem in worlds/ (empty, pillars)'),
+                              description='world file stem in worlds/ (empty, '
+                                          'pillars, or a scenario such as fence3d)'),
         DeclareLaunchArgument('gui', default_value='true',
                               description='run the Gazebo GUI'),
         DeclareLaunchArgument('reference', default_value='circle',
@@ -436,6 +503,11 @@ def generate_launch_description():
                               'it LOOKS like nothing on screen. r=2 m at '
                               'T=4.5 s is 39 deg, right at the tilt clamp, '
                               'with the rotor thrusts visibly split.'),
+        DeclareLaunchArgument('plan', default_value='',
+                              description='a space-time plan to fly: a JSON file '
+                              'of (x, y, z, t) control points that names its '
+                              'scenario (see plans/ and scenarios/). Requires '
+                              'world:=<that scenario>; overrides reference:=.'),
         DeclareLaunchArgument('csv', default_value='',
                               description='path to write per-step metrics, e.g. /ws/logs/run.csv'),
         SetEnvironmentVariable('GZ_SIM_RESOURCE_PATH',

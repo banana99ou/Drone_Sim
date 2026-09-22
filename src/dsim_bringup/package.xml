@@ -10,6 +10,11 @@
   <exec_depend>ros_gz_bridge</exec_depend>
   <exec_depend>dsim_control</exec_depend>
   <exec_depend>dsim_eval</exec_depend>
+  <exec_depend>dsim_planner</exec_depend>
+  <exec_depend>dsim_estimation</exec_depend>
+  <exec_depend>dsim_sensors</exec_depend>
+  <exec_depend>dsim_simctl</exec_depend>
+  <exec_depend>dsim_viz</exec_depend>
   <exec_depend>dsim_description</exec_depend>
   <exec_depend>rviz2</exec_depend>
   <export><build_type>ament_cmake</build_type></export>

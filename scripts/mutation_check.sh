@@ -32,6 +32,8 @@ sources_dsim_time=""                                     # header-only
 untestable_dsim_time=""
 sources_dsim_estimation="src/attitude_filter.cpp src/velocity_filter.cpp"
 untestable_dsim_estimation=""
+sources_dsim_eval=""                                     # header-only geometry
+untestable_dsim_eval=""                                  # (the nodes are *_node.cpp)
 
 audit_sources() {   # $1 = package
   local pkg="$1" listed found missing=0
@@ -111,6 +113,7 @@ check_baseline dsim_control test/test_control.cpp || baseline=BAD
 check_baseline dsim_simctl test/test_pacer.cpp    || baseline=BAD
 check_baseline dsim_time   test/test_sim_epoch.cpp || baseline=BAD
 check_baseline dsim_estimation test/test_estimation.cpp || baseline=BAD
+check_baseline dsim_eval   test/test_obstacle.cpp || baseline=BAD
 if [ "$baseline" != "ALL_PASS" ]; then
   # Without this guard every mutation below is "caught" by the same build
   # failure, and the script reports teeth it does not have. That happened the
@@ -293,6 +296,58 @@ PKG=dsim_control
 TEST=test/test_control.cpp
 
 # ---------------------------------------------------------------------------
+# The referee's clearance. This is the number that says whether a plan hit
+# something, so a bug here is a plan graded wrong in whichever direction the
+# bug points: a clamp that hides penetration, a velocity that is ignored so
+# the fence is scored where it was ten seconds ago, a hit counted five hundred
+# times or never cleared.
+# ---------------------------------------------------------------------------
+PKG=dsim_eval
+TEST=test/test_obstacle.cpp
+
+run_mutation "obstacle velocity ignored (scored where it was at t=0)" \
+  "include/dsim_eval/obstacle.hpp" \
+  "    cx = x + vx * t; cy = y + vy * t; cz = z + vz * t;" \
+  "    cx = x; cy = y; cz = z;"
+
+run_mutation "sphere distance clamped at zero (penetration reads as a graze)" \
+  "include/dsim_eval/obstacle.hpp" \
+  "      return std::sqrt(dx * dx + dy * dy + dz * dz) - sx;" \
+  "      return std::max(0.0, std::sqrt(dx * dx + dy * dy + dz * dz) - sx);"
+
+run_mutation "vehicle radius not subtracted from the clearance" \
+  "include/dsim_eval/obstacle.hpp" \
+  "      const double c = obstacles_[i].signedDistance(px, py, pz, t) - radius_;" \
+  "      const double c = obstacles_[i].signedDistance(px, py, pz, t);"
+
+run_mutation "a hit recorded on every sample inside, not once per entry" \
+  "include/dsim_eval/obstacle.hpp" \
+  "        if (!inside_[i]) {" \
+  "        if (true) {"
+
+run_mutation "leaving an obstacle never clears the inside flag (no re-entry)" \
+  "include/dsim_eval/obstacle.hpp" \
+  "      } else {
+        inside_[i] = false;
+      }" \
+  "      } else {
+      }"
+
+run_mutation "box signed distance loses its sign inside" \
+  "include/dsim_eval/obstacle.hpp" \
+  "    return std::max({ex, ey, ez});" \
+  "    return 0.0;"
+
+run_mutation "reset keeps the old hits" \
+  "include/dsim_eval/obstacle.hpp" \
+  "    hits_.clear();
+    std::fill(inside_.begin(), inside_.end(), false);" \
+  "    std::fill(inside_.begin(), inside_.end(), false);"
+
+PKG=dsim_control
+TEST=test/test_control.cpp
+
+# ---------------------------------------------------------------------------
 # The overlay geometry the browser draws lives on the ROS side (all logic does),
 # so it gets the same treatment. An arrow pointing the wrong way is worse than a
 # blank screen: it is confidently wrong, and it sends you looking for the bug in
@@ -324,6 +379,41 @@ open(p, "w").write(t.replace(a, b, 1))
 
 run_py_mutation() {
   mutate_py "$@"
+  local rc=$?
+  [ $rc -eq 2 ] && survivors=$((survivors+1))
+  [ $rc -eq 1 ] && skipped=$((skipped+1))
+  return 0
+}
+
+# Same treatment for the planner bridge's conversion (src/dsim_planner). The
+# tests there compare analytic derivatives against finite differences in
+# time, which is the one comparison a chain-rule slip cannot pass.
+mutate_planner() {  # $1 = name, $2 = from, $3 = to
+  local name="$1" from="$2" to="$3"
+  rm -rf "$WORK/planner"; cp -r src/dsim_planner "$WORK/planner"
+  find "$WORK/planner" -name __pycache__ -type d -exec rm -rf {} + 2>/dev/null
+  local target="$WORK/planner/dsim_planner/spacetime.py"
+  if ! grep -qF -- "$from" "$target"; then
+    echo "  [SKIP]     $name  (pattern not found -- code changed, update this script)"
+    return 1
+  fi
+  python3 -c '
+import sys
+p, a, b = sys.argv[1], sys.argv[2], sys.argv[3]
+t = open(p).read()
+open(p, "w").write(t.replace(a, b, 1))
+' "$target" "$from" "$to"
+  if PYTHONPATH="$WORK/planner" python3 -m pytest -x -q "$WORK/planner/test/test_spacetime.py" \
+       >"$WORK/py.log" 2>&1; then
+    echo "  [SURVIVED] $name  <-- BUG: this error would pass the test suite"
+    return 2
+  fi
+  echo "  [CAUGHT]   $name  -> $(grep -oE '[0-9]+ failed' "$WORK/py.log" | head -1)"
+  return 0
+}
+
+run_planner_mutation() {
+  mutate_planner "$@"
   local rc=$?
   [ $rc -eq 2 ] && survivors=$((survivors+1))
   [ $rc -eq 1 ] && skipped=$((skipped+1))
@@ -419,6 +509,57 @@ run_py_mutation "torque labelled in newton-metres at two decimals" \
   "            f'{_norm(tau):.{LABEL_DECIMALS}f} N.m'))"
 
 echo
+
+# ---------------------------------------------------------------------------
+# The space-time Bezier conversion. tau is not time; every one of these is
+# the mistake of forgetting that in one place.
+# ---------------------------------------------------------------------------
+echo
+echo "baseline (unmutated planner conversion):"
+rm -rf "$WORK/planner"; cp -r src/dsim_planner "$WORK/planner"
+find "$WORK/planner" -name __pycache__ -type d -exec rm -rf {} + 2>/dev/null
+if PYTHONPATH="$WORK/planner" python3 -m pytest -q "$WORK/planner/test/test_spacetime.py" \
+     >"$WORK/py.log" 2>&1; then
+  echo "  ALL_PASS  (expected)"
+else
+  echo "  BASELINE FAILS -- fix that before trusting anything below"
+  tail -5 "$WORK/py.log"
+  exit 1
+fi
+
+echo
+echo "injected planner-conversion bugs:"
+
+run_planner_mutation "dp/dtau reported as the velocity" \
+  "    vel = [dp[i] / tdot for i in range(3)]" \
+  "    vel = [dp[i] for i in range(3)]"
+
+run_planner_mutation "acceleration drops the d2t/dtau2 term" \
+  "    acc = [(ddp[i] * tdot - dp[i] * tddot) / tdot ** 3 for i in range(3)]" \
+  "    acc = [ddp[i] / tdot ** 2 for i in range(3)]"
+
+run_planner_mutation "time inverted as if it were linear in tau" \
+  "    lo, hi = 0.0, 1.0
+    for _ in range(iters):" \
+  "    return (t - t0) / (t1 - t0)
+    for _ in range(iters):"
+
+run_planner_mutation "derivative control points without the degree factor" \
+  "    return [[n * (b - a) for a, b in zip(P[i], P[i + 1])] for i in range(n)]" \
+  "    return [[(b - a) for a, b in zip(P[i], P[i + 1])] for i in range(n)]"
+
+run_planner_mutation "monotonic time no longer required" \
+  "        if not P[i + 1][3] > P[i][3]:" \
+  "        if False:"
+
+run_planner_mutation "the arrival sample dropped" \
+  "    out.append((t1, *sample_at_time(P, t1)))
+    return out" \
+  "    return out"
+
+run_planner_mutation "samples spaced in tau instead of time" \
+  "        out.append((t, *sample_at_time(P, t)))" \
+  "        out.append((de_casteljau(P, k * dt / (t1 - t0))[3], *sample_at_time(P, de_casteljau(P, k * dt / (t1 - t0))[3])))"
 
 # ---------------------------------------------------------------------------
 # The sensor models get the same treatment, and for a specific reason: a cold

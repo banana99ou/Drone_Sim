@@ -66,10 +66,11 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 import rclpy
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
+from rclpy.qos import DurabilityPolicy, QoSProfile, qos_profile_sensor_data
 from sensor_msgs.msg import Imu
 
-from dsim_msgs.msg import ControlDebug, FlightStatus, TrajectorySetpoint
+from dsim_msgs.msg import ClearanceReport, ControlDebug, FlightStatus, TrajectorySetpoint
+from nav_msgs.msg import Path
 
 from . import overlay
 from .simcontrol import UNKNOWN, ControlError, SimControlClient
@@ -101,6 +102,11 @@ class State:
         self.status = None
         self.control = None
         self.imu = None
+        # The referee's obstacle report: where the (possibly moving) obstacles
+        # are, and every hit so far with its position. Slow at the source.
+        self.clearance = None
+        # The planner's whole path, latched: drawn before it is flown.
+        self.plan_path = None
         # The simulator's own state is READ THROUGH, not copied in. It arrives
         # on its own topic at its own rate, and a second copy here would be one
         # more thing that can go stale: the first version of this rewrite kept
@@ -127,6 +133,7 @@ class State:
             seq, odom, sp = self.seq, self.odom, self.setpoint
             status, control, imu = self.status, self.control, self.imu
             consumed = self.consumed
+            clearance, plan_path = self.clearance, self.plan_path
 
         # Built outside the lock: message objects are not mutated after
         # publication, so reading them here cannot tear, and holding the lock
@@ -141,6 +148,8 @@ class State:
             "status": _status_of(status),
             "control": _control_of(control),
             "imu": _imu_of(imu),
+            "clearance": _clearance_of(clearance),
+            "plan_path": _path_of(plan_path),
         }
         snap["overlay"] = overlay.build(snap["pose"], snap["control"], snap["imu"])
 
@@ -199,6 +208,39 @@ def _status_of(m):
         "elapsed_s": m.elapsed_s,
         "energy_wh": m.energy_wh,
     }
+
+
+def _finite_or_none(v):
+    return None if (v is None or math.isnan(v) or math.isinf(v)) else v
+
+
+def _clearance_of(m):
+    """The referee's report, field for field. Infinities and NaN become null:
+    JSON has neither, and the page must show 'n/a', not a made-up number."""
+    if m is None:
+        return None
+    return {
+        "scenario_time_s": m.scenario_time_s,
+        "obstacles": [
+            {"name": n, "pos": [p.x, p.y, p.z], "r": r}
+            for n, p, r in zip(m.names, m.positions, m.radii)
+        ],
+        "clearance_m": _finite_or_none(m.clearance_m),
+        "nearest": m.nearest,
+        "min_clearance_m": _finite_or_none(m.min_clearance_m),
+        "hits": [
+            {"pos": [p.x, p.y, p.z], "with": w, "t": t, "depth_m": d}
+            for p, w, t, d in zip(m.hit_positions, m.hit_with, m.hit_times_s, m.hit_depths_m)
+        ],
+        "world_mismatch_m": _finite_or_none(m.world_mismatch_m),
+        "world_poses_seen": int(m.world_poses_seen),
+    }
+
+
+def _path_of(m):
+    if m is None:
+        return None
+    return [[ps.pose.position.x, ps.pose.position.y, ps.pose.position.z] for ps in m.poses]
 
 
 def _control_of(m):
@@ -276,6 +318,12 @@ class VizNode(Node):
         # Already slow at the source, so it comes straight from the referee.
         self.create_subscription(FlightStatus, "/drone/eval/status",
                                  self.on_status, 10)
+        self.create_subscription(ClearanceReport, "/drone/eval/clearance",
+                                 self.on_clearance, 10)
+        # Latched by the publisher; the subscription must be transient-local
+        # too or a page opened after the bridge started never sees the path.
+        latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        self.create_subscription(Path, "/drone/plan_path", self.on_plan_path, latched)
 
     # Every callback does the same cheap thing: keep the newest message and
     # bump a counter. No parsing, no allocation, no arithmetic. At 250 Hz on
@@ -303,6 +351,16 @@ class VizNode(Node):
     def on_control(self, m):
         with self.state.lock:
             self.state.control = m
+            self.state._bump()
+
+    def on_clearance(self, m):
+        with self.state.lock:
+            self.state.clearance = m
+            self.state._bump()
+
+    def on_plan_path(self, m):
+        with self.state.lock:
+            self.state.plan_path = m
             self.state._bump()
 
     def on_imu(self, m):

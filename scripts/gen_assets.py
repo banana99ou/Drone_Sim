@@ -8,6 +8,13 @@ Four files describe the same quadrotor and MUST NOT disagree:
   worlds/*.sdf                                  the scenes
   config/obstacles_pillars.yaml                 what the referee scores against
 
+and one more source feeds a second family: scenarios/*.json, a space-time
+planning scenario in the planner's own format (start, end, moving spherical
+obstacles). From each one this script emits the Gazebo world with the spheres
+in motion, the referee's obstacle list WITH velocities, the viewer's scene
+entry and a straight-line seed plan -- so the planner, the physics, the
+referee and the picture cannot disagree about where the fence is at t=4.
+
 If the SDF says 1.5 kg and the YAML says 1.8, the controller is flying a
 vehicle that does not exist and every tracking number is meaningless -- and
 nothing would visibly break. Same for the obstacle course: the referee would
@@ -467,7 +474,8 @@ GROUND = """
     </model>"""
 
 
-def world(name, extra_models="", header=""):
+def world(name, extra_models="", header="", spawn=(0.0, 0.0, 0.1)):
+    sx, sy, sz = spawn
     physics = f"""
     <physics name="step" type="ignored">
       <max_step_size>{PARAMS["physics_step_s"]}</max_step_size>
@@ -481,7 +489,7 @@ def world(name, extra_models="", header=""):
     <include>
       <uri>model://drone</uri>
       <name>drone</name>
-      <pose>0 0 0.1 0 0 0</pose>
+      <pose>{sx} {sy} {sz} 0 0 0</pose>
     </include>
   </world>
 </sdf>
@@ -557,7 +565,257 @@ def scene_json():
             ]},
         },
     }
+    # Moving obstacles carry their velocity so the page can draw them where
+    # they ARE; the live referee report (/drone/eval/clearance) is the
+    # authority, and `pose` is only where they sit at scenario t=0.
+    for path in SCENARIOS:
+        sc = load_scenario(path)
+        scene["worlds"][sc["name"]] = scenario_scene_entry(sc)
     return json.dumps(scene, indent=2) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# Space-time scenarios: obstacles that MOVE.
+#
+# The scenario file is the planner's dict (see scenarios/fence3d.json), read
+# here rather than transcribed, so a number in it appears in exactly one
+# place. Each obstacle is a sphere whose centre is pos0 + vel * t, with t the
+# SCENARIO clock -- which starts at sim["start_s"] seconds of simulated time,
+# because the vehicle has to fly from the pad to the start point first.
+# ---------------------------------------------------------------------------
+SCENARIOS = sorted((ROOT / "scenarios").glob("*.json"))
+
+
+def load_scenario(path):
+    import json
+    sc = json.loads(pathlib.Path(path).read_text())
+    for key in ("name", "start", "end", "T", "obstacles", "sim"):
+        if key not in sc:
+            raise SystemExit(f"{path}: scenario has no '{key}'")
+    if len(sc["start"]) != 4 or len(sc["end"]) != 4:
+        raise SystemExit(f"{path}: start/end must be (x, y, z, t); this sim flies in "
+                         f"three spatial dimensions and the planner's dim is spatial+1")
+    for o in sc["obstacles"]:
+        if "t_start" in o or "t_end" in o:
+            # A window cannot be expressed with a constant-velocity Gazebo body,
+            # and a sphere that is drawn but not scored (or the reverse) is the
+            # exact disagreement this generator exists to prevent.
+            raise SystemExit(f"{path}: obstacle {o.get('name')} has a time window; "
+                             "the sim cannot stage an obstacle appearing or vanishing")
+        if len(o["pos0"]) != 3 or len(o["vel"]) != 3:
+            raise SystemExit(f"{path}: obstacle {o.get('name')} is not 3-D")
+    return sc
+
+
+def scenario_world_models(sc):
+    """Visual-only spheres flying at constant velocity.
+
+    No <collision>: the referee scores clearance analytically (dsim_eval), so a
+    contact here would add nothing but a second, differently-shaped opinion
+    and thirteen more bodies for the contact solver to worry about.
+
+    Motion is left to the physics rather than scripted, through Gazebo's
+    VelocityControl system with an initial velocity -- gravity off, so the
+    commanded velocity is the whole motion. The spheres start moving at sim
+    t=0, so they are placed at pos0 - vel*start_s and pass through pos0 exactly
+    when the scenario clock reads zero.
+
+    Each one also reports its own pose (OdometryPublisher, 20 Hz, on
+    /model/<name>/odometry) and the referee holds that against pos0 + vel*t.
+    That check is what makes this construction trustworthy, not this comment.
+    Per model rather than the world's dynamic_pose/info because the ros_gz
+    bridge drops entity names when it converts Pose_V to TFMessage --
+    measured: every child_frame_id arrived empty -- and a pose with no name
+    cannot be checked against anything. OdometryPublisher rather than
+    PosePublisher because the latter goes silent after a world reset (it
+    throttles against a last-publish time that the reset leaves in the
+    future) and the check would be dead for the rest of the session without
+    anything saying so; the odometry one is what the vehicle's own truth uses
+    and survives resets, measured.
+    """
+    t0 = float(sc["sim"]["start_s"])
+    out = []
+    for o in sc["obstacles"]:
+        x0, y0, z0 = (float(o["pos0"][i]) - float(o["vel"][i]) * t0 for i in range(3))
+        vx, vy, vz = (float(v) for v in o["vel"])
+        r = float(o["r"])
+        rgb = _hex_rgb(o.get("color", "#e67e22"))
+        out.append(f"""
+    <model name="{o['name']}">
+      <pose>{x0:.6f} {y0:.6f} {z0:.6f} 0 0 0</pose>
+      <link name="link">
+        <gravity>false</gravity>
+        <inertial><mass>1.0</mass>
+          <inertia><ixx>0.1</ixx><iyy>0.1</iyy><izz>0.1</izz><ixy>0</ixy><ixz>0</ixz><iyz>0</iyz></inertia>
+        </inertial>
+        <visual name="visual">
+          <geometry><sphere><radius>{r}</radius></sphere></geometry>
+          <material>
+            <ambient>{rgb} 0.55</ambient><diffuse>{rgb} 0.55</diffuse>
+          </material>
+        </visual>
+      </link>
+      <plugin filename="gz-sim-velocity-control-system" name="gz::sim::systems::VelocityControl">
+        <initial_linear>{vx} {vy} {vz}</initial_linear>
+      </plugin>
+      <plugin filename="gz-sim-odometry-publisher-system" name="gz::sim::systems::OdometryPublisher">
+        <odom_frame>world</odom_frame>
+        <robot_base_frame>{o['name']}</robot_base_frame>
+        <dimensions>3</dimensions>
+        <odom_publish_frequency>20</odom_publish_frequency>
+        <odom_topic>/model/{o['name']}/odometry</odom_topic>
+      </plugin>
+    </model>""")
+    return "".join(out)
+
+
+def _hex_rgb(h):
+    h = h.lstrip("#")
+    return " ".join(f"{int(h[i:i + 2], 16) / 255:.3f}" for i in (0, 2, 4))
+
+
+def scenario_obstacle_yaml(sc):
+    """The referee's list, same shape as obstacle_yaml() plus `vel`, and the
+    scenario clock's origin so the referee evaluates pos0 + vel*t at the same
+    t the planner meant."""
+    names = ", ".join(f'"{o["name"]}"' for o in sc["obstacles"])
+    lines = [
+        f"# GENERATED by scripts/gen_assets.py from scenarios/{sc['name']}.json,",
+        f"# together with worlds/{sc['name']}.sdf. Do not hand-edit.",
+        "/**:", "  ros__parameters:",
+        f"    scenario.start_s: {float(sc['sim']['start_s'])}",
+        f"    scenario.duration_s: {float(sc['T'])}",
+        "    obstacles:", f"      names: [{names}]",
+    ]
+    for o in sc["obstacles"]:
+        lines += [f"      {o['name']}:", '        type: "sphere"',
+                  f"        pose: [{', '.join(str(round(float(v), 9)) for v in o['pos0'])}]",
+                  f"        size: [{float(o['r'])}]",
+                  f"        vel: [{', '.join(str(round(float(v), 9)) for v in o['vel'])}]"]
+    return "\n".join(lines) + "\n"
+
+
+def scenario_seed_plan(sc):
+    """The planner's own initial guess: a straight line in space-time, N=8.
+
+    This is what optimize_spacetime() starts from (build_initial_guess with
+    init_curve straight), reproduced here because the Rust solver does not
+    build on this host. It is a valid space-time Bezier and it flies THROUGH
+    the fence on purpose: the collision path gets exercised before any
+    optimised plan exists, and a bridge that reports this plan as clear is
+    broken.
+    """
+    import json
+    n_cp = 9
+    P = [[round((1 - s) * a + s * b, 9) for a, b in zip(sc["start"], sc["end"])]
+         for s in (i / (n_cp - 1) for i in range(n_cp))]
+    plan = {
+        "_generated_by": "scripts/gen_assets.py -- the straight-line seed, not a solution",
+        "scenario": sc["name"],
+        "solver": "seed",
+        # What flying this line through the scenario must produce, computed
+        # here in Python from the same start/end/obstacles. The referee
+        # computes it again in C++ on the live run (dsim_eval/obstacle.hpp),
+        # and scripts/check_planner.py holds the two against each other.
+        "expect": seed_expectation(sc, P),
+        "control_points": P,
+    }
+    # One control point per line: a 9x4 table is readable that way and not
+    # as 36 lines of one number each.
+    text = json.dumps({k: v for k, v in plan.items() if k != "control_points"}, indent=1)
+    rows = ",\n".join("  " + json.dumps(row) for row in P)
+    return text[:-2] + ',\n "control_points": [\n' + rows + "\n ]\n}\n"
+
+
+def seed_expectation(sc, P):
+    """First collision of the straight seed, predicted at 1 ms resolution.
+
+    The seed is linear in every coordinate including time, so the vehicle is
+    at start + s*(end - start) with s = t/T. Clearance counts the vehicle's
+    own radius, as the referee does.
+    """
+    x0, x1 = P[0], P[-1]
+    T = x1[3] - x0[3]
+    r_v = PARAMS["radius_m"]
+    first = None
+    n = int(T * 1000)
+    for k in range(n + 1):
+        t = k * T / n
+        s = t / T
+        px, py, pz = (x0[i] + s * (x1[i] - x0[i]) for i in range(3))
+        for o in sc["obstacles"]:
+            cx, cy, cz = (o["pos0"][i] + o["vel"][i] * t for i in range(3))
+            c = math.sqrt((px - cx) ** 2 + (py - cy) ** 2 + (pz - cz) ** 2) - o["r"] - r_v
+            if c < 0.0:
+                if first is None:
+                    first = {"with": o["name"], "t": round(t, 3), "depth_m": 0.0}
+                if o["name"] == first["with"]:
+                    first["depth_m"] = round(max(first["depth_m"], -c), 4)
+    return {"first_hit": first} if first else {}
+
+
+def scenario_scene_entry(sc):
+    return {"obstacles": [
+        {"name": o["name"], "type": "sphere", "pose": [float(v) for v in o["pos0"]],
+         "size": [float(o["r"])], "vel": [float(v) for v in o["vel"]],
+         "color": o.get("color", "#e67e22")}
+        for o in sc["obstacles"]],
+        "start": [float(v) for v in sc["start"]],
+        "end": [float(v) for v in sc["end"]]}
+
+
+def scenario_spawn(sc):
+    """The pad: on the ground directly under the plan's start point.
+
+    The transit from the pad to `start` is not part of the plan and nothing
+    certifies it, so it is made trivial -- a vertical climb. The first
+    version spawned at the origin, and the diagonal transit to fence3d's
+    start ran along the fence row while it was still sweeping in from its
+    t=-start_s position: five hits before the plan had begun.
+    """
+    return (float(sc["start"][0]), float(sc["start"][1]), 0.1)
+
+
+def check_pad_is_clear(sc):
+    """Refuse a scenario whose obstacles sweep through the pad or the climb
+    before the plan starts. Between sim t=0 and start_s the vehicle is
+    somewhere on the vertical line from the pad to `start`; every obstacle
+    must clear that whole segment by the vehicle radius the whole time."""
+    x, y, _ = scenario_spawn(sc)
+    z_top = float(sc["start"][2])
+    t0 = float(sc["sim"]["start_s"])
+    r_v = PARAMS["radius_m"]
+    for k in range(int(t0 * 100) + 1):
+        t = -t0 + k / 100.0
+        for o in sc["obstacles"]:
+            cx, cy, cz = (o["pos0"][i] + o["vel"][i] * t for i in range(3))
+            dz = max(0.0, cz - z_top, 0.0 - cz)   # distance to the segment in z
+            d = math.sqrt((x - cx) ** 2 + (y - cy) ** 2 + dz ** 2) - o["r"] - r_v
+            if d < 0.0:
+                raise SystemExit(
+                    f"scenarios/{sc['name']}.json: obstacle {o['name']} is {-d:.2f} m into "
+                    f"the pad-to-start climb at scenario t={t:.2f} s (sim t={t + t0:.2f}); "
+                    f"the transit is not part of the plan, so change sim.start_s or the "
+                    f"obstacle rather than fly into it before the run begins")
+
+
+def scenario_targets():
+    out = {}
+    for path in SCENARIOS:
+        sc = load_scenario(path)
+        name = sc["name"]
+        if path.stem != name:
+            raise SystemExit(f"{path}: file is named {path.stem} but the scenario is {name}")
+        check_pad_is_clear(sc)
+        out[f"worlds/{name}.sdf"] = lambda sc=sc: world(
+            f"drone_{sc['name']}", scenario_world_models(sc),
+            header=f"Space-time scenario '{sc['name']}': moving spherical obstacles, "
+                   f"visual only. Generated from scenarios/{sc['name']}.json "
+                   f"by scripts/gen_assets.py; the referee scores the same list.",
+            spawn=scenario_spawn(sc))
+        out[f"config/obstacles_{name}.yaml"] = lambda sc=sc: scenario_obstacle_yaml(sc)
+        out[f"plans/{name}_seed.json"] = lambda sc=sc: scenario_seed_plan(sc)
+    return out
 
 
 TARGETS = {
@@ -574,6 +832,7 @@ TARGETS = {
         header="Obstacle course. Generated with config/obstacles_pillars.yaml "
                "from one source list. See scripts/gen_assets.py."),
 }
+TARGETS.update(scenario_targets())
 
 
 def validate_xml(rel, text):

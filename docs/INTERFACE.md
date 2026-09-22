@@ -19,7 +19,15 @@ publish trajectories, it flies them and scores the result.**
 | sim → you | `/drone/state_est` | `nav_msgs/msg/Odometry` | 250 Hz |
 | sim → you | `/drone/estimator_debug` | `dsim_msgs/msg/EstimatorDebug` | 250 Hz |
 | sim → you | `/sim/state` | `dsim_msgs/msg/SimState` | 5 Hz |
+| sim → you | `/drone/eval/clearance` | `dsim_msgs/msg/ClearanceReport` | 20 Hz |
+| sim → you | `/drone/obstacle_pose/<name>` | `geometry_msgs/msg/PoseStamped` | 20 Hz, moving obstacles only |
 | **you → sim** | `/sim/control` (service) | `dsim_msgs/srv/SimControl` | on demand |
+
+`/drone/eval/clearance` is the referee's obstacle report: where every declared
+obstacle is right now (moving ones on the scenario clock, `pos0 + vel*t`), the
+signed clearance to the nearest one counting the vehicle radius, and every hit
+so far with the vehicle position, obstacle, time and depth. For a plan solved
+against a space-time scenario, see [PLANNER.md](PLANNER.md).
 
 `/sim/control` also carries **gusts**: an external force on the airframe, in
 newtons, world frame, applied by the simulator and never announced to anything

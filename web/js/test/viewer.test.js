@@ -122,3 +122,51 @@ test("colourFor routes rotors to the diverging scale and unknowns to a default",
   assert.ok(colourFor({ kind: "something_new" }).startsWith("#"));
   assert.ok(widthFor({ kind: "something_new" }) > 0);
 });
+
+import { sphereFaces, obstaclePositions, hitMarkers } from "../shapes.js";
+
+// FAILS IF: sphereFaces stops describing a sphere of the requested radius at
+// the requested centre -- every vertex must sit exactly r from the centre,
+// and there must be faces both above and below it (not a hemisphere).
+test("sphereFaces vertices all lie on the sphere", () => {
+  const faces = sphereFaces(2, -1, 0.5, 0.9, "#e67e22", 0.3);
+  assert.ok(faces.length >= 40, "too few faces to read as a sphere");
+  let above = 0, below = 0;
+  for (const f of faces) {
+    assert.ok(f.alpha < 1, "obstacle spheres must be translucent");
+    for (const [x, y, z] of f.pts) {
+      const d = Math.hypot(x - 2, y + 1, z - 0.5);
+      assert.ok(Math.abs(d - 0.9) < 1e-9, `vertex at distance ${d}, not 0.9`);
+      if (z > 0.5 + 0.3) above++;
+      if (z < 0.5 - 0.3) below++;
+    }
+  }
+  assert.ok(above > 0 && below > 0, "sphere is missing a cap");
+});
+
+// FAILS IF: the live position lookup keys on the wrong field or drops
+// entries, so a moving obstacle would be drawn at its t=0 pose forever.
+test("obstaclePositions maps referee names to live positions", () => {
+  const rep = { obstacles: [{ name: "F5", pos: [5.2, 5, 0], r: 0.9 },
+                            { name: "M1", pos: [7, 2.3, 0.81], r: 0.7 }] };
+  const live = obstaclePositions(rep);
+  assert.deepEqual(live.F5, [5.2, 5, 0]);
+  assert.deepEqual(live.M1, [7, 2.3, 0.81]);
+  assert.deepEqual(obstaclePositions(null), {});
+});
+
+// FAILS IF: a hit marker is not centred on the hit position, or is drawn at
+// the obstacle instead of where the vehicle was. Three axis segments each
+// straddle the position by the vehicle radius.
+test("hitMarkers put a cross exactly on each hit", () => {
+  const rep = { hits: [{ pos: [5.21, 5.0, 0.5], with: "F5", t: 3.71, depth_m: 0.7 }] };
+  const segs = hitMarkers(rep, 0.3);
+  assert.equal(segs.length, 4);
+  for (const s of segs.slice(0, 3)) {
+    const mid = s.a.map((v, i) => 0.5 * (v + s.b[i]));
+    assert.deepEqual(mid.map((v) => +v.toFixed(9)), [5.21, 5.0, 0.5]);
+    const l = Math.hypot(...s.a.map((v, i) => v - s.b[i]));
+    assert.ok(Math.abs(l - 0.6) < 1e-9, "cross arm is not 2 x radius");
+  }
+  assert.deepEqual(hitMarkers(null), []);
+});

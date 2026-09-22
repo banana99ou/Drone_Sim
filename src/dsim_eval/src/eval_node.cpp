@@ -7,14 +7,22 @@
 //
 // Metrics:
 //   tracking error   | truth position vs the setpoint the controller tracked
-//   collision        | contact sensor on the 50 cm guard envelope
-//   clearance        | analytic distance to obstacles listed in the world config
+//   collision        | contact sensor on the guard envelope, AND the analytic
+//                    | clearance going negative (edge-triggered, with position)
+//   clearance        | analytic SIGNED distance to obstacles listed in the world
+//                    | config, which may be moving: centre = pos0 + vel * t
 //   path length      | integrated ground-truth travel
 //   energy           | momentum-theory estimate anchored to the data sheet
 //
 // Clearance uses the world's declared obstacle list rather than the depth
 // sensor, on purpose: this is the referee, and the referee must not share the
 // planner's blind spots.
+//
+// Moving obstacles run on the SCENARIO clock: t = sim time - scenario.start_s,
+// zero when the plan begins executing. The referee also listens to the poses
+// Gazebo reports for those bodies and keeps the worst disagreement with its own
+// pos0 + vel * t, so "the world being flown is the world being scored" is a
+// measured number on /drone/eval/clearance rather than an assumption.
 
 #include <cmath>
 #include <fstream>
@@ -27,40 +35,15 @@
 #include <nav_msgs/msg/odometry.hpp>
 #include <actuator_msgs/msg/actuators.hpp>
 #include <ros_gz_interfaces/msg/contacts.hpp>
+#include <dsim_msgs/msg/clearance_report.hpp>
 #include <dsim_msgs/msg/flight_status.hpp>
 #include <dsim_msgs/msg/trajectory_setpoint.hpp>
 #include <dsim_msgs/srv/reset_run.hpp>
 #include <dsim_time/sim_epoch.hpp>
+#include "dsim_eval/obstacle.hpp"
 
 namespace dsim_eval
 {
-
-struct Obstacle
-{
-  std::string type;                  // "box" | "cylinder" | "sphere"
-  double x{0}, y{0}, z{0};
-  double sx{1}, sy{1}, sz{1};        // box: full extents; cylinder: radius,_,height; sphere: radius
-
-  /// Distance from a point to this obstacle's surface (0 inside).
-  double distance(double px, double py, double pz) const
-  {
-    if (type == "sphere") {
-      const double d = std::sqrt(
-        (px - x) * (px - x) + (py - y) * (py - y) + (pz - z) * (pz - z));
-      return std::max(0.0, d - sx);
-    }
-    if (type == "cylinder") {
-      const double dr = std::max(0.0, std::sqrt((px - x) * (px - x) + (py - y) * (py - y)) - sx);
-      const double dz = std::max(0.0, std::abs(pz - z) - sz / 2.0);
-      return std::sqrt(dr * dr + dz * dz);
-    }
-    // box, axis aligned
-    const double dx = std::max(0.0, std::abs(px - x) - sx / 2.0);
-    const double dy = std::max(0.0, std::abs(py - y) - sy / 2.0);
-    const double dz = std::max(0.0, std::abs(pz - z) - sz / 2.0);
-    return std::sqrt(dx * dx + dy * dy + dz * dz);
-  }
-};
 
 class EvalNode : public rclcpp::Node
 {
@@ -82,8 +65,14 @@ public:
     // not by the plan. Including it makes short runs look far worse than long
     // ones for no real reason, so the RMSE window starts after this.
     warmup_s_ = declare_parameter("warmup_s", 6.0);
+    // Scenario clock origin, in simulated seconds. Comes from the generated
+    // config/obstacles_<world>.yaml for a space-time scenario; 0 for the
+    // static courses, where nothing moves and the clock is unused.
+    scenario_start_s_ = declare_parameter("scenario.start_s", 0.0);
+    scenario_duration_s_ = declare_parameter("scenario.duration_s", 0.0);
 
     loadObstacles();
+    tracker_ = std::make_unique<ClearanceTracker>(obstacles_, vehicle_radius_);
 
     truth_sub_ = create_subscription<nav_msgs::msg::Odometry>(
       "/drone/truth", rclcpp::SensorDataQoS(),
@@ -100,8 +89,21 @@ public:
       "/drone/command/motor_speed", rclcpp::QoS(1),
       [this](actuator_msgs::msg::Actuators::SharedPtr m) {onCommand(*m);});
 
+    // Gazebo's own report of where each MOVING body is, one topic per
+    // obstacle (the world's OdometryPublisher, bridged by the launch). Static
+    // ones cannot disagree with themselves and get no subscription.
+    for (const auto & o : obstacles_) {
+      if (!o.moving()) {continue;}
+      const Obstacle * which = &o;
+      pose_subs_.push_back(create_subscription<nav_msgs::msg::Odometry>(
+        "/drone/obstacle_pose/" + o.name, rclcpp::SensorDataQoS(),
+        [this, which](nav_msgs::msg::Odometry::SharedPtr m) {onObstaclePose(*which, *m);}));
+    }
+
     status_pub_ = create_publisher<dsim_msgs::msg::FlightStatus>(
       "/drone/eval/status", rclcpp::QoS(10));
+    clearance_pub_ = create_publisher<dsim_msgs::msg::ClearanceReport>(
+      "/drone/eval/clearance", rclcpp::QoS(10));
 
     reset_srv_ = create_service<dsim_msgs::srv::ResetRun>(
       "/drone/eval/reset",
@@ -126,8 +128,11 @@ public:
         RCLCPP_WARN(get_logger(), "could not open %s for writing", csv_path_.c_str());
       }
     }
-    RCLCPP_INFO(get_logger(), "eval up: %zu obstacles, vehicle radius %.2f m",
-      obstacles_.size(), vehicle_radius_);
+    size_t moving = 0;
+    for (const auto & o : obstacles_) {moving += o.moving() ? 1 : 0;}
+    RCLCPP_INFO(get_logger(),
+      "eval up: %zu obstacles (%zu moving), vehicle radius %.2f m, scenario t=0 at sim %.1f s",
+      obstacles_.size(), moving, vehicle_radius_, scenario_start_s_);
   }
 
 private:
@@ -141,6 +146,7 @@ private:
       "obstacles.names", std::vector<std::string>{});
     for (const auto & n : names) {
       Obstacle o;
+      o.name = n;
       o.type = declare_parameter("obstacles." + n + ".type", std::string("box"));
       const auto pose = declare_parameter<std::vector<double>>(
         "obstacles." + n + ".pose", {0.0, 0.0, 0.0});
@@ -150,8 +156,31 @@ private:
       o.sx = size.at(0);
       o.sy = size.size() > 1 ? size.at(1) : size.at(0);
       o.sz = size.size() > 2 ? size.at(2) : size.at(0);
+      // Optional: the static courses declare none and stay put.
+      const auto vel = declare_parameter<std::vector<double>>(
+        "obstacles." + n + ".vel", {0.0, 0.0, 0.0});
+      o.vx = vel.at(0); o.vy = vel.at(1); o.vz = vel.at(2);
       obstacles_.push_back(o);
     }
+  }
+
+  double scenarioTime(double sim_s) const {return sim_s - scenario_start_s_;}
+
+  void onObstaclePose(const Obstacle & o, const nav_msgs::msg::Odometry & m)
+  {
+    // Evaluate the analytic centre at the time the pose was TAKEN, not at
+    // the time it arrived: at 0.25 m/s a 30 ms delay is 7.5 mm, which is the
+    // size of the thing being measured.
+    double stamp = static_cast<double>(m.header.stamp.sec) +
+      1e-9 * static_cast<double>(m.header.stamp.nanosec);
+    if (stamp <= 0.0) {stamp = get_clock()->now().seconds();}
+    double cx, cy, cz;
+    o.centreAt(scenarioTime(stamp), cx, cy, cz);
+    const auto & p = m.pose.pose.position;
+    const double d = std::sqrt(
+      (p.x - cx) * (p.x - cx) + (p.y - cy) * (p.y - cy) + (p.z - cz) * (p.z - cz));
+    if (!std::isfinite(world_mismatch_m_) || d > world_mismatch_m_) {world_mismatch_m_ = d;}
+    ++world_poses_seen_;
   }
 
   static bool isDrone(const std::string & name)
@@ -245,14 +274,23 @@ private:
     lx_ = px; ly_ = py; lz_ = pz;
     have_last_pos_ = true;
 
-    // clearance to the nearest declared obstacle, minus the guard envelope
-    double clearance = std::numeric_limits<double>::infinity();
-    for (const auto & o : obstacles_) {
-      clearance = std::min(clearance, o.distance(px, py, pz) - vehicle_radius_);
+    // Signed clearance to the nearest declared obstacle, minus the guard
+    // envelope, with the moving ones where they are NOW on the scenario clock.
+    // Going negative is a collision, recorded once per excursion with the
+    // position it happened at -- see dsim_eval/obstacle.hpp.
+    const size_t hits_before = tracker_->hits().size();
+    const auto sample = tracker_->update(px, py, pz, scenarioTime(now));
+    if (std::isfinite(sample.clearance)) {
+      last_clearance_ = sample.clearance;
+      nearest_ = sample.nearest;
     }
-    if (std::isfinite(clearance)) {
-      min_clearance_ = std::min(min_clearance_, clearance);
-      last_clearance_ = clearance;
+    if (tracker_->hits().size() > hits_before) {
+      const auto & h = tracker_->hits().back();
+      RCLCPP_ERROR(
+        get_logger(), "COLLISION (analytic) with %s at (%.2f, %.2f, %.2f), scenario t=%.2f s",
+        h.with.c_str(), h.x, h.y, h.z, h.t);
+      collided_ = true;
+      ++collision_count_;
     }
 
     if (have_sp_) {
@@ -295,20 +333,54 @@ private:
     s.tracking_max_m = max_err_;
     // NaN, not -1: with no obstacles in the world there IS no clearance, and
     // -1.0 reads exactly like "penetrated by one metre".
-    s.min_obstacle_clearance_m = std::isfinite(min_clearance_)
-      ? min_clearance_
+    s.min_obstacle_clearance_m = std::isfinite(tracker_->minClearance())
+      ? tracker_->minClearance()
       : std::numeric_limits<double>::quiet_NaN();
     s.path_length_m = path_length_;
     s.elapsed_s = elapsed_;
     s.energy_wh = energy_wh_;
     status_pub_->publish(s);
+    publishClearance(s.header.stamp);
+  }
+
+  void publishClearance(const builtin_interfaces::msg::Time & stamp)
+  {
+    dsim_msgs::msg::ClearanceReport r;
+    r.header.stamp = stamp;
+    const double now = get_clock()->now().seconds();
+    r.scenario_time_s = scenarioTime(now);
+    for (const auto & o : tracker_->obstacles()) {
+      geometry_msgs::msg::Point c;
+      o.centreAt(r.scenario_time_s, c.x, c.y, c.z);
+      r.names.push_back(o.name);
+      r.positions.push_back(c);
+      r.radii.push_back(o.sx);
+    }
+    r.clearance_m = last_clearance_;
+    r.nearest = nearest_;
+    r.min_clearance_m = tracker_->minClearance();
+    for (const auto & h : tracker_->hits()) {
+      geometry_msgs::msg::Point p;
+      p.x = h.x; p.y = h.y; p.z = h.z;
+      r.hit_positions.push_back(p);
+      r.hit_with.push_back(h.with);
+      r.hit_times_s.push_back(h.t);
+      r.hit_depths_m.push_back(h.depth);
+    }
+    r.world_mismatch_m = world_mismatch_m_;
+    r.world_poses_seen = static_cast<uint32_t>(world_poses_seen_);
+    clearance_pub_->publish(r);
   }
 
   void reset()
   {
     t0_ = -1.0; elapsed_ = 0.0; err_ = 0.0; sq_sum_ = 0.0; n_samples_ = 0;
     max_err_ = 0.0; path_length_ = 0.0; energy_wh_ = 0.0; last_power_s_ = 0.0;
-    min_clearance_ = std::numeric_limits<double>::infinity();
+    tracker_->reset();
+    nearest_.clear();
+    last_clearance_ = std::numeric_limits<double>::infinity();
+    world_mismatch_m_ = std::numeric_limits<double>::quiet_NaN();
+    world_poses_seen_ = 0;
     collided_ = false; collision_count_ = 0; ground_contacts_ = 0;
     have_last_pos_ = false; was_airborne_ = false;
     RCLCPP_INFO(get_logger(), "metrics reset");
@@ -318,6 +390,11 @@ private:
   dsim_time::SimEpoch epoch_;
 
   std::vector<Obstacle> obstacles_;
+  std::unique_ptr<ClearanceTracker> tracker_;
+  double scenario_start_s_ {0.0}, scenario_duration_s_ {0.0};
+  std::string nearest_;
+  double world_mismatch_m_ {std::numeric_limits<double>::quiet_NaN()};
+  size_t world_poses_seen_ {0};
   double vehicle_radius_, hover_power_w_, mass_, motor_constant_, publish_hz_;
   std::string csv_path_;
   std::ofstream csv_;
@@ -329,14 +406,16 @@ private:
   size_t collision_count_ {0}, ground_contacts_ {0}, n_samples_ {0};
   double t0_ {-1.0}, elapsed_ {0.0}, err_ {0.0}, sq_sum_ {0.0}, max_err_ {0.0};
   double path_length_ {0.0}, energy_wh_ {0.0}, last_power_s_ {0.0};
-  double lx_ {0}, ly_ {0}, lz_ {0}, last_clearance_ {0.0};
-  double min_clearance_ {std::numeric_limits<double>::infinity()};
+  double lx_ {0}, ly_ {0}, lz_ {0};
+  double last_clearance_ {std::numeric_limits<double>::infinity()};
 
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr truth_sub_;
   rclcpp::Subscription<dsim_msgs::msg::TrajectorySetpoint>::SharedPtr sp_sub_;
   rclcpp::Subscription<ros_gz_interfaces::msg::Contacts>::SharedPtr contact_sub_;
   rclcpp::Subscription<actuator_msgs::msg::Actuators>::SharedPtr cmd_sub_;
+  std::vector<rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr> pose_subs_;
   rclcpp::Publisher<dsim_msgs::msg::FlightStatus>::SharedPtr status_pub_;
+  rclcpp::Publisher<dsim_msgs::msg::ClearanceReport>::SharedPtr clearance_pub_;
   rclcpp::Service<dsim_msgs::srv::ResetRun>::SharedPtr reset_srv_;
   rclcpp::TimerBase::SharedPtr timer_;
 };

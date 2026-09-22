@@ -36,6 +36,9 @@ services:
       - ../logs:/ws/logs:rw
       - ../scripts:/ws/scripts:rw
       - ../web:/ws/web:rw
+      # Space-time scenarios and the plans that solve them (see docs/PLANNER.md).
+      - ../scenarios:/ws/scenarios:rw
+      - ../plans:/ws/plans:rw
       # Your planner repo gets mounted here — see docs/INTERFACE.md
       # Defaults to an empty placeholder, NOT ../src -- mounting the workspace
       # twice makes colcon fail on duplicate package names.

@@ -15,6 +15,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   msg/OpticalFlow.msg
   msg/EstimatorDebug.msg
   msg/SimState.msg
+  msg/ClearanceReport.msg
   srv/ResetRun.srv
   srv/SimControl.srv
   DEPENDENCIES std_msgs geometry_msgs builtin_interfaces
