@@ -48,6 +48,27 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       ros-jazzy-rosbridge-suite \
     && rm -rf /var/lib/apt/lists/*
 
+# ---- planner toolchain: Rust + maturin, so bezier_opt builds in here -------
+# The space-time planner (banana99ou/bezier-trajectory) has no Python solver
+# path: its optimiser is a Rust extension (pyo3, clarabel) and without it
+# optimize_spacetime() raises. Building it needs cargo and maturin, and they
+# need the network at `make planner` time -- through whatever CA the local
+# network insists on (docker/ca/README.md). Separate layer, same reason as
+# the one above: the big Gazebo layer must not rebuild for this.
+COPY ca/ /usr/local/share/ca-certificates/extra/
+RUN update-ca-certificates \
+ && apt-get update && apt-get install -y --no-install-recommends \
+      python3-pip python3-venv build-essential curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
+    PIP_CERT=/etc/ssl/certs/ca-certificates.crt \
+    RUSTUP_HOME=/opt/rustup \
+    CARGO_HOME=/opt/cargo
+RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --no-modify-path \
+ && chmod -R a+rwX /opt/rustup /opt/cargo \
+ && pip install --break-system-packages maturin==1.8.3
+ENV PATH="/opt/cargo/bin:${PATH}"
+
 # Source ROS for EVERY shell, not just the entrypoint.
 #
 # `docker exec` bypasses ENTRYPOINT, and `bash -lc` (what the Makefile uses)
@@ -62,6 +83,8 @@ RUN printf '%s\n' \
       'source /opt/ros/jazzy/setup.bash' \
       '[ -f /ws/install/setup.bash ] && source /ws/install/setup.bash' \
       'export GZ_SIM_RESOURCE_PATH="/ws/src/dsim_description/models:/ws/worlds${GZ_SIM_RESOURCE_PATH:+:$GZ_SIM_RESOURCE_PATH}"' \
+      'export PYTHONPATH="/ws/install/planner_py:/ws/planner_src${PYTHONPATH:+:$PYTHONPATH}"' \
+      'export CARGO_HOME=/ws/build/cargo' \
       > /etc/profile.d/10-ros.sh \
  && chmod 0644 /etc/profile.d/10-ros.sh \
  && cat /etc/profile.d/10-ros.sh >> /home/${USERNAME}/.bashrc \

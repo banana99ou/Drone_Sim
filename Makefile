@@ -2,10 +2,17 @@
 COMPOSE := docker compose -f docker/compose.yaml
 export UID := $(shell id -u)
 export GID := $(shell id -g)
+# The space-time planner's working copy, mounted at /ws/planner_src. This is
+# a SYNC of the MacBook's ~/code/bezier-trajectory-merge worktree (rsync, see
+# `make planner-sync`), not a git checkout: the worktree's .git is a pointer
+# into the MacBook's main repo and means nothing here.
+export PLANNER_REPO ?= $(HOME)/code/bezier-trajectory-merge-sync
+PLANNER_HOST ?= you@your-macbook.your-tailnet.ts.net
+PLANNER_PATH ?= code/bezier-trajectory-merge
 
 .PHONY: help setup build up down shell sim viz stop status test test-overlay \
-        test-viewer test-planner verify assets fly plan telemetry simctl sensors \
-        estimator plot clean
+        test-viewer test-planner verify assets fly plan planner solve telemetry \
+        simctl sensors estimator plot clean planner planner-sync solve
 
 help:
 	@echo "make setup    one-time host setup (sudo: docker group + nvidia toolkit)"
@@ -17,6 +24,12 @@ help:
 	@echo "make verify   mutation check + generated-asset drift check (host, no docker)"
 	@echo "make fly      headless flight check: proves it actually flies"
 	@echo "make plan     fly a space-time plan headless and grade it (PLAN=plans/...)"
+	@echo "make planner-sync  pull the planner worktree from the MacBook"
+	@echo "make planner  build the space-time optimiser's Rust extension"
+	@echo "make solve    solve a scenario into a plan (SCENARIO= N= NSEG= VMAX=)"
+	@echo "make planner-sync  rsync the planner worktree from the MacBook"
+	@echo "make planner  build the planner's Rust solver inside the container"
+	@echo "make solve    solve a scenario: SCENARIO=fence3d N=8 NSEG=2 [VMAX=..]"
 	@echo "make telemetry  cross-check a RUNNING sim's control telemetry"
 	@echo "make simctl     drive pause/speed/reset against a RUNNING sim"
 	@echo "make sensors  measure a RUNNING sim's sensor noise vs its config"
@@ -85,6 +98,33 @@ fly:
 plan:
 	$(COMPOSE) exec -e PLAN="$(PLAN)" sim bash -lc "colcon build --symlink-install >/dev/null && \
 		bash scripts/plan_check.sh"
+
+# The planner. `planner-sync` copies the MacBook worktree (minus its build
+# products, caches and papers) to $(PLANNER_REPO); `planner` builds its Rust
+# extension against the container's Python and checks the import; `solve`
+# runs it on a scenario and writes plans/<scenario>_N<N>_seg<NSEG>.json.
+planner-sync:
+	rsync -az --delete --stats \
+	  --exclude .git --exclude .venv --exclude .claude --exclude .cursor --exclude .specstory \
+	  --exclude rust_optimizer/target --exclude __pycache__ --exclude .pytest_cache \
+	  --exclude artifacts --exclude figures --exclude doc --exclude paper --exclude cache --exclude tmp \
+	  "$(PLANNER_HOST):$(PLANNER_PATH)/" "$(PLANNER_REPO)/" | grep -E "transferred|speedup"
+
+planner:
+	$(COMPOSE) exec sim bash -lc "bash scripts/build_planner.sh"
+
+#   make solve SCENARIO=fence3d N=8 NSEG=2 VMAX=3.0
+#   make solve SCENARIO=fence3d SOLVE_ARGS=--sweep
+# VMAX matters more than it looks. The optimiser has no acceleration cap at
+# all, and its only physical bound is this speed cap: an uncapped fence3d
+# solve returns a curve demanding 15 m/s, 83 m/s^2 and 109 degrees of tilt,
+# against a 40 degree clamp. Measured, and printed by solve_plan.py before the
+# plan is written.
+SCENARIO ?= fence3d
+N ?= 8
+NSEG ?= 2
+solve:
+	$(COMPOSE) exec sim bash -lc "python3 scripts/solve_plan.py --scenario $(SCENARIO) -N $(N) --n-seg $(NSEG) $(if $(VMAX),--v-max $(VMAX),) $(SOLVE_ARGS)"
 
 # WORLD/REFERENCE/RADIUS are passed straight through, e.g.
 #   make viz WORLD=fence3d PLAN=plans/fence3d_seed.json
