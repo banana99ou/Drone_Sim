@@ -218,6 +218,14 @@ The bridge notices the new file by mtime and reloads it, so a solve reaches the
 flying vehicle in about a second with nothing restarted. A plan that does not
 parse is refused and the old one keeps flying.
 
+The **scenario** dropdown above it is a different hammer: it restarts the
+simulator with whichever run you pick, in about four seconds, and the page
+stays up throughout. Every scenario that some plan declares is offered, plus
+the planner-free `hover` and `circle`; the server will only launch a name from
+the list the page built its dropdown from. A solved plan is preferred over the
+straight seed, because the seed exists to be flown *into* an obstacle. See
+[VIEWER.md](VIEWER.md#the-scenario-dropdown).
+
 ## The opening transient, measured
 
 Every plan opens with a velocity STEP, because the optimiser pins endpoint

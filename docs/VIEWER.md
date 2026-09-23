@@ -368,17 +368,71 @@ The `GET`s are not — a 30 Hz stream would drown the launch output — but the
 write path leaves a record, because the last time it broke a run there was
 nothing to read afterwards.
 
-To remove the endpoint entirely and get the old read-only guarantee back:
+To serve a read-only viewer — the endpoints still exist and answer 403, so the
+page can say they are off rather than appear broken:
 
 ```bash
-ros2 launch dsim_bringup sim.launch.py control:=false
+ros2 launch dsim_bringup viz.launch.py control:=false
 ```
 
 To keep it off the LAN entirely, bind it to the Tailscale interface:
 
 ```bash
-ros2 launch dsim_bringup sim.launch.py viz:=true bind:=100.64.0.1
+ros2 launch dsim_bringup viz.launch.py bind:=100.64.0.1
+BIND=100.64.0.1 bash scripts/run_sim.sh      # the same thing, both launches
 ```
+
+## Two launches, and why
+
+The viewer is `viz.launch.py`. The simulator is `sim.launch.py`. They are
+started separately and only the second one is ever restarted.
+
+That split exists for the scenario dropdown. Picking a scenario restarts the
+simulator, and a server that was part of the launch it restarts would kill
+itself mid-reply — leaving the page on a closed socket with no way to say
+whether the new run came up, failed, or was never started. So the viewer
+outlives every run it shows: the tab stays live across a switch, the HUD keeps
+its numbers, and a launch that dies puts the tail of its own log on the page.
+
+The handoff between them is `web/current.json`, written by `sim.launch.py`
+**after** it has accepted its arguments. So the viewer reports what is running,
+not what was asked for: a launch that refuses its arguments leaves the previous
+run named on the page, which is true, where "now flying wall" would be a lie.
+
+`scripts/kill_sim.sh` kills the viewer too — it derives its pattern list from
+the install tree and `viz_server` is in it. The one path that must spare the
+viewer is the teardown the viewer itself runs, and that is already covered:
+the script excludes its own ancestors, and there the viewer is one. Nothing is
+special-cased.
+
+## The scenario dropdown
+
+It restarts the simulator with the run you pick. It is not a drawing
+preference — the world, the obstacles and the plan all come from whichever run
+is actually up.
+
+The list is derived from disk, not written down: every scenario in
+`scenarios/` that some plan in `plans/` **declares** is offered, plus the
+built-in `hover` and `circle`, which need no planner at all. The server will
+only launch a name from that list, and the page builds the dropdown from the
+same object — so it cannot offer a run that would then be refused, and cannot
+be asked for one it never offered.
+
+Two things the catalogue works out rather than being told:
+
+* **Which plan.** A solved plan beats the straight seed. The seed exists to be
+  flown *into* an obstacle — it is the fixture that proves the referee reports
+  a hit — so defaulting to it would report the fixture rather than the planner.
+  Seeds are still flyable from the command line.
+* **Which state source.** A plan whose control points go above the optical
+  flow's `max_height_m` is launched `state:=truth`, and the dropdown says why.
+  `loiter` flies at 62.5 m: measured tracking error is 48 m on the estimate
+  against 2.2 cm on truth. That is the sensors being honest about their
+  envelope, not the controller failing.
+
+While a run is coming up the line under the dropdown counts the seconds. If the
+launch exits, or produces no telemetry inside 90 s, it says so and shows the
+last lines of `logs/sim.log` in the page.
 
 ## When it says "disconnected"
 
@@ -387,9 +441,14 @@ is not running rather than the network being wrong:
 
 ```bash
 make status     # "NOT publishing" means the nodes are gone even if the page still serves
-make viz        # restart
+make viz        # restart both launches
 tail -f logs/sim.log
+tail -f logs/viz.log
 ```
+
+Since the viewer outlives the simulator, "the page serves but there is no
+drone" is now a normal state with its own label: the line under the scenario
+dropdown reads `no simulator running`, and picking a scenario starts one.
 
 The page reconnects by itself once the sim is back, so leave the tab open.
 

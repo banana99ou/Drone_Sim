@@ -577,8 +577,10 @@ run_planner_mutation "samples spaced in tau instead of time" \
 
 # ---------------------------------------------------------------------------
 # The solve endpoint. It is the second write path this project exposes on a
-# port reachable across the whole tailnet, and the only one that starts a
-# process, so every bound on what a request may say gets broken on purpose.
+# port reachable across the whole tailnet, so every bound on what a request may
+# say gets broken on purpose. (It is no longer the only one that starts a
+# process -- /launch starts a whole simulator, and gets the same treatment
+# further down.)
 # ---------------------------------------------------------------------------
 mutate_solver() {   # $1 = name, $2 = from, $3 = to
   local name="$1" from="$2" to="$3"
@@ -655,8 +657,18 @@ run_solver_mutation "a zero speed cap passed through as a cap of zero" \
   "        if vmax >= 0.0:"
 
 run_solver_mutation "enabled without a plan file to write" \
-  "        self.enabled = bool(enabled and scenario and plan_file)" \
-  "        self.enabled = bool(enabled)"
+  "        self.enabled = bool(self.allowed and scenario and plan_file)" \
+  "        self.enabled = bool(self.allowed)"
+
+run_solver_mutation "the plan summary cached on mtime alone" \
+  "        key = (self.plan_file, st.st_mtime_ns, st.st_size, st.st_ino)" \
+  "        key = (self.plan_file, st.st_mtime_ns)"
+
+run_solver_mutation "retarget keeps the previous run's solve log" \
+  "            self.last = None
+        self.scenario = scenario" \
+  "            pass
+        self.scenario = scenario"
 
 run_solver_mutation "an unreadable plan crashes the snapshot" \
   "        except (OSError, ValueError):
@@ -926,6 +938,160 @@ run_mutation "accel integral gain re-enabled (winds up in every turn)" \
 
 PKG=dsim_control
 TEST=test/test_control.cpp
+
+# ---------------------------------------------------------------------------
+# The launch endpoint. The biggest hammer on the port: it tears the simulator
+# down and starts a different one. Two classes of bug are broken on purpose
+# here -- what a request is allowed to reach, and whether the endpoint can
+# still say a launch FAILED. The second matters as much as the first: a
+# launcher that reports success unconditionally turns a dead simulator into a
+# blank page with a green label on it.
+# ---------------------------------------------------------------------------
+mutate_launcher() { # $1 = name, $2 = from, $3 = to
+  local name="$1" from="$2" to="$3"
+  rm -rf "$WORK/viz"; cp -r src/dsim_viz "$WORK/viz"
+  find "$WORK/viz" -name __pycache__ -type d -exec rm -rf {} + 2>/dev/null
+  local target="$WORK/viz/dsim_viz/launcher.py"
+  if ! grep -qF -- "$from" "$target"; then
+    echo "  [SKIP]     $name  (pattern not found -- code changed, update this script)"
+    return 1
+  fi
+  python3 -c '
+import sys
+p, a, b = sys.argv[1], sys.argv[2], sys.argv[3]
+t = open(p).read()
+open(p, "w").write(t.replace(a, b, 1))
+' "$target" "$from" "$to"
+  if PYTHONPATH="$WORK/viz" python3 -m pytest -x -q "$WORK/viz/test/test_launcher.py" \
+       >"$WORK/py.log" 2>&1; then
+    echo "  [SURVIVED] $name  <-- BUG: this error would pass the test suite"
+    return 2
+  fi
+  echo "  [CAUGHT]   $name  -> $(grep -oE '[0-9]+ failed' "$WORK/py.log" | head -1)"
+  return 0
+}
+
+run_launcher_mutation() {
+  mutate_launcher "$@"
+  local rc=$?
+  [ $rc -eq 2 ] && survivors=$((survivors+1))
+  [ $rc -eq 1 ] && skipped=$((skipped+1))
+  return 0
+}
+
+echo
+echo "baseline (unmutated launch endpoint):"
+rm -rf "$WORK/viz"; cp -r src/dsim_viz "$WORK/viz"
+find "$WORK/viz" -name __pycache__ -type d -exec rm -rf {} + 2>/dev/null
+if PYTHONPATH="$WORK/viz" python3 -m pytest -q "$WORK/viz/test/test_launcher.py" \
+     >"$WORK/py.log" 2>&1; then
+  echo "  ALL_PASS  (expected)"
+else
+  echo "  BASELINE FAILS -- fix that before trusting anything below"
+  tail -5 "$WORK/py.log"
+  exit 1
+fi
+
+echo
+echo "injected launch-endpoint bugs:"
+
+run_launcher_mutation "an unknown name fabricates a run instead of being refused" \
+  "        run = self.catalogue.by_name(name)
+        if run is None:" \
+  "        run = self.catalogue.by_name(name) or {\"name\": name, \"world\": name}
+        if run is None:"
+
+run_launcher_mutation "the disabled switch ignored" \
+  "        if not self.enabled:
+            raise LaunchError(\"switching runs is disabled on this server\")" \
+  "        if False:
+            raise LaunchError(\"switching runs is disabled on this server\")"
+
+run_launcher_mutation "teardown points at something harmless, so the old sim lives" \
+  "                [\"bash\", os.path.join(self.ws, \"scripts\", \"kill_sim.sh\")]," \
+  "                [\"true\"],"
+
+run_launcher_mutation "a failed teardown ignored" \
+  "        if killed.returncode != 0:" \
+  "        if False:"
+
+run_launcher_mutation "run through a shell" \
+  "                proc = subprocess.Popen(argv, cwd=self.ws, stdout=log," \
+  "                proc = subprocess.Popen(\" \".join(argv), shell=True, cwd=self.ws, stdout=log,"
+
+run_launcher_mutation "a scenario offered that has no scenario file" \
+  "            if not os.path.exists(os.path.join(self.scenario_dir, f\"{scenario}.json\")):" \
+  "            if False:"
+
+run_launcher_mutation "the plan's filename trusted over its declared scenario" \
+  "            scenario = doc.get(\"scenario\")" \
+  "            scenario = fname.split(\"_\")[0]"
+
+run_launcher_mutation "the seed plan preferred over the solved one" \
+  "        solved = sorted(f for f, _ in plans if not f.endswith(\"_seed.json\"))" \
+  "        solved = sorted(f for f, _ in plans if f.endswith(\"_seed.json\"))"
+
+run_launcher_mutation "the sensing envelope ignored, so loiter flies on the estimate" \
+  "            if top is not None and top > ceiling:" \
+  "            if False:"
+
+run_launcher_mutation "stale telemetry counts as the new run coming up" \
+  "            if started is not None and started > self._at:" \
+  "            if started is not None:"
+
+run_launcher_mutation "a launch that exits is never reported as failed" \
+  "                if code is not None:" \
+  "                if False:"
+
+run_launcher_mutation "a launch that never publishes starts for ever" \
+  "                elif (self._clock() - self._at) > START_TIMEOUT_S:" \
+  "                elif False:"
+
+run_launcher_mutation "a second switch allowed while one is still starting" \
+  "        if self.status()[0] == \"starting\":" \
+  "        if False:"
+
+run_launcher_mutation "a reference run named after its world, so hover and circle collide" \
+  "        name = doc.get(\"world\") if doc.get(\"plan\") else doc.get(\"reference\")" \
+  "        name = doc.get(\"world\")"
+
+run_launcher_mutation "a run outside the catalogue claims a catalogue entry" \
+  "        return name if name and self.catalogue.by_name(name) else None" \
+  "        return name or None"
+
+run_launcher_mutation "the catalogue keyed on modification time alone" \
+  "            out.append((e.name, st.st_mtime_ns, st.st_size))" \
+  "            out.append((e.name, st.st_mtime_ns))"
+
+run_launcher_mutation "the catalogue keyed on the directory, which misses a rewrite" \
+  "    try:
+        entries = os.scandir(path)" \
+  "    try:
+        return os.stat(path).st_mtime_ns
+        entries = os.scandir(path)"
+
+run_launcher_mutation "the catalogue cached for the life of the process" \
+  "        if key != self._key:
+            self._runs = tuple(REFERENCE_RUNS) + tuple(self._scenario_runs())" \
+  "        if self._runs == ():
+            self._runs = tuple(REFERENCE_RUNS) + tuple(self._scenario_runs())"
+
+run_launcher_mutation "current.json cached, so the page reports the previous run" \
+  "        return doc if isinstance(doc, dict) else {}" \
+  "        self._memo = getattr(self, \"_memo\", None) or (doc if isinstance(doc, dict) else {})
+        return self._memo"
+
+run_launcher_mutation "a half-written current.json taken as fact" \
+  "        except (OSError, ValueError):
+            # Missing, or caught mid-write. Either way there is no run to
+            # report, and reporting none is better than reporting half of one.
+            return {}" \
+  "        except (OSError, ValueError):
+            raise"
+
+run_launcher_mutation "colour codes left in the log shown to the browser" \
+  "        text = \"\\n\".join(_ANSI.sub(\"\", line).rstrip() for line in raw).strip()" \
+  "        text = \"\\n\".join(line.rstrip() for line in raw).strip()"
 
 echo
 if [ "$skipped" -ne 0 ]; then

@@ -8,9 +8,11 @@ line and its own switch.
 
 What it can express, and nothing else:
 
-  * the scenario is FIXED, taken from the launch. It is not a request field,
-    because the Gazebo world is generated per scenario -- solving a different
-    one would produce a plan for obstacles that are not in the running world.
+  * the scenario is FIXED: it is whatever the RUNNING simulator says it is
+    flying, and is not a request field, because the Gazebo world is generated
+    per scenario -- solving a different one would produce a plan for obstacles
+    that are not in the running world. Switching scenarios is a different
+    endpoint with a different hammer; see launcher.py.
   * three numbers, each range-checked against a bound with a reason;
   * the output path is FIXED: the plan file the running bridge already reads.
 
@@ -66,13 +68,30 @@ class Solver:
 
     def __init__(self, ws, scenario, plan_file, enabled):
         self.ws = ws
+        self.allowed = bool(enabled)
+        self.last = None
+        self._key = object()
+        self._summary = None
+        self.retarget(scenario, plan_file)
+
+    def retarget(self, scenario, plan_file):
+        """Point at the run the simulator is flying NOW.
+
+        The viewer outlives the simulator (see launcher.py), so the scenario
+        this endpoint solves is not fixed for the life of the process any
+        more. It follows the running sim. `last` is cleared on a real change
+        because a solve log from the previous scenario, still on screen under
+        the new one's name, is a caption that lies.
+        """
+        if (scenario, plan_file) != (getattr(self, "scenario", None),
+                                     getattr(self, "plan_file", None)):
+            self.last = None
         self.scenario = scenario
         self.plan_file = plan_file
-        # Enabled only when this launch actually has a plan and a scenario.
+        # Enabled only when the running sim actually has a plan and a scenario.
         # Without both there is nothing to solve and nowhere to put it, and a
         # button that quietly does nothing is worse than one that is not there.
-        self.enabled = bool(enabled and scenario and plan_file)
-        self.last = None
+        self.enabled = bool(self.allowed and scenario and plan_file)
 
     @property
     def state(self):
@@ -89,16 +108,36 @@ class Solver:
         }
 
     def plan_summary(self):
-        """The plan on disk right now, as the page should label it."""
+        """The plan on disk right now, as the page should label it.
+
+        Cached on the file's mtime -- the same signal the planner bridge
+        reloads on -- because this is read once per streamed frame, at 30 Hz
+        per browser, and a json.load per frame per client is exactly the cost
+        the module docstring of viz_server.py is about.
+        """
         if not self.plan_file:
             return None
+        try:
+            st = os.stat(self.plan_file)
+        except OSError:
+            return None
+        # mtime is not enough on its own. Its granularity is a property of the
+        # filesystem, not of Python, so two writes inside one tick are
+        # indistinguishable by time alone -- and this cache failing silently
+        # means the page keeps quoting the PREVIOUS plan's certified clearance
+        # under the new plan's name. The inode is the decisive part:
+        # scripts/solve_plan.py writes through a temporary file and renames it,
+        # so a re-solve always lands on a different one.
+        key = (self.plan_file, st.st_mtime_ns, st.st_size, st.st_ino)
+        if key == self._key:
+            return self._summary
         try:
             with open(self.plan_file) as fh:
                 doc = json.load(fh)
         except (OSError, ValueError):
             return None
         d = doc.get("demands") or {}
-        return {
+        self._summary = {
             "solver": doc.get("solver"),
             "config": doc.get("config"),
             "certified_clearance_m": doc.get("certified_clearance_m"),
@@ -110,6 +149,8 @@ class Solver:
             "flyable": d.get("flyable"),
             "start_speed_mps": d.get("start_speed_mps"),
         }
+        self._key = key
+        return self._summary
 
     def solve(self, body):
         if not self.enabled:

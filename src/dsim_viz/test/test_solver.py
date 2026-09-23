@@ -4,6 +4,7 @@ Nothing here runs the optimiser: these are about what the endpoint will and
 will not pass through to it. Each test says what it would catch.
 """
 import json
+import os
 
 import pytest
 
@@ -140,3 +141,70 @@ def test_a_missing_or_broken_plan_summarises_as_none(tmp_path):
     bad = tmp_path / "bad.json"
     bad.write_text("{not json")
     assert sv(bad).plan_summary() is None
+
+
+# ---- the endpoint follows the running simulator ---------------------------
+#
+# The viewer outlives the simulator now (see launcher.py), so which scenario
+# this endpoint solves is not fixed for the life of the process.
+
+def test_retargets_onto_the_new_run(tmp_path, plan):
+    # FAILS IF: after a scenario switch, /solve still writes the previous
+    # scenario's plan file -- overwriting a plan the vehicle is not flying
+    # with a solve for obstacles that are not there.
+    other = tmp_path / "other.json"
+    other.write_text(plan.read_text())
+    sv = Solver("/ws", "fence3d", str(plan), True)
+    sv.retarget("wall", str(other))
+    assert sv.scenario == "wall"
+    assert sv.state["plan_file"] == "other.json"
+
+
+def test_retargeting_drops_the_previous_solve_log(tmp_path, plan):
+    # FAILS IF: the log from the old scenario's solve stays on screen under
+    # the new scenario's name -- a caption that lies.
+    other = tmp_path / "other.json"
+    other.write_text(plan.read_text())
+    sv = Solver("/ws", "fence3d", str(plan), True)
+    sv.last = {"N": 8, "n_seg": 2, "v_max": 3.0, "log": "solved fence3d"}
+    sv.retarget("wall", str(other))
+    assert sv.last is None
+
+
+def test_retargeting_to_the_same_run_keeps_the_log(plan):
+    # FAILS IF: the solve log is wiped 30 times a second, because the state
+    # stream retargets on every frame.
+    sv = Solver("/ws", "fence3d", str(plan), True)
+    sv.last = {"N": 8, "n_seg": 2, "v_max": 3.0, "log": "solved fence3d"}
+    sv.retarget("fence3d", str(plan))
+    assert sv.last is not None
+
+
+def test_retargeting_to_a_run_with_no_plan_disables_solving(plan):
+    # FAILS IF: switching to hover or circle leaves a solve button with
+    # nothing to solve and nowhere to put it.
+    sv = Solver("/ws", "fence3d", str(plan), True)
+    assert sv.enabled
+    sv.retarget("", "")
+    assert not sv.enabled
+
+
+def test_the_plan_summary_is_not_cached_on_mtime_alone(tmp_path, plan):
+    # FAILS IF: the cache key is the modification TIME and nothing else. Its
+    # granularity belongs to the filesystem, not to Python, so two writes
+    # inside one tick are indistinguishable by time -- and the page then goes
+    # on quoting the previous plan's certified clearance under the new plan's
+    # name, which is the kind of stale number that gets believed.
+    #
+    # The timestamp is pinned rather than raced. Writing twice and hoping they
+    # land in the same tick is a test that only catches the bug on a fast
+    # enough machine, which is to say a test that reports a pass for a reason
+    # it cannot state.
+    sv = Solver("/ws", "fence3d", str(plan), True)
+    assert sv.state["plan"]["config"] == "N8_seg2"
+    stamp = os.stat(plan).st_mtime_ns
+    doc = json.loads(plan.read_text())
+    doc["config"] = "N12_seg8"
+    plan.write_text(json.dumps(doc) + " " * 32)
+    os.utime(plan, ns=(stamp, stamp))
+    assert sv.state["plan"]["config"] == "N12_seg8"

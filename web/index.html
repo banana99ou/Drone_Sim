@@ -28,12 +28,41 @@
   .planline { color: #9aa3b8; font-size: 11px; line-height: 1.45; margin-top: 4px;
               font-variant-numeric: tabular-nums; }
   .planline.bad { color: #f87171; }
+  .planline.warn { color: #f59e0b; }
+  #runlog { margin: 6px 0 0; padding: 6px; max-height: 108px; overflow: auto;
+            background: #10131a; border: 1px solid #2a2f3d; border-radius: 4px;
+            color: #f87171; font-size: 10px; line-height: 1.35; white-space: pre-wrap; }
   #solvelog { margin: 7px 0 0; padding: 6px; max-height: 150px; overflow: auto;
               background: #10131a; border: 1px solid #2a2f3d; border-radius: 4px;
               color: #9aa3b8; font-size: 10px; line-height: 1.35; white-space: pre-wrap; }
-  .panel { position: fixed; background: rgba(18,21,28,.86); border: 1px solid #2a2f3d;
+  .panel { background: rgba(18,21,28,.86); border: 1px solid #2a2f3d;
     border-radius: 10px; padding: 10px 12px; backdrop-filter: blur(8px); }
-  #hud { top: 12px; left: 12px; min-width: 226px; }
+  /* The panels live in two fixed-height RAILS rather than being positioned
+     individually. Free-floating panels sized by their content is what put the
+     control panel underneath the legend and ran the HUD off the bottom of a
+     laptop screen: nothing knew how tall the window was. A rail is bounded by
+     the viewport, so its children can only scroll, never escape. */
+  .rail { position: fixed; top: 12px; bottom: 12px; display: flex;
+    flex-direction: column; gap: 8px; pointer-events: none; z-index: 2; }
+  .rail > * { pointer-events: auto; min-height: 0; }
+  .rail .scroll { overflow-y: auto; overscroll-behavior: contain;
+    scrollbar-width: thin; scrollbar-color: #39415480 transparent; }
+  .rail .scroll::-webkit-scrollbar { width: 7px; }
+  .rail .scroll::-webkit-scrollbar-thumb { background: #394154; border-radius: 4px; }
+  .rail .scroll::-webkit-scrollbar-track { background: transparent; }
+  #left { left: 12px; width: 232px; }
+  #right { right: 12px; width: 186px; }
+  /* The HUD gives up height first: it is a table you can scroll. The control
+     panel is the one with the buttons, so it keeps what it needs. */
+  #hud { flex: 0 1 auto; }
+  #legend { flex: none; }
+  #ctl { flex: 1 1 auto; }
+  /* Narrow screens (the iPad in portrait, a phone): shrink the rails rather
+     than let them meet in the middle over the drone. */
+  @media (max-width: 620px) {
+    #left { width: 188px; } #right { width: 164px; }
+    #hud td { padding: 1px 0; } #hud td:first-child { padding-right: 8px; }
+  }
   #hud h1 { margin: 0 0 8px; font-size: 13px; letter-spacing: .02em; font-weight: 650; }
   #hud table { border-collapse: collapse; width: 100%; }
   #hud td { padding: 2px 0; font-variant-numeric: tabular-nums; }
@@ -42,7 +71,6 @@
   #hud tr.sep td { padding-top: 9px; color: #5d647a; font-size: 10px;
     text-transform: uppercase; letter-spacing: .09em; font-weight: 600; }
   #hud td#rot { font-size: 11px; letter-spacing: -.01em; }
-  #ctl { top: 12px; right: 12px; width: 168px; }
   #ctl label.field { display: block; color: #8b93a7; margin: 0 0 4px; font-size: 10px;
     text-transform: uppercase; letter-spacing: .07em; }
   #ctl select, #ctl button { background: #1b1f2a; color: #e6e8ef; border: 1px solid #333a4a;
@@ -63,11 +91,10 @@
   #speed { width: 100%; accent-color: #f59e0b; }
   #gustn { width: 100%; accent-color: #f472b6; }
   #ctl button:disabled { opacity: .45; cursor: not-allowed; }
-  #legend { bottom: 12px; right: 12px; font-size: 11px; color: #a9b1c4; }
+  #legend { font-size: 11px; color: #a9b1c4; }
   #legend div { display: flex; align-items: center; gap: 7px; margin: 2px 0; }
   #legend i { width: 12px; height: 3px; border-radius: 2px; flex: none; }
-  #legend .note { display: block; color: #7b8398; margin-top: 6px; max-width: 168px; }
-  #help { bottom: 12px; left: 12px; color: #7b8398; font-size: 11px; }
+  #legend .note { display: block; color: #7b8398; margin-top: 6px; }
   .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%;
     margin-right: 6px; vertical-align: 1px; }
   .up { background: #34d399; } .down { background: #f87171; }
@@ -77,7 +104,8 @@
 
 <canvas id="view"></canvas>
 
-<div id="hud" class="panel">
+<div id="left" class="rail">
+<div id="hud" class="panel scroll">
   <h1><span id="link" class="dot down"></span><span id="linktext">connecting…</span></h1>
   <table>
     <tr><td>altitude</td><td id="alt">—</td></tr>
@@ -111,10 +139,22 @@
     <tr><td>resets</td><td id="resets">—</td></tr>
   </table>
 </div>
+<div id="legend" class="panel"></div>
+</div>
 
-<div id="ctl" class="panel">
+<div id="right" class="rail">
+<div id="ctl" class="panel scroll">
+  <!-- Picking from this list RESTARTS the simulator with that run. It is not a
+       drawing preference: the obstacles, the world and the plan all come from
+       whichever run is actually up, and a selector that only changed what was
+       drawn could show a fence the vehicle was not flying through. The viewer
+       survives the restart because it is a launch of its own -- see
+       src/dsim_bringup/launch/viz.launch.py. -->
   <label class="field" for="world">scenario</label>
   <select id="world"></select>
+  <div class="planline" id="runline">—</div>
+  <div class="hint" id="runnote" hidden></div>
+  <pre id="runlog" hidden></pre>
   <hr>
   <label class="field">overlays</label>
   <div id="groups"></div>
@@ -171,8 +211,6 @@
   <button id="clear">clear trails</button>
   <div class="hint">drag orbits · right-drag, shift-drag or two fingers pan · wheel or pinch zooms</div>
 </div>
-
-<div id="legend" class="panel"></div>
-<div id="help" class="panel">drag orbit · wheel/pinch zoom · shift-drag pan</div>
+</div>
 
 <script type="module" src="js/app.js"></script>

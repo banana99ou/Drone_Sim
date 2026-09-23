@@ -28,7 +28,7 @@ SCENARIO="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['sce
   || { echo "FAIL: cannot read scenario from $PLAN"; exit 1; }
 START_S="$(python3 -c "import json,sys; print(json.load(open(f'scenarios/{sys.argv[1]}.json'))['sim']['start_s'])" "$SCENARIO")"
 
-SIM_PROCS='gz sim|controller_node|eval_node|reference_generator_node|parameter_bridge|bridge_node'
+SIM_PROCS='gz sim|controller_node|eval_node|reference_generator_node|parameter_bridge|bridge_node|viz_server'
 kill_leftovers() { bash "$(dirname "$0")/kill_sim.sh" >/dev/null 2>&1; }
 
 if pgrep -f "$SIM_PROCS" >/dev/null 2>&1; then
@@ -40,15 +40,24 @@ if pgrep -f "$SIM_PROCS" >/dev/null 2>&1; then
 fi
 
 echo "== launching ($SCENARIO, plan $PLAN, state=$STATE, headless; scenario t=0 at sim ${START_S}s) =="
+# The viewer is its own launch now (see viz.launch.py): this script reads the
+# run through its /snapshot endpoint, so it has to bring one up itself. Started
+# first, because the poll below asks it whether the simulator has appeared.
+setsid ros2 launch dsim_bringup viz.launch.py web_port:="$WEB_PORT" \
+    >/tmp/plan_check_viz.log 2>&1 &
+VIZ_PID=$!
+
 setsid ros2 launch dsim_bringup sim.launch.py \
-    world:="$SCENARIO" plan:="/ws/$PLAN" gui:=false web_port:="$WEB_PORT" state:="$STATE" \
+    world:="$SCENARIO" plan:="/ws/$PLAN" gui:=false state:="$STATE" \
     >/tmp/plan_check.log 2>&1 &
 LAUNCH_PID=$!
 
 cleanup() {
+  kill -INT -"$VIZ_PID" 2>/dev/null || kill -INT "$VIZ_PID" 2>/dev/null
   kill -INT -"$LAUNCH_PID" 2>/dev/null || kill -INT "$LAUNCH_PID" 2>/dev/null
   for _ in $(seq 1 8); do kill -0 "$LAUNCH_PID" 2>/dev/null || return 0; sleep 1; done
   kill -KILL -"$LAUNCH_PID" 2>/dev/null
+  kill -KILL -"$VIZ_PID" 2>/dev/null
   kill_leftovers
   return 0
 }

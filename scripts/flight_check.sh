@@ -36,7 +36,7 @@ WEB_PORT="${WEB_PORT:-8080}"
 source /opt/ros/jazzy/setup.bash
 source /ws/install/setup.bash
 
-SIM_PROCS='gz sim|controller_node|eval_node|reference_generator_node|parameter_bridge'
+SIM_PROCS='gz sim|controller_node|eval_node|reference_generator_node|parameter_bridge|viz_server'
 
 kill_leftovers() {
   # Delegated to a script file on purpose -- see the comment in kill_sim.sh
@@ -62,9 +62,16 @@ fi
 
 echo "== launching ($WORLD, $REFERENCE, state=$STATE, headless) =="
 # setsid so the whole launch tree is one process group we can signal as a unit.
+# The viewer is its own launch now (see viz.launch.py): this script reads the
+# run through its /snapshot endpoint, so it has to bring one up itself. Started
+# first, because the poll below asks it whether the simulator has appeared.
+setsid ros2 launch dsim_bringup viz.launch.py web_port:="$WEB_PORT" \
+    >/tmp/flight_check_viz.log 2>&1 &
+VIZ_PID=$!
+
 setsid ros2 launch dsim_bringup sim.launch.py \
     world:="$WORLD" reference:="$REFERENCE" gui:=false \
-    radius:="$RADIUS" period:="$PERIOD" web_port:="$WEB_PORT" state:="$STATE" \
+    radius:="$RADIUS" period:="$PERIOD" state:="$STATE" \
     >/tmp/flight_check.log 2>&1 &
 LAUNCH_PID=$!
 
@@ -72,12 +79,14 @@ cleanup() {
   # `ros2 launch` does not reliably exit on SIGINT without a tty, and a bare
   # `wait` on it hangs forever -- that is exactly how the first version of this
   # script wedged. Signal the group, give it a bounded grace period, then KILL.
+  kill -INT -"$VIZ_PID" 2>/dev/null || kill -INT "$VIZ_PID" 2>/dev/null
   kill -INT -"$LAUNCH_PID" 2>/dev/null || kill -INT "$LAUNCH_PID" 2>/dev/null
   for _ in $(seq 1 8); do
     kill -0 "$LAUNCH_PID" 2>/dev/null || return 0
     sleep 1
   done
   kill -KILL -"$LAUNCH_PID" 2>/dev/null
+  kill -KILL -"$VIZ_PID" 2>/dev/null
   kill_leftovers
   return 0
 }

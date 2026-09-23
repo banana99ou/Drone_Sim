@@ -41,16 +41,25 @@ Endpoints, all on one port and one origin:
     /state         text/event-stream, ~30 Hz of the same object
     /control       POST: pause, playback speed, reset, gust  (see simcontrol.py)
     /solve         POST: re-solve the running scenario         (see solver.py)
+    /launch        POST: switch which run the sim is flying    (see launcher.py)
 
-Almost read-only. Every GET is. There are two write paths, kept apart on
-purpose: /control reaches the simulator, /solve reaches the planner and
-nothing else. Widening /control to run the solver would have falsified the
-paragraph below while leaving it on the page. It forwards
+Almost read-only. Every GET is. There are three write paths, kept apart on
+purpose: /control reaches the simulator, /solve reaches the planner, /launch
+cycles the simulator's launch, and none of them can do another's job.
+Widening /control to run the solver would have falsified the paragraph below
+while leaving it on the page. It forwards
 to one ROS service with four commands -- pause, toggle pause, speed, reset --
 and can express nothing else. It cannot arm a vehicle, retune a controller,
 move the drone or run a command. That narrowness is the point: this port is
 reachable from the whole tailnet. With `control:=false` the endpoint still
 exists and answers 403 -- it is disabled, not removed.
+
+THIS PROCESS OUTLIVES THE SIMULATOR. It is launched by viz.launch.py, not by
+sim.launch.py, precisely so that /launch can tear the simulator down and bring
+a different scenario up without the server that was asked to do it going down
+with it. Everything here that names the running scenario therefore reads
+web/current.json -- written by the simulator's launch, so it reports what came
+up rather than what was requested -- instead of taking it from argv once.
 
 The narrowness claim used to be made about a version of this endpoint that
 could, through `gz service -s set_physics`, delete the world's gravity and
@@ -62,6 +71,7 @@ reconstructed from the spacing of unrelated INFO lines.
 """
 import json
 import math
+import os
 import threading
 import time
 from functools import partial
@@ -77,6 +87,7 @@ from dsim_msgs.msg import ClearanceReport, ControlDebug, FlightStatus, Trajector
 from nav_msgs.msg import Path
 
 from . import overlay
+from .launcher import CurrentRun, LaunchError, Launcher
 from .simcontrol import UNKNOWN, ControlError, SimControlClient
 from .solver import SolveError, Solver
 
@@ -121,6 +132,10 @@ class State:
         # Read through like sim_source, and for the same reason: the plan on
         # disk changes without any message arriving here.
         self.solver_source = lambda: None
+        self.launcher_source = lambda: None
+        # Monotonic time the last FlightStatus arrived, or None if none ever
+        # has. Read by the launcher to decide whether a run it started is up.
+        self.status_at = None
         self._cache = None
         self._cache_seq = -1
 
@@ -138,7 +153,8 @@ class State:
                 # The memo holds vehicle state; the simulator's pause/speed
                 # arrives on its own topic, so it is read fresh here.
                 return dict(self._cache, sim=self.sim_source(),
-                            solver=self.solver_source())
+                            solver=self.solver_source(),
+                            launcher=self.launcher_source())
             seq, odom, sp = self.seq, self.odom, self.setpoint
             status, control, imu = self.status, self.control, self.imu
             consumed = self.consumed
@@ -168,7 +184,8 @@ class State:
             # the memo is only valid for the seq it was built from.
             if self._cache_seq < seq:
                 self._cache, self._cache_seq = snap, seq
-            snap = dict(snap, sim=self.sim_source(), solver=self.solver_source())
+            snap = dict(snap, sim=self.sim_source(), solver=self.solver_source(),
+                        launcher=self.launcher_source())
         return snap
 
 
@@ -358,6 +375,10 @@ class VizNode(Node):
     def on_status(self, m):
         with self.state.lock:
             self.state.status = m
+            # WALL time, not the message stamp: this is how /launch tells a
+            # simulator that came up from one that did not, and a sim-time
+            # stamp from a world that never started would be 0.0 forever.
+            self.state.status_at = time.monotonic()
             self.state._bump()
 
     def on_control(self, m):
@@ -386,7 +407,9 @@ class Handler(SimpleHTTPRequestHandler):
     sim_control = None    # set via partial()
     solver = None         # set via partial()
     logger = None         # set via partial(): the node's logger
+    launcher = None       # set via partial()
     rate_hz = 30.0
+
     # Refuse a body larger than this outright. The only legitimate request is a
     # few dozen bytes of JSON, so anything bigger is a mistake or an attempt to
     # make the server allocate.
@@ -437,15 +460,17 @@ class Handler(SimpleHTTPRequestHandler):
                 + (f" — {detail}" if detail else ""))
 
     def do_POST(self):
-        """The write paths: /control drives the simulator, /solve the planner.
+        """The write paths: /control drives the simulator, /solve the planner,
+        /launch cycles the simulator's launch.
 
         Everything a /control request can express is parsed in simcontrol.py
         and applied by dsim_simctl, and the reply reports what was OBSERVED
         afterwards rather than what was asked for. /solve is in solver.py and
-        can express three range-checked numbers.
+        can express three range-checked numbers. /launch is in launcher.py and
+        can express one name out of a catalogue read off disk.
         """
         route = self.path.split("?")[0]
-        if route not in ("/control", "/solve"):
+        if route not in ("/control", "/solve", "/launch"):
             self._json({"error": "not found"}, 404)
             return
         if route == "/control" and (self.sim_control is None or not self.sim_control.enabled):
@@ -455,6 +480,10 @@ class Handler(SimpleHTTPRequestHandler):
         if route == "/solve" and (self.solver is None or not self.solver.enabled):
             self._audit("refused", "solving disabled")
             self._json({"error": "this run has no plan to re-solve"}, 403)
+            return
+        if route == "/launch" and (self.launcher is None or not self.launcher.enabled):
+            self._audit("refused", "launching disabled")
+            self._json({"error": "switching runs is disabled"}, 403)
             return
 
         # Require a JSON content type. This is not pedantry: without it the
@@ -489,10 +518,12 @@ class Handler(SimpleHTTPRequestHandler):
             self._json({"error": f"bad JSON: {exc}"}, 400)
             return
 
+        routes = {"/control": lambda: self.sim_control.command(body),
+                  "/solve": lambda: self.solver.solve(body),
+                  "/launch": lambda: self.launcher.launch(body)}
         try:
-            result = (self.sim_control.command(body) if route == "/control"
-                      else self.solver.solve(body))
-        except (ControlError, SolveError) as exc:
+            result = routes[route]()
+        except (ControlError, SolveError, LaunchError) as exc:
             # A refused request is a normal outcome, not a server fault: 400 so
             # the page can show the reason instead of a generic failure.
             self._audit("refused", f"{route} {body} — {exc}")
@@ -545,13 +576,14 @@ def main():
     # No --world-name: this process no longer talks to Gazebo at all. The world
     # name belongs to dsim_simctl, which is the only thing that does.
     parser.add_argument("--allow-control", action="store_true",
-                        help="expose POST /control (pause, speed, reset) and, "
-                             "when this run is flying a plan, POST /solve")
-    parser.add_argument("--scenario", default="",
-                        help="the space-time scenario this run is flying, if any")
-    parser.add_argument("--plan-file", default="",
-                        help="the plan file the bridge reads; /solve overwrites it")
-    parser.add_argument("--ws", default="/ws", help="workspace root, for the solver")
+                        help="expose the write paths: POST /control (pause, "
+                             "speed, reset, gust), POST /solve when the running "
+                             "sim is flying a plan, and POST /launch")
+    # No --scenario/--plan-file. This process outlives the simulator, so the
+    # scenario is not a property of ITS launch; it is read from current.json,
+    # which the simulator's launch writes when it comes up.
+    parser.add_argument("--ws", default="/ws", help="workspace root, for the "
+                        "solver, the launcher and the run catalogue")
     args, ros_args = parser.parse_known_args()
 
     rclpy.init(args=ros_args)
@@ -566,13 +598,31 @@ def main():
     sim_control = SimControlClient(node, enabled=bool(args.allow_control))
     state.sim_source = lambda: sim_control.state
 
-    solver = Solver(args.ws, args.scenario, args.plan_file,
+    # The one place that knows what is flying. Both the solver (which scenario
+    # to re-solve, which file to overwrite) and the page (which obstacles to
+    # draw) follow it, so they cannot disagree about which run is on screen.
+    current = CurrentRun(os.path.join(args.directory, "current.json"), args.ws)
+    solver = Solver(args.ws, current.scenario, current.plan_file,
                     enabled=bool(args.allow_control))
-    state.solver_source = lambda: solver.state
+
+    def solver_view():
+        # current.json is re-read here rather than cached -- it is eighty bytes
+        # and it is the one fact this server must not be stale about. The PLAN
+        # underneath it is the expensive read, and that one is cached on the
+        # file's identity; see Solver.plan_summary.
+        solver.retarget(current.scenario, current.plan_file)
+        return solver.state
+
+    state.solver_source = solver_view
+
+    launcher = Launcher(args.ws, current, enabled=bool(args.allow_control),
+                        status_at=lambda: state.status_at)
+    state.launcher_source = lambda: launcher.state
 
     Handler.state = state
     Handler.sim_control = sim_control
     Handler.solver = solver
+    Handler.launcher = launcher
     Handler.logger = node.get_logger()
     Handler.rate_hz = args.rate
     handler = partial(Handler, directory=args.directory)
@@ -584,8 +634,9 @@ def main():
     node.get_logger().info(
         f"viewer on http://{args.bind}:{args.port}  "
         f"(static {args.directory}, SSE /state at {args.rate:.0f} Hz, "
-        f"control {'ON' if args.allow_control else 'OFF'}, "
-        f"solve {'ON for ' + args.scenario if solver.enabled else 'OFF'})")
+        f"write paths {'ON' if args.allow_control else 'OFF'}, "
+        f"{len(launcher.catalogue.runs())} runs on offer, "
+        f"now flying {current.read().get('world') or 'nothing yet'})")
 
     try:
         rclpy.spin(node)

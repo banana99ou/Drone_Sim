@@ -58,6 +58,7 @@ const S = {
   overlay: null,
   sim: null,
   solver: null,        // the planner panel: what can be solved, and what is loaded
+  launcher: null,      // the run catalogue and what the simulator is doing with it
   clearance: null,     // the referee's obstacle report: live positions, hits
   planPath: null,      // the planner's whole path, before it is flown
   flown: [],
@@ -71,6 +72,10 @@ const prefs = {
 
 let cam = { ...CAM_HOME, target: CAM_HOME.target.slice() };
 let hudError = "";
+// True between asking for a run and the server reporting one. It stops the
+// dropdown being overwritten by the still-running old scenario while the new
+// one comes up, which would silently snap the user's choice back.
+let switching = false;
 
 const renderer = new Renderer(el("view"));
 const telemetry = new Telemetry({ onSnapshot: ingest });
@@ -85,14 +90,15 @@ function loadPrefs() {
     if (!saved) return;
     if (typeof saved.gain === "number") prefs.gain = saved.gain;
     if (saved.show) Object.assign(prefs.show, saved.show);
-    if (saved.world) S.world = saved.world;
+    // NOT the world: that follows the running simulator now (see adoptRun),
+    // and a remembered one would fight it on every load.
   } catch (_) { /* private browsing, or a stale format */ }
 }
 
 function savePrefs() {
   try {
     localStorage.setItem(PREFS_KEY, JSON.stringify(
-      { gain: prefs.gain, show: prefs.show, world: S.world }));
+      { gain: prefs.gain, show: prefs.show }));
   } catch (_) { /* not important enough to surface */ }
 }
 
@@ -135,6 +141,66 @@ function ingest(snap) {
   if (snap.overlay !== undefined) S.overlay = snap.overlay;
   if (snap.sim) S.sim = snap.sim;
   if (snap.solver !== undefined) S.solver = snap.solver;
+  if (snap.launcher !== undefined) adoptRun(snap.launcher);
+}
+
+/// Follow the simulator that is actually up.
+///
+/// The world decides which colours the obstacles are drawn in and where the
+/// camera goes home to, and it is taken from the RUNNING sim rather than from
+/// a saved preference. A viewer that remembered a world across a restart would
+/// paint one scenario's palette over another scenario's obstacles, which is
+/// the failure the old cosmetic selector could produce on purpose.
+function adoptRun(lc) {
+  S.launcher = lc;
+  const world = (lc.current && lc.current.world) || null;
+  // Which dropdown entry is flying. NOT the world: hover and circle share the
+  // empty world, so a selector set from the world would sit on neither of them
+  // while one was running. The server works this out; see current_run_name().
+  const run = lc.current_run;
+  if (world && world !== S.world && S.scene && S.scene.worlds[world]) {
+    S.world = world;
+    cam = homeFor(S.scene.worlds[world]);
+    // Whatever was on screen belonged to the run that just ended.
+    S.flown = [];
+    S.planned = [];
+    S.clearance = null;
+    S.planPath = null;
+  }
+  const sel = el("world");
+  // Keyed on the NAMES, not the count: a catalogue that swapped one run for
+  // another would keep its length, and the dropdown would go on offering a run
+  // the server no longer has.
+  const key = lc.runs.map((r) => r.name).join("|");
+  if (sel && sel.dataset.filled !== key) fillRuns(sel, lc.runs, key);
+  // Not while a switch is in flight: current.json still names the OLD run
+  // until the new launch has accepted its arguments and written it, so setting
+  // the selector from it here would visibly snap the user's choice back for a
+  // second and then jump forward again.
+  const settled = !switching && lc.status !== "starting";
+  if (sel && settled && document.activeElement !== sel && run) sel.value = run;
+}
+
+/// Build the dropdown from the catalogue the SERVER offers.
+///
+/// Not from scene.json: the server will only launch a name out of this list,
+/// so taking the list from anywhere else would let the page offer a run that
+/// is then refused. Empty means the server has nothing to launch, and the
+/// control says so instead of being an empty box.
+function fillRuns(sel, runs, key) {
+  sel.textContent = "";
+  for (const r of runs) {
+    const o = document.createElement("option");
+    o.value = r.name;
+    o.textContent = r.title || r.name;
+    sel.appendChild(o);
+  }
+  if (!runs.length) {
+    const o = document.createElement("option");
+    o.textContent = "no runs on offer";
+    sel.appendChild(o);
+  }
+  sel.dataset.filled = key;
 }
 
 // ---- frame rate ----------------------------------------------------------
@@ -373,6 +439,7 @@ function updateHudOnce() {
     el("gust").className = mag < 1e-6 ? "" : "bad";
   }
 
+  updateRunPanel();
   updateSolvePanel();
 
   const st = S.status;
@@ -411,6 +478,63 @@ function updateHudOnce() {
     el("obst").className = n > 0 && live === 0 ? "bad" : "";
     el("stime").textContent = fmt(cl.scenario_time_s, " s", 1) +
       (cl.duration_s ? ` of ${cl.duration_s.toFixed(0)}` : "");
+  }
+}
+
+/// What the simulator is doing with the run that was asked for.
+///
+/// Written to be able to say NO. "starting" carries the seconds it has been
+/// starting for, and a launch that dies shows the tail of its own log in the
+/// page -- because the alternative, discovered the hard way, is a dropdown
+/// that changes and then nothing happens, with the reason sitting in a file on
+/// the host that the person looking at the page cannot read.
+function updateRunPanel() {
+  const lc = S.launcher;
+  const line = el("runline");
+  const note = el("runnote");
+  const log = el("runlog");
+  const sel = el("world");
+  if (!lc) {
+    line.textContent = "waiting for the server";
+    return;
+  }
+  sel.disabled = !lc.enabled || lc.status === "starting";
+  if (lc.status === "starting") {
+    switching = false;               // the server owns the state from here
+    line.textContent = `starting ${lc.requested}… ${lc.elapsed_s ?? 0} s`;
+    line.className = "planline warn";
+    log.hidden = true;
+  } else if (lc.status === "failed") {
+    line.textContent = `${lc.requested || "the run"} did not start`;
+    line.className = "planline bad";
+    log.hidden = false;
+    log.textContent = lc.detail || "no detail";
+  } else if (lc.status === "running") {
+    const cur = lc.current || {};
+    const bits = [cur.world || "?"];
+    if (cur.plan) bits.push(cur.plan.replace(/\.json$/, ""));
+    else if (cur.reference && cur.reference !== "none") bits.push(cur.reference);
+    if (cur.state === "truth") bits.push("on truth");
+    line.textContent = `flying ${bits.join(" · ")}`;
+    line.className = "planline";
+    log.hidden = true;
+  } else {
+    // No telemetry and nothing starting. The server is up -- you are reading
+    // its page -- so this is specifically "no simulator", not "no viewer".
+    line.textContent = switching ? "asking…" : "no simulator running";
+    line.className = "planline bad";
+    log.hidden = !lc.detail;
+    if (lc.detail) log.textContent = lc.detail;
+  }
+  // Anything the chosen run needs said about it: an altitude outside the
+  // sensing envelope, or a plan the vehicle cannot fly.
+  const run = lc.runs.find((r) => r.name === sel.value);
+  const why = run && (run.state_reason || run.warning);
+  note.hidden = !why;
+  if (why) note.textContent = why;
+  if (!lc.enabled) {
+    line.textContent = "switching runs is disabled on this server";
+    line.className = "planline";
   }
 }
 
@@ -642,41 +766,63 @@ function bindInput() {
     }).catch((e) => { log.textContent = `solve: ${e.message}`; })
       .finally(() => { btn.disabled = false; btn.textContent = "solve & fly"; });
   };
+  // The scenario dropdown RESTARTS the simulator. It goes to its own endpoint
+  // for the same reason /solve does: /control is documented as unable to run a
+  // command, and this one runs a launch.
   el("world").onchange = (e) => {
-    S.world = e.target.value;
-    cam = homeFor(S.scene && S.scene.worlds[S.world]);
-    savePrefs();
+    const name = e.target.value;
+    const sel = e.target;
+    switching = true;
+    sel.disabled = true;
+    el("runline").textContent = `asking for ${name}…`;
+    el("runline").className = "planline warn";
+    el("runlog").hidden = true;
+    fetch("/launch", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ run: name }),
+    }).then((r) => r.json()).then((r) => {
+      if (r.error) {
+        switching = false;
+        el("runline").textContent = "refused";
+        el("runline").className = "planline bad";
+        el("runlog").hidden = false;
+        el("runlog").textContent = r.error;
+        hudError = "switch refused";
+      } else {
+        // The old run's path is not this run's path, and its obstacles are
+        // not this run's obstacles. Clear them now rather than let the last
+        // frame of the previous scenario hang under the new one.
+        S.flown = [];
+        S.planned = [];
+        S.clearance = null;
+        S.planPath = null;
+        S.launcher = r;
+        hudError = "";
+      }
+    }).catch((err) => {
+      switching = false;
+      el("runline").textContent = `switch: ${err.message}`;
+      el("runline").className = "planline bad";
+    }).finally(() => { sel.disabled = false; });
   };
 }
 
 // ---- boot ----------------------------------------------------------------
+/// The static half of the scene: the drone's geometry, and per-world palettes
+/// and camera framing.
+///
+/// It no longer fills the dropdown or reads current.json. Both of those are
+/// live facts about a simulator that now starts and stops underneath this
+/// page, so they arrive on the stream (see adoptRun) where they can change
+/// without a reload. This file is only the things that are true of a world
+/// whether or not anything is running in it.
 function loadScene() {
   return fetch("scene.json")
     .then((r) => r.json())
     .then((scene) => {
       S.scene = scene;
-      const sel = el("world");
-      for (const name of Object.keys(scene.worlds)) {
-        const o = document.createElement("option");
-        o.value = name;
-        o.textContent = name;
-        sel.appendChild(o);
-      }
-      if (!scene.worlds[S.world]) S.world = Object.keys(scene.worlds)[0];
-      sel.value = S.world;
-      // What the sim is ACTUALLY running overrides the remembered choice.
-      // Drawing obstacles that are not in the running world is worse than
-      // drawing none: you would trust a clearance that does not exist.
-      return fetch("current.json", { cache: "no-store" })
-        .then((r) => r.json())
-        .then((cur) => {
-          if (cur && cur.world && scene.worlds[cur.world]) {
-            S.world = cur.world;
-            sel.value = S.world;
-          }
-          cam = homeFor(scene.worlds[S.world]);
-        })
-        .catch(() => { /* viz launched without it; the dropdown stays manual */ });
+      if (scene.worlds[S.world]) cam = homeFor(scene.worlds[S.world]);
     })
     .catch(() => {
       el("linktext").textContent = "scene.json missing";

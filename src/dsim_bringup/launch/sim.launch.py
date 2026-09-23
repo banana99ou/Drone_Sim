@@ -128,8 +128,6 @@ def launch_setup(context, *args, **kwargs):
     use_rviz = LaunchConfiguration('rviz').perform(context)
     csv_path = LaunchConfiguration('csv').perform(context)
     viz = LaunchConfiguration('viz').perform(context)
-    bind = LaunchConfiguration('bind').perform(context)
-    web_port = LaunchConfiguration('web_port').perform(context)
     control = LaunchConfiguration('control').perform(context)
     radius = LaunchConfiguration('radius').perform(context)
     altitude = LaunchConfiguration('altitude').perform(context)
@@ -361,27 +359,44 @@ def launch_setup(context, *args, **kwargs):
                          'gust_link': 'drone::base_link'}],
         ))
 
-    # Tell the viewer which world is actually running. Without this its world
-    # selector is cosmetic, and it could happily draw one scenario's obstacles
-    # while the sim flies another -- showing a fence that is not there.
+    # Tell the viewer which world is actually running. This is the ONLY handoff
+    # between the two launches, and it is written HERE, at the end of a setup
+    # that has already refused every bad combination above -- so it records
+    # what came up, not what was asked for. A launch that rejects its own
+    # arguments never reaches this line, and the viewer goes on reporting the
+    # previous run rather than a run that does not exist.
+    #
+    # Without it the viewer's scenario selector is cosmetic, and it could
+    # happily draw one scenario's obstacles while the sim flies another --
+    # showing a fence that is not there.
+    #
+    # Written through a temporary file and renamed, because the viewer is a
+    # separate process reading it while this one writes: a plain open(..., 'w')
+    # is a truncate followed by a write, and a reader landing in between gets
+    # an empty or half-written document. Rename is atomic on the same
+    # filesystem, so a reader sees either the old run or the new one.
     if viz == 'true':
+        target = os.path.join(WEB_DIR, 'current.json')
         try:
-            with open(os.path.join(WEB_DIR, 'current.json'), 'w') as fh:
+            tmp = target + '.tmp'
+            with open(tmp, 'w') as fh:
                 json.dump({'world': world, 'reference': reference,
+                           'state': state,
                            'plan': os.path.basename(plan) if plan else None}, fh)
+            os.replace(tmp, target)
         except OSError as exc:
             print(f'[sim.launch] could not write current.json: {exc}')
 
-    # ---- remote viewer ----------------------------------------------------
-    # Streams state over a WebSocket for web/index.html to render, rather than
-    # streaming video of a GUI. See docs/VIEWER.md.
+    # ---- telemetry for the viewer -----------------------------------------
+    # The viewer SERVER is not here. It lives in viz.launch.py, as its own
+    # process, because its POST /launch restarts THIS launch to switch
+    # scenarios -- see that file's docstring. Only the relay is a per-run
+    # thing, because its state topic follows state:=est|truth.
+    #
+    # Decimates the 250 Hz telemetry to ~30 Hz. See the header of
+    # dsim_eval/src/viz_relay_node.cpp for the measured reason this is a
+    # separate C++ node and not a filter in the Python viewer.
     if viz == 'true':
-        # One process, one port, one origin: static files + an SSE state stream.
-        # This replaced rosbridge plus a separate http.server -- see the module
-        # docstring in dsim_viz/viz_server.py for why.
-        # Decimates the 250 Hz telemetry to ~30 Hz for the Python viewer.
-        # See the header of dsim_eval/src/viz_relay_node.cpp for the measured
-        # reason this is a separate C++ node and not a filter in the viewer.
         nodes.append(Node(
             package='dsim_eval', executable='viz_relay_node', name='dsim_viz_relay',
             output='screen',
@@ -391,29 +406,6 @@ def launch_setup(context, *args, **kwargs):
             parameters=[{'use_sim_time': True, 'rate_hz': 30.0,
                          'state_topic': '/drone/state_est' if state == 'est'
                          else '/drone/truth'}],
-        ))
-        # use_sim_time is deliberately FALSE here, and it is the single biggest
-        # cost in this launch if you get it wrong. Setting it True makes rclpy
-        # subscribe to /clock, which the bridge publishes at the 1 ms physics
-        # step -- 1000 messages a second into a Python process, costing ~50% of
-        # a CPU core, for a clock this node never reads. Every timestamp the
-        # viewer shows comes out of a message header, and the only sleep is the
-        # stream's own pacing, which should be wall time anyway: a browser
-        # refreshing at sim time would stutter whenever the physics did.
-        nodes.append(Node(
-            package='dsim_viz', executable='viz_server', name='dsim_viz',
-            output='screen',
-            parameters=[{'use_sim_time': False}],
-            # --scenario/--plan-file enable POST /solve, which re-solves THIS
-            # scenario over THIS plan file. The bridge reloads it by mtime, so
-            # a solve lands on the running vehicle without a relaunch. Both are
-            # empty for a run with no plan, and the endpoint is then refused
-            # rather than present and useless.
-            arguments=(['--port', web_port, '--bind', bind,
-                        '--directory', WEB_DIR, '--ws', WS,
-                        '--scenario', scenario['name'] if scenario else '',
-                        '--plan-file', plan]
-                       + (['--allow-control'] if control == 'true' else [])),
         ))
 
     if use_rviz == 'true':
@@ -446,19 +438,20 @@ def generate_launch_description():
                                           'planner is publishing /drone/trajectory.'),
         DeclareLaunchArgument('rviz', default_value='false'),
         DeclareLaunchArgument('viz', default_value='true',
-                              description='serve the browser viewer (static + SSE state)'),
-        DeclareLaunchArgument('bind', default_value='0.0.0.0',
-                              description='interface the viewer binds to. '
-                                          'Set to your Tailscale IP to keep it off '
-                                          'the local LAN.'),
-        DeclareLaunchArgument('web_port', default_value='8080'),
+                              description='publish the decimated telemetry the '
+                                          'browser viewer reads, and record this '
+                                          'run in web/current.json. The viewer '
+                                          'SERVER is a separate launch '
+                                          '(viz.launch.py) that outlives this '
+                                          'one; see its docstring.'),
         DeclareLaunchArgument('control', default_value='true',
-                              description='expose the viewer\'s pause and '
-                              'playback-speed buttons (POST /control). This is '
-                              'the only write path into the simulator from the '
-                              'web port; set false to keep the server '
-                              'read-only. It can pause/resume and set a '
-                              'range-checked real-time factor, nothing else.'),
+                              description='run dsim_simctl, the one write path '
+                              'into the simulator: pause, a range-checked '
+                              'real-time factor, reset and gusts. false leaves '
+                              'it out, and the viewer\'s buttons then report '
+                              'the node as absent rather than appearing to '
+                              'work. Whether the WEB PORT exposes any of it is '
+                              'viz.launch.py\'s control:= argument.'),
         DeclareLaunchArgument('radius', default_value='2.0',
                               description='built-in trajectory radius (m), for '
                               'reference:=circle | lemniscate in the empty world.'),

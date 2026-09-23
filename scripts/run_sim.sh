@@ -21,6 +21,13 @@
 #
 # It also WAITS for the sim to actually publish before claiming success, so
 # "started" means observed, not hoped.
+#
+# TWO launches, not one. The viewer is viz.launch.py and outlives the
+# simulator; sim.launch.py is the part that gets cycled. That split is what
+# lets the viewer's scenario dropdown restart the simulator without killing
+# the server that was asked to do it -- see viz.launch.py's docstring. So this
+# script starts the viewer first, waits for it to answer, and only then brings
+# a run up underneath it.
 set -o pipefail
 cd "$(dirname "$0")/.."
 
@@ -35,9 +42,14 @@ GUI="${GUI:-false}"
 # refuses anything else.
 PLAN="${PLAN:-}"
 WEB_PORT="${WEB_PORT:-8080}"
+# Interface the viewer binds to. Set it to your Tailscale IP to keep the port
+# off the local LAN.
+BIND="${BIND:-0.0.0.0}"
 COMPOSE="docker compose -f docker/compose.yaml"
 LOG="logs/sim.log"
 PIDFILE="logs/.sim.pid"
+VIZ_LOG="logs/viz.log"
+VIZ_PIDFILE="logs/.viz.pid"
 
 mkdir -p logs
 
@@ -48,8 +60,37 @@ fi
 
 echo "==> clearing anything left over"
 $COMPOSE exec -T sim bash -lc 'cd /ws && bash scripts/kill_sim.sh' || true
-[ -f "$PIDFILE" ] && kill "$(cat "$PIDFILE")" 2>/dev/null
-rm -f "$PIDFILE"
+for f in "$PIDFILE" "$VIZ_PIDFILE"; do
+  [ -f "$f" ] && kill "$(cat "$f")" 2>/dev/null
+  rm -f "$f"
+done
+
+# ---- the viewer, which outlives every run it shows -------------------------
+echo "==> starting the viewer on :$WEB_PORT"
+nohup $COMPOSE exec -T sim bash -lc \
+  "cd /ws && exec ros2 launch dsim_bringup viz.launch.py \
+     web_port:=$WEB_PORT bind:=$BIND" \
+  >"$VIZ_LOG" 2>&1 &
+echo $! > "$VIZ_PIDFILE"
+
+# Answering on the port is the proof, not "the process exists": the previous
+# viewer may still be releasing the socket, and a viewer that lost the bind
+# race fails in exactly the way that looks like a healthy start from outside.
+VIZ_UP=0
+for i in $(seq 1 30); do
+  sleep 1
+  if ! kill -0 "$(cat "$VIZ_PIDFILE" 2>/dev/null)" 2>/dev/null; then
+    echo "FAIL: the viewer exited. Last lines of $VIZ_LOG:"; tail -20 "$VIZ_LOG"; exit 1
+  fi
+  if $COMPOSE exec -T sim bash -lc \
+       "curl -sf http://127.0.0.1:${WEB_PORT}/snapshot >/dev/null"; then
+    VIZ_UP=1; break
+  fi
+done
+if [ "$VIZ_UP" -ne 1 ]; then
+  echo "FAIL: the viewer never answered on :$WEB_PORT. Last lines of $VIZ_LOG:"
+  tail -20 "$VIZ_LOG"; exit 1
+fi
 
 # Report the bank angle the chosen lap implies, so "nothing is happening on
 # screen" can be checked against what was actually asked for before anyone
@@ -71,7 +112,7 @@ nohup $COMPOSE exec -T sim bash -lc \
   "cd /ws && exec ros2 launch dsim_bringup sim.launch.py \
      world:=$WORLD reference:=$REFERENCE radius:=$RADIUS altitude:=$ALTITUDE \
      period:=$PERIOD $PLAN_ARG \
-     gui:=$GUI viz:=true web_port:=$WEB_PORT" \
+     gui:=$GUI viz:=true" \
   >"$LOG" 2>&1 &
 echo $! > "$PIDFILE"
 
@@ -104,5 +145,8 @@ IP="$(tailscale ip -4 2>/dev/null | head -1)"
 
 echo
 echo "  viewer:  http://${IP}:${WEB_PORT}"
+echo "           the scenario dropdown switches runs from there -- it restarts"
+echo "           the simulator underneath the page, which stays up."
 echo "  log:     $LOG          (tail -f to watch)"
+echo "  viewer log: $VIZ_LOG"
 echo "  stop:    make stop"

@@ -60,6 +60,12 @@ make viz   WORLD=fence3d PLAN=plans/fence3d_N8_seg2.json   # watch it, and re-so
 Seven scenarios come straight from the planner (`original`, `curve`,
 `diverse`, `wall`, `fence3d`, `door3d`, `loiter`) — `scripts/solve_plan.py
 --list` shows them. A fence3d solve takes 0.20 s.
+
+Once the viewer is open you do not need the command line to change scenario:
+the dropdown restarts the simulator with whichever run you pick, including the
+planner-free `hover` and `circle`. It takes about four seconds and the page
+stays up throughout, because the viewer is a launch of its own — see
+[docs/VIEWER.md](docs/VIEWER.md#two-launches-and-why).
 `plans/<name>_seed.json` is the optimiser's straight-line initial guess and on
 six of the seven goes THROUGH something on purpose — its file says what and
 when, and the referee has to agree.
@@ -89,7 +95,7 @@ scripts/build_planner.sh    build the optimiser's Rust extension in the containe
 scripts/solve_plan.py       solve a scenario into a plan, and say if the vehicle can fly it
 scripts/plot_run.py         CSV -> SVG, no dependencies
 scripts/kill_sim.sh         clear leftover sim processes
-scripts/run_sim.sh          make viz -- start sim + viewer, verify it is up
+scripts/run_sim.sh          make viz -- start viewer + sim (two launches), verify both are up
 scripts/check_telemetry.py  cross-check a running sim's telemetry against physics
 scripts/check_estimator.py  the estimate against ground truth, live
 src/dsim_viz/               one-port viewer server + the overlay geometry it sends
@@ -261,14 +267,18 @@ tracking error).
   active window ignored, a column scored as a ball, penetration clamped to
   zero, hits counted per sample), the space-time conversion (dp/dtau as velocity, the t'' term
   dropped, samples spaced in tau) and the solve endpoint (range checks
-  dropped, the scenario or output path taken from the request, a shell), then
+  dropped, the scenario or output path taken from the request, a shell), the
+  launch endpoint (any name accepted, teardown skipped or ignored, stale
+  telemetry counted as a successful start, a dead launch never reported), then
   fails if the tests do not notice. A green suite is only evidence if it would have gone red on a wrong
   implementation.
 
-  Currently **120 C++ + 127 Python + 15 viewer tests pass, 99/99 injected bugs
-  caught, 0 skipped.** (C++: 39 control, 27 sensors, 21 estimation, 13 pacer,
-  12 referee geometry, 8 epoch. Python: 74 viewer overlay, 19 solve endpoint,
-  34 planner conversion and bridge.)
+  Currently **120 C++ + 171 Python + 15 viewer tests pass, 122/122 injected
+  bugs caught, 0 skipped.** (C++: 39 control, 27 sensors, 21 estimation, 13
+  pacer, 12 referee geometry, 8 epoch. Python: 30 overlay geometry, 44
+  simulation control, 24 solve endpoint, 39 launch endpoint, 34 planner
+  conversion and bridge. `colcon test-result` says 126 for the same suites:
+  it counts the six ctest wrappers as well as the cases inside them.)
 
   Three rules keep the harness honest, all added after it lied. A mutation whose
   pattern no longer matches the source counts as a **failure**, not a pass:
