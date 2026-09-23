@@ -5,6 +5,7 @@
 #   WORLD=empty REFERENCE=lemniscate scripts/run_sim.sh
 #   RADIUS=2.0 PERIOD=6 scripts/run_sim.sh
 #   WORLD=fence3d PLAN=plans/fence3d_seed.json scripts/run_sim.sh   # fly a plan
+#   WORLD=loiter PLAN=plans/loiter_N8_seg16.json STATE=truth scripts/run_sim.sh
 #
 # PERIOD is the knob that decides whether there is anything to watch. A circle
 # needs bank = atan(4*pi^2*r / (T^2*g)), so the old 12 s lap on a 1 m circle
@@ -41,6 +42,11 @@ GUI="${GUI:-false}"
 # The plan names its scenario and WORLD must be that scenario; the launch
 # refuses anything else.
 PLAN="${PLAN:-}"
+# What the controller flies on: est (the sensor-based estimate) or truth.
+# loiter needs truth -- it flies at 62.5 m and the optical flow aids velocity
+# only below 3 m. The viewer's dropdown works this out per run from the plan's
+# own altitude; from here you have to say. See docs/PLANNER.md.
+STATE="${STATE:-est}"
 WEB_PORT="${WEB_PORT:-8080}"
 # Interface the viewer binds to. Set it to your Tailscale IP to keep the port
 # off the local LAN.
@@ -112,7 +118,7 @@ nohup $COMPOSE exec -T sim bash -lc \
   "cd /ws && exec ros2 launch dsim_bringup sim.launch.py \
      world:=$WORLD reference:=$REFERENCE radius:=$RADIUS altitude:=$ALTITUDE \
      period:=$PERIOD $PLAN_ARG \
-     gui:=$GUI viz:=true" \
+     gui:=$GUI viz:=true state:=$STATE" \
   >"$LOG" 2>&1 &
 echo $! > "$PIDFILE"
 
