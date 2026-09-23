@@ -325,7 +325,15 @@ def main(argv=None):
             "N", "n_seg", "converged", "certified", "feasible", "figure_grade",
             "figure_grade_reasons", "iterations", "arrival_time", "elastic_weight",
             "weight_raises", "total_slack", "max_koz_dual", "speed_cap_violation",
-            "certificate_violation", "stop_label", "trust_radius") if k in r},
+            "certificate_violation", "stop_label", "trust_radius",
+            # Line of sight. Three keys and not one, because "certified" alone
+            # is not the claim: the solver DROPS occlusion planes when a
+            # station lies inside the convex hull it is building them from, and
+            # a dropped plane is not a satisfied one. A run with planes dropped
+            # certified nothing about those instants, and the referee is the
+            # only thing that then knows whether sight was held.
+            "occlusion_certified", "occlusion_violation",
+            "occlusion_planes_dropped") if k in r},
         "solve_seconds": round(elapsed, 3),
         # What the plan asks of the vehicle, and whether it can. Written into
         # the file so a plan cannot be flown without the question having been
@@ -344,7 +352,13 @@ def main(argv=None):
     tmp = out_path.with_suffix(".json.tmp")
     tmp.write_text(text[:-2] + ',\n "control_points": [\n' + rows + "\n ]\n}\n")
     tmp.replace(out_path)
-    print(f"\nwrote {out_path.relative_to(ROOT)}")
+    # relative_to raises for a path outside the workspace, and raising AFTER
+    # the file is written reports failure for a solve that succeeded.
+    try:
+        shown = out_path.relative_to(ROOT)
+    except ValueError:
+        shown = out_path
+    print(f"\nwrote {shown}")
     print(f"  make plan PLAN={out_path.relative_to(ROOT)}")
     return 0
 

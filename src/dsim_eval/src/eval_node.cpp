@@ -79,7 +79,7 @@ public:
     scenario_name_ = declare_parameter("scenario.name", std::string(""));
 
     loadObstacles();
-    tracker_ = std::make_unique<ClearanceTracker>(obstacles_, vehicle_radius_);
+    tracker_ = std::make_unique<ClearanceTracker>(obstacles_, vehicle_radius_, stations_);
 
     truth_sub_ = create_subscription<nav_msgs::msg::Odometry>(
       "/drone/truth", rclcpp::SensorDataQoS(),
@@ -168,6 +168,21 @@ private:
         throw std::runtime_error("obstacle " + n + " has control point times running backwards");
       }
       obstacles_.push_back(o);
+    }
+
+    // Stations: fixed ground points the vehicle must stay visible from, as a
+    // flat [x,y,z, x,y,z, ...] for the same reason the control points are.
+    // Most scenarios have none, and then line of sight is not constrained and
+    // not reported -- an unconstrained margin is +inf, never 0.
+    const auto flat_stations = declare_parameter<std::vector<double>>(
+      "stations", std::vector<double>{});
+    if (flat_stations.size() % 3 != 0) {
+      throw std::runtime_error(
+              "stations has " + std::to_string(flat_stations.size()) +
+              " numbers; need a multiple of 3 (x,y,z per station)");
+    }
+    for (size_t i = 0; i < flat_stations.size(); i += 3) {
+      stations_.push_back({flat_stations[i], flat_stations[i + 1], flat_stations[i + 2]});
     }
   }
 
@@ -269,13 +284,28 @@ private:
     // Going negative is a collision, recorded once per excursion with the
     // position it happened at -- see dsim_eval/obstacle.hpp.
     const size_t hits_before = tracker_->hits().size();
-    const auto sample = tracker_->update(px, py, pz, scenarioTime(now));
+    // The instant this whole report describes. Held so publishClearance uses
+    // it for the obstacle positions AND the margins, rather than stamping the
+    // positions with the publish time while the margins come from here.
+    //
+    // Those are different instants, and at a window boundary they disagree:
+    // the referee reported scenario t = 0.00 with a sight-line margin measured
+    // a few milliseconds earlier, when the obstacle whose window opens at 0 did
+    // not exist yet -- so the report said "unconstrained at t=0" while the
+    // planner, asked about t=0, said +49.76 m. One report, one instant.
+    last_sample_t_ = scenarioTime(now);
+    last_sample_p_ = {px, py, pz};
+    have_sample_ = true;
+    const auto sample = tracker_->update(px, py, pz, last_sample_t_);
     // Taken unconditionally, infinity included. Keeping the last finite value
     // when every obstacle has gone left `door3d` reporting 0.82 m of clearance
     // to a door that had opened five seconds earlier -- a stale number that
     // looks exactly like a live one.
     last_clearance_ = sample.clearance;
     nearest_ = sample.nearest;
+    last_los_ = sample.los_margin;
+    los_blocker_ = sample.los_blocker;
+    los_station_ = sample.los_station;
     if (tracker_->hits().size() > hits_before) {
       const auto & h = tracker_->hits().back();
       RCLCPP_ERROR(
@@ -341,8 +371,15 @@ private:
   {
     dsim_msgs::msg::ClearanceReport r;
     r.header.stamp = stamp;
+    // The time of the last ground-truth sample, not of this publish: every
+    // number below was measured at that instant. Before any state has arrived
+    // there is nothing to describe, so the clock is the only answer available.
     const double now = get_clock()->now().seconds();
-    r.scenario_time_s = scenarioTime(now);
+    r.scenario_time_s = have_sample_ ? last_sample_t_ : scenarioTime(now);
+    r.sample_valid = have_sample_;
+    r.sample_position.x = last_sample_p_[0];
+    r.sample_position.y = last_sample_p_[1];
+    r.sample_position.z = last_sample_p_[2];
     for (const auto & o : tracker_->obstacles()) {
       const auto centre = o.centreAt(r.scenario_time_s);
       geometry_msgs::msg::Point c;
@@ -364,6 +401,25 @@ private:
       r.hit_times_s.push_back(h.t);
       r.hit_depths_m.push_back(h.depth);
     }
+    for (const auto & st : tracker_->stations()) {
+      geometry_msgs::msg::Point p;
+      p.x = st[0]; p.y = st[1]; p.z = st[2];
+      r.stations.push_back(p);
+    }
+    r.los_margin_m = last_los_;
+    r.los_blocker = los_blocker_;
+    r.los_station = los_station_;
+    r.min_los_margin_m = tracker_->minLosMargin();
+    for (const auto & b : tracker_->blackouts()) {
+      geometry_msgs::msg::Point p;
+      p.x = b.x; p.y = b.y; p.z = b.z;
+      r.dark_positions.push_back(p);
+      r.dark_station.push_back(b.station);
+      r.dark_blocker.push_back(b.blocker);
+      r.dark_times_s.push_back(b.t);
+      r.dark_durations_s.push_back(b.duration);
+      r.dark_depths_m.push_back(b.depth);
+    }
     r.scenario = scenario_name_;
     r.scenario_duration_s = scenario_duration_s_;
     clearance_pub_->publish(r);
@@ -376,6 +432,10 @@ private:
     tracker_->reset();
     nearest_.clear();
     last_clearance_ = std::numeric_limits<double>::infinity();
+    last_los_ = std::numeric_limits<double>::infinity();
+    have_sample_ = false;
+    los_blocker_.clear();
+    los_station_.clear();
     collided_ = false; collision_count_ = 0; ground_contacts_ = 0;
     have_last_pos_ = false; was_airborne_ = false;
     RCLCPP_INFO(get_logger(), "metrics reset");
@@ -385,6 +445,7 @@ private:
   dsim_time::SimEpoch epoch_;
 
   std::vector<Obstacle> obstacles_;
+  std::vector<std::array<double, 3>> stations_;
   std::unique_ptr<ClearanceTracker> tracker_;
   double scenario_start_s_ {0.0}, scenario_duration_s_ {0.0};
   std::string scenario_name_, nearest_;
@@ -401,6 +462,11 @@ private:
   double path_length_ {0.0}, energy_wh_ {0.0}, last_power_s_ {0.0};
   double lx_ {0}, ly_ {0}, lz_ {0};
   double last_clearance_ {std::numeric_limits<double>::infinity()};
+  double last_los_ {std::numeric_limits<double>::infinity()};
+  double last_sample_t_ {0.0};
+  std::array<double, 3> last_sample_p_ {{0.0, 0.0, 0.0}};
+  bool have_sample_ {false};
+  std::string los_blocker_, los_station_;
 
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr truth_sub_;
   rclcpp::Subscription<dsim_msgs::msg::TrajectorySetpoint>::SharedPtr sp_sub_;

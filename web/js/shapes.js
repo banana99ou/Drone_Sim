@@ -160,6 +160,53 @@ export function obstacleFaces(clearance, colors, camAz, columnHeight = 6) {
 }
 
 /// Every analytic hit as a red three-axis cross at the vehicle position it
+/// The sight lines a scenario's stations need kept clear, as segments.
+///
+/// Drawn from the referee's own report, like the obstacles: it is the only
+/// thing that knows where the stations are and whether the line is clear right
+/// now. A blocked line is drawn in the bad colour, which is the whole point --
+/// the vehicle can be nowhere near an obstacle and still be behind it, and
+/// that failure is invisible in a picture of clearances.
+export function sightLines(clearance, pose, colours = {}) {
+  const out = [];
+  if (!clearance || !pose || !clearance.stations || !clearance.stations.length) return out;
+  const blocked = clearance.los_margin_m !== null && clearance.los_margin_m < 0;
+  for (const st of clearance.stations) {
+    out.push({
+      a: st.slice(),
+      b: pose.p.slice(),
+      colour: blocked ? (colours.blocked || "#f87171") : (colours.clear || "#34d399"),
+      width: blocked ? 2 : 1,
+    });
+  }
+  return out;
+}
+
+/// A station: a small pad on the ground with a mast, so it reads as a place
+/// rather than as another obstacle.
+export function stationFaces(clearance, colour = "#8b93a7") {
+  const faces = [];
+  if (!clearance || !clearance.stations) return faces;
+  const r = 0.6, h = 1.2, n = 8;
+  for (const st of clearance.stations) {
+    const ring = [];
+    for (let i = 0; i < n; i++) {
+      const a = (2 * Math.PI * i) / n;
+      ring.push([st[0] + r * Math.cos(a), st[1] + r * Math.sin(a), st[2]]);
+    }
+    faces.push({ pts: ring, colour, kind: "station" });
+    for (let i = 0; i < n; i++) {
+      const j = (i + 1) % n;
+      faces.push({
+        pts: [ring[i], ring[j], [st[0], st[1], st[2] + h]],
+        colour,
+        kind: "station",
+      });
+    }
+  }
+  return faces;
+}
+
 /// happened at, plus a drop line to the ground so the spot reads in 3D.
 /// The cross is sized to the vehicle radius: it marks where the ENVELOPE
 /// was when it went in, which is the thing the referee measures.

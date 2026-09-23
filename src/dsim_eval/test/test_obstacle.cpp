@@ -205,3 +205,217 @@ TEST(ClearanceTracker, TheSeedPlanHitsTheFenceWhenTheArithmeticSaysItDoes)
   // (motion ignored) would first hit at 0.5 + 0.9 t = 4 - 1.09087, t = 2.68.
   // The 3.71 above is only right because the fence moved.
 }
+
+// ---------------------------------------------------------------------------
+// Line of sight. A station is a fixed ground point the vehicle must stay
+// VISIBLE from, and an obstacle takes that away by standing between them --
+// which it can do while the vehicle is nowhere near it. Every number below is
+// derived in the comment beside it; the arithmetic is
+//
+//     distance( obstacle centre at t, segment[station, vehicle] ) - radius
+//
+// with the foot of the perpendicular CLAMPED to the segment.
+// ---------------------------------------------------------------------------
+
+namespace
+{
+const std::array<double, 3> ORIGIN_STATION{0.0, 0.0, 0.0};
+}
+
+TEST(LineOfSight, ABodyOnTheSightLineBlocksItByItsRadius)
+{
+  // Station (0,0,0), vehicle (10,0,0), obstacle centred at (5,0,0) r=1. The
+  // segment runs straight through the centre, so the distance is 0 and the
+  // margin is 0 - 1 = -1: blocked, by one radius.
+  const auto o = moving("B", 5, 0, 0, 1.0);
+  EXPECT_NEAR(o.losMargin(ORIGIN_STATION, 10, 0, 0, 5.0), -1.0, 1e-12);
+}
+
+TEST(LineOfSight, ABodyBesideTheSightLineDoesNotBlockIt)
+{
+  // Same segment, obstacle at (5,0,3): the perpendicular distance is 3, so
+  // the margin is 3 - 1 = 2.
+  const auto o = moving("B", 5, 0, 3, 1.0);
+  EXPECT_NEAR(o.losMargin(ORIGIN_STATION, 10, 0, 0, 5.0), 2.0, 1e-12);
+}
+
+TEST(LineOfSight, ABodyBehindTheStationIsNotBetweenThem)
+{
+  // Obstacle at (-5,0,0), vehicle at (10,0,0). On the INFINITE line the
+  // distance is 0 and it would read as blocked; on the SEGMENT the nearest
+  // point is the station itself, 5 m away, so the margin is 5 - 1 = 4.
+  //
+  // FAILS IF: the foot of the perpendicular is not clamped. That mistake
+  // reports the sight line lost to a body the vehicle is flying away from.
+  const auto o = moving("B", -5, 0, 0, 1.0);
+  EXPECT_NEAR(o.losMargin(ORIGIN_STATION, 10, 0, 0, 5.0), 4.0, 1e-12);
+}
+
+TEST(LineOfSight, ABodyBeyondTheVehicleIsNotBetweenThemEither)
+{
+  // Obstacle at (15,0,0), vehicle at (10,0,0): nearest point on the segment is
+  // the vehicle, 5 m away, margin 5 - 1 = 4. The other end of the same clamp.
+  const auto o = moving("B", 15, 0, 0, 1.0);
+  EXPECT_NEAR(o.losMargin(ORIGIN_STATION, 10, 0, 0, 5.0), 4.0, 1e-12);
+}
+
+TEST(LineOfSight, AnInactiveBodyBlocksNothing)
+{
+  // Dead centre of the sight line, but its window is [0, 10] and we ask at
+  // t=11. An obstacle outside its window does not exist, so it cannot occlude:
+  // +infinity, not -1.
+  const auto o = moving("B", 5, 0, 0, 1.0, 0, 0, 0, 0.0, 10.0);
+  EXPECT_EQ(o.losMargin(ORIGIN_STATION, 10, 0, 0, 11.0), INF);
+  EXPECT_NEAR(o.losMargin(ORIGIN_STATION, 10, 0, 0, 9.0), -1.0, 1e-12);
+}
+
+TEST(LineOfSight, AMovingBodyIsFollowedNotFrozen)
+{
+  // Crosses the sight line: centre starts at (5,-4,0) and moves +1 m/s in y,
+  // so at t=4 it is at (5,0,0) -- on the line, margin -1 -- and at t=0 it is
+  // 4 m off it, margin 3.
+  const auto o = moving("B", 5, -4, 0, 1.0, 0, 1, 0);
+  EXPECT_NEAR(o.losMargin(ORIGIN_STATION, 10, 0, 0, 0.0), 3.0, 1e-12);
+  EXPECT_NEAR(o.losMargin(ORIGIN_STATION, 10, 0, 0, 4.0), -1.0, 1e-12);
+}
+
+TEST(LineOfSight, NoStationsMeansNoConstraintNotAZeroMargin)
+{
+  // FAILS IF: an unconstrained scenario reports 0.0, which reads as "only just
+  // visible" and would put every scenario one rounding error from a failure.
+  ClearanceTracker tr({moving("B", 5, 0, 0, 1.0)}, 0.3);
+  const auto s = tr.update(10, 0, 0, 5.0);
+  EXPECT_EQ(s.los_margin, INF);
+  EXPECT_TRUE(s.los_blocker.empty());
+  EXPECT_TRUE(tr.blackouts().empty());
+  EXPECT_EQ(tr.minLosMargin(), INF);
+}
+
+TEST(LineOfSight, TheWorstStationIsTheOneReported)
+{
+  // Two stations. From (0,0,0) the body at (5,0,0) is dead on the line:
+  // margin -1. From (0,0,10) the segment to (10,0,0) passes the body at
+  // distance |(5,0,0) - foot|; the segment direction is (10,0,-10)/sqrt(200),
+  // and the foot parameter is ((5,0,-10) . (10,0,-10))/200 = 150/200 = 0.75,
+  // giving foot (7.5,0,2.5) and distance sqrt(2.5^2 + 2.5^2) = 3.5355, margin
+  // 2.5355. The worst of the two is -1, from station0.
+  ClearanceTracker tr({moving("B", 5, 0, 0, 1.0)}, 0.3,
+    {{{0.0, 0.0, 0.0}}, {{0.0, 0.0, 10.0}}});
+  const auto s = tr.update(10, 0, 0, 5.0);
+  EXPECT_NEAR(s.los_margin, -1.0, 1e-12);
+  EXPECT_EQ(s.los_station, "station0");
+  EXPECT_EQ(s.los_blocker, "B");
+}
+
+TEST(LineOfSight, OneExcursionBehindABodyIsOneBlackout)
+{
+  // The vehicle sits at (10,0,0); the body crosses the sight line at 1 m/s in
+  // y from (5,-4,0). It occludes while its centre is within 1 m of the line,
+  // that is |y| < 1, so from t=3 to t=5: one blackout, 2 s long, deepest at
+  // t=4 where the margin is -1.
+  //
+  // FAILS IF: the event is per sample. At 100 Hz this pass would be reported
+  // as 200 separate losses of sight.
+  ClearanceTracker tr({moving("B", 5, -4, 0, 1.0, 0, 1, 0)}, 0.3, {ORIGIN_STATION});
+  for (int i = 0; i <= 1000; ++i) {tr.update(10, 0, 0, 0.01 * i);}
+  ASSERT_EQ(tr.blackouts().size(), 1u);
+  const auto & b = tr.blackouts()[0];
+  EXPECT_EQ(b.station, "station0");
+  EXPECT_EQ(b.blocker, "B");
+  EXPECT_NEAR(b.t, 3.0, 0.011);              // first 10 ms sample past 3.0
+  EXPECT_NEAR(b.duration, 2.0, 0.021);
+  EXPECT_NEAR(b.depth, 1.0, 1e-3);
+  EXPECT_NEAR(tr.minLosMargin(), -1.0, 1e-3);
+}
+
+TEST(LineOfSight, SightCanBeLostWithoutGoingAnywhereNearTheObstacle)
+{
+  // The whole reason this is a separate measure. Vehicle at (10,0,0), body of
+  // radius 1 at (5,0,0): the clearance is |(10,0,0)-(5,0,0)| - 1 - 0.3 = 3.7,
+  // comfortably clear, while the sight line from the origin is blocked by 1 m.
+  // A referee that only scored collision would call this run perfect.
+  ClearanceTracker tr({moving("B", 5, 0, 0, 1.0)}, 0.3, {ORIGIN_STATION});
+  const auto s = tr.update(10, 0, 0, 5.0);
+  EXPECT_NEAR(s.clearance, 3.7, 1e-12);
+  EXPECT_TRUE(tr.hits().empty());
+  EXPECT_NEAR(s.los_margin, -1.0, 1e-12);
+  EXPECT_EQ(tr.blackouts().size(), 1u);
+}
+
+TEST(LineOfSight, ResetClearsTheBlackoutsAndTheWorstMargin)
+{
+  ClearanceTracker tr({moving("B", 5, 0, 0, 1.0)}, 0.3, {ORIGIN_STATION});
+  tr.update(10, 0, 0, 5.0);
+  ASSERT_EQ(tr.blackouts().size(), 1u);
+  tr.reset();
+  EXPECT_TRUE(tr.blackouts().empty());
+  EXPECT_EQ(tr.minLosMargin(), INF);
+  // And the next excursion is a NEW event, not a continuation of the old one.
+  tr.update(10, 0, 0, 5.0);
+  EXPECT_EQ(tr.blackouts().size(), 1u);
+}
+
+TEST(LineOfSight, AColumnWithStationsIsRefusedRatherThanGuessedAt)
+{
+  // The planner treats every obstacle as a ball for occlusion, so there is no
+  // column-vs-sight-line arithmetic on that side to check this one against.
+  // A number with nothing to check it against is worse than no number.
+  EXPECT_THROW(
+    ClearanceTracker({moving("C", 5, 0, 0, 1.0, 0, 0, 0, 0.0, 10.0, "column")},
+    0.3, {ORIGIN_STATION}),
+    std::runtime_error);
+  // Without stations the same column is fine: nothing is asking about sight.
+  EXPECT_NO_THROW(
+    ClearanceTracker({moving("C", 5, 0, 0, 1.0, 0, 0, 0, 0.0, 10.0, "column")}, 0.3));
+}
+
+TEST(LineOfSight, SightLostTwiceIsTwoBlackouts)
+{
+  // A body that crosses the sight line, clears it, and crosses back. Its
+  // centre follows a QUADRATIC in y with control points -4, +14, -4, so
+  //     y(s) = -4 + 36 s - 36 s^2,   t = 10 s
+  // which runs -4 -> +5 -> -4. The vehicle sits at (10,0,0) and the station is
+  // the origin, so the sight line is the x axis and the body (r=1) occludes
+  // while |y| < 1. Solving -4 + 36s - 36s^2 = -1 gives s = 0.09175, 0.90825;
+  // = +1 gives s = 0.16667, 0.83333. So sight is lost over
+  //     t in [0.9175, 1.6667]  and  t in [8.3333, 9.0825]
+  // -- two excursions of 0.749 s each. y passes through 0 inside each one
+  // (s = 0.12732 and 0.87268), where the margin would be exactly -1. The
+  // samples are 10 ms apart, so the grid lands at s = 0.127 instead, where
+  // y = -4 + 4.572 - 0.580644 = -0.008644 and the depth is 0.991356. That is
+  // the number asserted: what this sampling actually sees, not the limit it
+  // approaches.
+  //
+  // FAILS IF: regaining sight does not clear the per-station flag. Then the
+  // second loss is folded into the first and the run reports one blackout that
+  // appears to last eight seconds, over a stretch where the station could see
+  // the vehicle perfectly well.
+  Obstacle o;
+  o.name = "X"; o.radius = 1.0;
+  o.control_points = {
+    ControlPoint{5, -4, 0, 0.0}, ControlPoint{5, 14, 0, 5.0}, ControlPoint{5, -4, 0, 10.0}};
+  ClearanceTracker tr({o}, 0.3, {ORIGIN_STATION});
+  for (int i = 0; i <= 1000; ++i) {tr.update(10, 0, 0, 0.01 * i);}
+  ASSERT_EQ(tr.blackouts().size(), 2u);
+  EXPECT_NEAR(tr.blackouts()[0].t, 0.9175, 0.011);
+  EXPECT_NEAR(tr.blackouts()[0].duration, 0.749, 0.021);
+  EXPECT_NEAR(tr.blackouts()[0].depth, 0.991356, 1e-5);
+  EXPECT_NEAR(tr.blackouts()[1].t, 8.3333, 0.011);
+  EXPECT_NEAR(tr.blackouts()[1].duration, 0.749, 0.021);
+  EXPECT_NEAR(tr.blackouts()[1].depth, 0.991356, 1e-5);
+}
+
+TEST(LineOfSight, TwoSeparateHitsAreTwoHits)
+{
+  // The same shape of check for the clearance side, which had no test for
+  // re-entry either: the body above passes THROUGH the vehicle's position
+  // twice if the vehicle sits on its path. Vehicle at (5,0,0), body r=1 plus
+  // the 0.3 m envelope, so it is a hit while |y| < 1.3.
+  Obstacle o;
+  o.name = "X"; o.radius = 1.0;
+  o.control_points = {
+    ControlPoint{5, -4, 0, 0.0}, ControlPoint{5, 14, 0, 5.0}, ControlPoint{5, -4, 0, 10.0}};
+  ClearanceTracker tr({o}, 0.3);
+  for (int i = 0; i <= 1000; ++i) {tr.update(5, 0, 0, 0.01 * i);}
+  EXPECT_EQ(tr.hits().size(), 2u);
+}

@@ -190,16 +190,29 @@ export class Renderer {
     ctx.restore();
   }
 
-  grid(n = 8, step = 1) {
+  /// The ground grid, over an explicit extent rather than a fixed one.
+  ///
+  /// It used to be a hard-coded -8..+8 m around the origin, from a time when
+  /// everything flew near the origin. Every scenario out of the planner lives
+  /// in 0..10 m, so the action sat in one quarter of the grid and ran off its
+  /// edge at 9.5 m; loiter spans 200 m and the grid was a 16 m postage stamp
+  /// under it. See gridFor() in app.js for where the extent comes from.
+  ///
+  /// `lo` and `hi` are [x, y] corners. The axis lines through the origin stay
+  /// brighter, so you can still see where the world frame actually is -- which
+  /// is the thing a recentred grid would otherwise hide.
+  grid(lo = [-8, -8], hi = [8, 8], step = 1) {
     const ctx = this.ctx;
     ctx.save();
     ctx.lineWidth = this.px;
-    for (let i = -n; i <= n; i++) {
+    const i0 = Math.floor(Math.min(lo[0], lo[1]) / step);
+    const i1 = Math.ceil(Math.max(hi[0], hi[1]) / step);
+    for (let i = i0; i <= i1; i++) {
       ctx.strokeStyle = i === 0 ? "#3d4763" : "#20242f";
-      const segs = [
-        [[i * step, -n * step, 0], [i * step, n * step, 0]],
-        [[-n * step, i * step, 0], [n * step, i * step, 0]],
-      ];
+      const v = i * step;
+      const segs = [];
+      if (v >= lo[0] && v <= hi[0]) segs.push([[v, lo[1], 0], [v, hi[1], 0]]);
+      if (v >= lo[1] && v <= hi[1]) segs.push([[lo[0], v, 0], [hi[0], v, 0]]);
       for (const [s0, s1] of segs) {
         const a = this.project(s0);
         const b = this.project(s1);

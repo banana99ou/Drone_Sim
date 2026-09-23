@@ -269,16 +269,19 @@ tracking error).
   dropped, samples spaced in tau) and the solve endpoint (range checks
   dropped, the scenario or output path taken from the request, a shell), the
   launch endpoint (any name accepted, teardown skipped or ignored, stale
-  telemetry counted as a successful start, a dead launch never reported), then
+  telemetry counted as a successful start, a dead launch never reported), the
+  sight-line measure (measured to the infinite line instead of the segment,
+  the obstacle radius left out, an absent body still blocking, the best station
+  reported instead of the worst, a blackout per sample), then
   fails if the tests do not notice. A green suite is only evidence if it would have gone red on a wrong
   implementation.
 
-  Currently **120 C++ + 171 Python + 15 viewer tests pass, 122/122 injected
-  bugs caught, 0 skipped.** (C++: 39 control, 27 sensors, 21 estimation, 13
-  pacer, 12 referee geometry, 8 epoch. Python: 30 overlay geometry, 44
-  simulation control, 24 solve endpoint, 39 launch endpoint, 34 planner
-  conversion and bridge. `colcon test-result` says 126 for the same suites:
-  it counts the six ctest wrappers as well as the cases inside them.)
+  Currently **134 C++ + 171 Python + 30 viewer tests pass, 133/133 injected
+  bugs caught, 0 skipped.** (C++: 39 control, 27 sensors, 26 referee geometry
+  and line of sight, 21 estimation, 13 pacer, 8 epoch. Python: 30 overlay
+  geometry, 44 simulation control, 24 solve endpoint, 39 launch endpoint, 34
+  planner conversion and bridge. `colcon test-result` adds 6 to the C++ figure:
+  it counts the ctest wrappers as well as the cases inside them.)
 
   Three rules keep the harness honest, all added after it lied. A mutation whose
   pattern no longer matches the source counts as a **failure**, not a pass:

@@ -22,29 +22,17 @@
 //   app.js        state, HUD, input, the frame loop       (this file)
 
 import { add, scale } from "./vec3.js";
-import { droneFaces, obstacleFaces, hitMarkers } from "./shapes.js";
+import { droneFaces, obstacleFaces, hitMarkers, sightLines, stationFaces }
+  from "./shapes.js";
 import { GROUP_LABEL, LEGEND, PALETTE, TICK_COLOUR, colourFor, widthFor }
   from "./palette.js";
 import { Renderer } from "./render.js";
 import { Telemetry } from "./telemetry.js";
+import { extendTrail } from "./trail.js";
+import { CAM_HOME, gridFor, homeFor } from "./framing.js";
 
-const TRAIL_MAX = 4000;                 // ~2 min of trail at 30 Hz
 const BACKGROUND = "#0d0f14";
-const CAM_HOME = { az: -0.9, el: 0.42, dist: 11, target: [0, 0, 1.0] };
 
-/// Where "recentre" looks: the origin for the built-in courses, the middle
-/// of the plan for a scenario world (it has a start and an end), zoomed out
-/// enough to see both. fence3d's action is around (5, 5), and the default
-/// home put its whole fence off the right edge of the screen.
-function homeFor(world) {
-  const home = { ...CAM_HOME, target: CAM_HOME.target.slice() };
-  if (world && world.start && world.end) {
-    home.target = [0, 1, 2].map((i) => 0.5 * (world.start[i] + world.end[i]));
-    home.dist = Math.max(11, 1.5 * Math.hypot(
-      world.end[0] - world.start[0], world.end[1] - world.start[1]));
-  }
-  return home;
-}
 const PREFS_KEY = "dsim.prefs";
 
 const el = (id) => document.getElementById(id);
@@ -65,8 +53,19 @@ const S = {
   planned: [],
 };
 
+/// How far the follow camera closes on the vehicle each frame. Not a snap:
+/// at 3 m/s the target would jitter with every noisy pose, and at loiter's
+/// speeds the whole scene would twitch. 0.15 settles in about a fifth of a
+/// second and rides out a single bad sample.
+const FOLLOW_LERP = 0.15;
+/// Pulled in to this when follow is switched on, if the camera was further
+/// out than it. loiter frames at 300 m, where the vehicle is a dot -- which is
+/// the whole reason this mode exists.
+const FOLLOW_MAX_DIST_M = 18;
+
 const prefs = {
   gain: 1,
+  follow: false,
   show: Object.fromEntries(Object.keys(GROUP_LABEL).map((g) => [g, true])),
 };
 
@@ -89,6 +88,7 @@ function loadPrefs() {
     const saved = JSON.parse(localStorage.getItem(PREFS_KEY) || "null");
     if (!saved) return;
     if (typeof saved.gain === "number") prefs.gain = saved.gain;
+    if (typeof saved.follow === "boolean") prefs.follow = saved.follow;
     if (saved.show) Object.assign(prefs.show, saved.show);
     // NOT the world: that follows the running simulator now (see adoptRun),
     // and a remembered one would fight it on every load.
@@ -98,11 +98,12 @@ function loadPrefs() {
 function savePrefs() {
   try {
     localStorage.setItem(PREFS_KEY, JSON.stringify(
-      { gain: prefs.gain, show: prefs.show }));
+      { gain: prefs.gain, show: prefs.show, follow: prefs.follow }));
   } catch (_) { /* not important enough to surface */ }
 }
 
 // ---- incoming state ------------------------------------------------------
+
 let lastStreamT = null;
 function ingest(snap) {
   if (!snap) return;
@@ -110,29 +111,24 @@ function ingest(snap) {
   // page's button, another tab, or a gate script. The trails belong to the
   // run that just ended. Clearing only on this page's own button left a
   // reset from anywhere else drawing the old run's path under the new one.
+  //
+  // This is necessary and NOT sufficient: it fires on the frame the clock
+  // comes back, and whatever has not come back yet lands on the cleared
+  // trail. extendTrail() is what makes the trail honest either way.
+  const prevT = lastStreamT;
   if (typeof snap.t === "number" && lastStreamT !== null && snap.t < lastStreamT - 0.5) {
     S.flown = [];
     S.planned = [];
   }
   if (typeof snap.t === "number") lastStreamT = snap.t;
+  const dt = (typeof snap.t === "number" && prevT !== null) ? snap.t - prevT : 0;
+  const r = snap.overlay && snap.overlay.readout;
   if (snap.pose) {
-    const p = snap.pose.p;
-    const last = S.flown[S.flown.length - 1];
     S.pose = snap.pose;
-    // Extend the trail only when the vehicle actually moved, so a paused sim
-    // does not accumulate thousands of identical points.
-    if (!last || last[0] !== p[0] || last[1] !== p[1] || last[2] !== p[2]) {
-      S.flown.push(p);
-      if (S.flown.length > TRAIL_MAX) S.flown.shift();
-    }
+    extendTrail(S.flown, snap.pose.p, dt, r && r.speed_mps);
   }
   if (snap.setpoint) {
-    const sp = snap.setpoint;
-    const last = S.planned[S.planned.length - 1];
-    if (!last || last[0] !== sp[0] || last[1] !== sp[1] || last[2] !== sp[2]) {
-      S.planned.push(sp);
-      if (S.planned.length > TRAIL_MAX) S.planned.shift();
-    }
+    extendTrail(S.planned, snap.setpoint, dt, r && r.cmd_speed_mps);
   }
   if (snap.status) S.status = snap.status;
   if (snap.control) S.control = snap.control;
@@ -266,10 +262,26 @@ function render(now) {
   requestAnimationFrame(render);
 }
 
+/// Keep the vehicle in frame.
+///
+/// Only the camera's TARGET moves; orbit angle and zoom stay where the user
+/// put them, so following does not take the controls away. Without this,
+/// loiter is unwatchable: it covers 200 m and 62.5 m of altitude, so a camera
+/// framed on the whole course draws the drone about a pixel wide.
+function followVehicle() {
+  if (!prefs.follow || !S.pose) return;
+  const p = S.pose.p;
+  for (let i = 0; i < 3; i++) cam.target[i] += FOLLOW_LERP * (p[i] - cam.target[i]);
+}
+
 function renderOnce() {
+  followVehicle();
   renderer.begin(cam, BACKGROUND);
   if (!S.scene) return;
-  renderer.grid();
+  // The grid follows the world, so the action is on it rather than in one
+  // corner of a fixed patch. See gridFor().
+  const g = gridFor(S.scene.worlds[S.world]);
+  renderer.grid(g.lo, g.hi, g.step);
 
   // The obstacles come from the REFEREE, live, not from the scene file: it is
   // the only account of where they are, and the only one that knows which of
@@ -277,8 +289,15 @@ function renderOnce() {
   // else about them.
   const world = S.scene.worlds[S.world] || {};
   const faces = obstacleFaces(S.clearance, world.colors, cam.az);
+  faces.push(...stationFaces(S.clearance));
   faces.push(...droneFaces(S.pose, S.scene.drone));
   renderer.faces(faces);
+
+  // The sight lines, under the trails so a blocked one does not hide the path
+  // that blocked it. Red means a station cannot see the vehicle -- a failure
+  // that is invisible in a picture of clearances, because the vehicle can be
+  // nowhere near an obstacle and still be behind it.
+  renderer.segments(sightLines(S.clearance, S.pose));
 
   if (S.planPath) renderer.polyline(S.planPath, "rgba(250,204,21,.7)", 1.5, true);
   renderer.polyline(S.planned, "rgba(248,113,113,.85)", 2, true);
@@ -478,6 +497,26 @@ function updateHudOnce() {
     el("obst").className = n > 0 && live === 0 ? "bad" : "";
     el("stime").textContent = fmt(cl.scenario_time_s, " s", 1) +
       (cl.duration_s ? ` of ${cl.duration_s.toFixed(0)}` : "");
+    // Line of sight. "n/a" for a scenario with no stations: nothing constrains
+    // visibility there, and a 0 would read as "only just visible".
+    const stations = cl.stations || [];
+    if (!stations.length) {
+      el("los").textContent = "n/a";
+      el("los").className = "";
+      el("dark").textContent = "—";
+      el("dark").className = "";
+    } else {
+      const m = cl.los_margin_m;
+      el("los").textContent = m === null
+        ? "clear" : `${fmt(m, " m")}${cl.los_blocker ? ` · ${cl.los_blocker}` : ""}`;
+      el("los").className = m !== null && m < 0 ? "bad" : "good";
+      const dark = cl.blackouts || [];
+      const lastDark = dark[dark.length - 1];
+      el("dark").textContent = lastDark
+        ? `${lastDark.station} · ${lastDark.with} @ t=${lastDark.t.toFixed(2)} s`
+        : "never";
+      el("dark").className = dark.length ? "bad" : "good";
+    }
   }
 }
 
@@ -729,6 +768,15 @@ function bindInput() {
 
   el("reset").onclick = () => {
     cam = homeFor(S.scene && S.scene.worlds[S.world]);
+  };
+  const followBox = el("follow");
+  followBox.checked = prefs.follow;
+  followBox.onchange = () => {
+    prefs.follow = followBox.checked;
+    // Switching it on from a whole-course framing would otherwise follow the
+    // vehicle from 300 m away, which looks exactly like it is not working.
+    if (prefs.follow) cam.dist = Math.min(cam.dist, FOLLOW_MAX_DIST_M);
+    savePrefs();
   };
   el("clear").onclick = () => { S.flown = []; S.planned = []; };
 

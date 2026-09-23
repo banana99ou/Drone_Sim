@@ -48,6 +48,13 @@ import urllib.request
 #: right. A frame offset, a clock offset or a dropped control point all land
 #: orders of magnitude above it.
 OBSTACLE_AGREEMENT_M = 1e-6
+#: Two implementations of one formula, in two languages, on the same inputs.
+#: Anything above float noise is a real difference, not a tolerance.
+LOS_AGREEMENT_M = 1e-6
+#: How far below its certified sight-line margin the flown run may come before
+#: the certificate is called wrong rather than the tracking. Same role as
+#: CLEARANCE_SLACK_M, and the same size: this is tracking error, not geometry.
+LOS_SLACK_M = 0.10
 START_TOL_M = 0.15         # must be at the start point, not merely near it
 CRUISE_SPEED_TOL = 0.15    # fraction: |v_ref| against the plan's own speed
 #: The cruise window is the last CRUISE_FROM_FRAC of the plan, never starting
@@ -167,6 +174,66 @@ def obstacle_agreement(url, scenario, samples=41):
     return (worst if seen else None), worst_name, worst_t, window
 
 
+def los_agreement(samples, scenario):
+    """Compare the referee's sight-line margins against the planner's own.
+
+    The same shape of test as obstacle_agreement, and for a stronger reason.
+    The solver does not measure line of sight at all -- it certifies it through
+    a CONVEX occlusion relaxation, an outer approximation whose shadow planes
+    are not the true geometry. So there are three things here, not two: the
+    solver's certificate, the planner's own sampled measurement
+    (los_margin_at), and the referee's. This check holds the two MEASUREMENTS
+    against each other; they are independent implementations of one formula in
+    two languages, so any gap between them is a bug in one of them. Whether the
+    certificate bounds the measurement is a separate question, checked below.
+
+    The planner's routine is evaluated at the position and time the referee
+    reported, so this compares ARITHMETIC and not trajectories.
+
+    `samples` is (t, position, referee margin or None for +infinity), collected
+    while the plan was flying. "Unconstrained" has to be compared too, not
+    skipped: the referee saying +inf while the planner says a number is an
+    active-window disagreement, and it is exactly the kind of thing that hides
+    if only finite samples are checked.
+
+    Returns (worst |difference|, at what time, how many were compared,
+    window disagreements).
+    """
+    from spacetime_bezier.geometry import los_margin_at
+    import numpy as np
+
+    stations = [np.asarray(st, dtype=float) for st in (scenario.get("stations") or [])]
+    if not stations:
+        return None, 0.0, 0, []
+    spatial = int(scenario["spatial_dim"])
+    obstacles = []
+    for o in scenario["obstacles"]:
+        cps = np.asarray(o["control_points"], dtype=float)
+        if spatial == 2:
+            cps = cps[:, [0, 1, 3]]
+        obstacles.append({"control_points": cps, "radius": float(o["radius"])})
+
+    worst, worst_t, seen, window = 0.0, 0.0, 0, []
+    for t, pos, got in samples:
+        p = np.asarray(pos[:spatial], dtype=float)
+        # The planner measures per station; the referee reports the WORST over
+        # all of them, so the comparison is against the minimum.
+        want = min(float(los_margin_at(p[None, :], np.array([t]), st, obstacles)[0])
+                   for st in stations)
+        seen += 1
+        if not np.isfinite(want) or got is None:
+            if np.isfinite(want) != (got is not None):
+                window.append(
+                    f"t={t:.2f}: referee says "
+                    f"{'unconstrained' if got is None else f'{got:+.4f} m'}, planner says "
+                    f"{'unconstrained' if not np.isfinite(want) else f'{want:+.4f} m'}")
+            continue
+        d = abs(float(got) - want)
+        if d > worst:
+            worst, worst_t = d, t
+    return (worst if seen else None), worst_t, seen, window
+
+
 def scenario_time(snap):
     c = snap.get("clearance")
     return None if not c else c["scenario_time_s"]
@@ -278,6 +345,12 @@ def main(plan_file, url):
     max_err_cruise = 0.0
     max_err_stop = 0.0          # after the plan ends: the vehicle is still moving
     speed_samples = []          # (t, |v_ref| reported, |v| planned)
+    #: (scenario t, vehicle position, referee's sight-line margin or None for
+    #: +inf). Captured DURING the flight, because after the window every
+    #: obstacle is inactive and the margin is unconstrained on both sides --
+    #: the first version of this check sampled afterwards and compared nothing
+    #: at all, then reported that as a failure.
+    los_samples = []
     last_t = -1.0
     deadline = time.time() + T + 15
     while time.time() < deadline:
@@ -300,6 +373,16 @@ def main(plan_file, url):
             max_err = max(max_err, st.get("tracking_error_m", 0.0))
             if t >= cruise_from:
                 max_err_cruise = max(max_err_cruise, st.get("tracking_error_m", 0.0))
+            # The referee's OWN sample, not the viewer's pose: the margin was
+            # measured from that position at that time, and anything else
+            # compares two different instants. At loiter's 3.4 m/s the few
+            # milliseconds between them read as 2.5 cm of disagreement between
+            # two implementations that agree exactly.
+            cl_now = snap.get("clearance")
+            if cl_now and cl_now.get("sample_position"):
+                los_samples.append((cl_now["scenario_time_s"],
+                                    cl_now["sample_position"],
+                                    cl_now.get("los_margin_m")))
             ctl = snap.get("control")
             if ctl and 1.0 <= t <= T - 1.0:
                 v = ctl["velocity_world"]
@@ -337,6 +420,89 @@ def main(plan_file, url):
               "a scenario clock offset between the referee and the plan, a control "
               "point dropped in the parameter flattening, or de Casteljau implemented "
               "differently on the two sides")
+
+    # ---- 2. line of sight, where the scenario constrains it ---------------
+    if not (scenario.get("stations") or []):
+        print("  n/a   this scenario has no stations, so nothing constrains "
+              "line of sight")
+    else:
+        los_worst, los_t, los_seen, los_window = los_agreement(los_samples, scenario)
+        if los_worst is None or los_seen == 0:
+            c.bad("referee agrees with the planner about line of sight",
+                  "no sight-line samples were taken during the window",
+                  "a referee that was given no stations -- check that "
+                  f"config/obstacles_{plan['scenario']}.yaml carries a stations: key")
+        elif los_window:
+            c.bad("referee agrees with the planner about when sight is constrained",
+                  f"{len(los_window)} instant(s) disagree: {los_window[:3]}",
+                  "an obstacle's active window read differently on the two sides, "
+                  "so one of them is measuring occlusion by a body the other "
+                  "says does not exist")
+        elif los_worst <= LOS_AGREEMENT_M:
+            c.ok("referee agrees with the planner about line of sight",
+                 f"max |referee - planner| {los_worst:.2e} m over {los_seen} "
+                 f"instants of the flown run (limit {LOS_AGREEMENT_M:g})")
+        else:
+            c.bad("referee agrees with the planner about line of sight",
+                  f"max |referee - planner| {los_worst:.3e} m at t={los_t:.2f} s",
+                  "the sight segment measured differently on the two sides -- an "
+                  "unclamped foot of the perpendicular is the usual one, which "
+                  "reports occlusion by bodies behind the station")
+
+        # What the SOLVER claimed, which is a different kind of claim from the
+        # measurement above. It never measures the sight line: it builds a
+        # convex occlusion relaxation and certifies that. Two things have to
+        # hold for that certificate to mean "sight was guaranteed":
+        # occlusion_certified, AND no planes dropped -- the builder drops a
+        # plane when the station lies inside the hull it is cutting from, and
+        # a dropped plane is not a satisfied one. So the certificate is only
+        # binding on the instants whose planes survived.
+        info = plan.get("solver_info") or {}
+        cl = fetch(url).get("clearance") or {}
+        measured = cl.get("min_los_margin_m")
+        blackouts = cl.get("blackouts") or []
+        certified = bool(info.get("occlusion_certified"))
+        dropped = float(info.get("occlusion_planes_dropped") or 0.0)
+        violation = float(info.get("occlusion_violation") or 0.0)
+
+        if measured is None:
+            c.bad("line of sight was measured at all", "no margin in the report",
+                  "a referee with stations configured but no sight-line "
+                  "arithmetic reaching the report")
+        elif certified and dropped == 0.0 and violation == 0.0:
+            # The solver guaranteed it. The vehicle flies the tracking error
+            # away from the certified curve, so the measurement may come in
+            # below zero by that much and no more.
+            if measured >= -LOS_SLACK_M and not blackouts:
+                c.ok("the sight-line certificate holds in flight",
+                     f"optimiser certified line of sight (0 planes dropped), referee "
+                     f"measured worst margin {measured:+.4f} m "
+                     f"(allowed {-LOS_SLACK_M:+.2f} for tracking)")
+            else:
+                first = (f"; first: {blackouts[0]['station']} lost it to "
+                         f"{blackouts[0]['with']} at t={blackouts[0]['t']:.2f} s for "
+                         f"{blackouts[0]['duration_s']:.2f} s" if blackouts else "")
+                c.bad("the sight-line certificate holds in flight",
+                      f"certified, but measured {measured:+.4f} m with "
+                      f"{len(blackouts)} blackout(s){first}",
+                      "the convex occlusion relaxation did not contain the true "
+                      "geometry, or the vehicle did not fly the certified curve")
+        else:
+            # Not certified. A blackout is then agreement with the plan rather
+            # than a surprise, and the run is reported, not graded -- the same
+            # rule the clearance check uses for a plan the optimiser could not
+            # certify.
+            why = []
+            if not certified:
+                why.append("occlusion not certified")
+            if dropped:
+                why.append(f"{dropped:g} occlusion plane(s) dropped")
+            if violation:
+                why.append(f"violation {violation:.3e}")
+            print(f"  note  the plan does not guarantee line of sight "
+                  f"({', '.join(why)}); the referee measured worst margin "
+                  f"{measured:+.4f} m over {len(blackouts)} blackout(s). Nothing "
+                  f"to grade against -- this is the plan being honest.")
 
     # ---- 3. feedforward reached the controller ----------------------------
     if not speed_samples:

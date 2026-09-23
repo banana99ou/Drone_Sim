@@ -247,6 +247,10 @@ def _clearance_of(m):
         return None
     return {
         "scenario_time_s": m.scenario_time_s,
+        # The inputs every number here was measured from. A checker that took
+        # the pose from anywhere else would be comparing two different samples.
+        "sample_position": ([m.sample_position.x, m.sample_position.y,
+                             m.sample_position.z] if m.sample_valid else None),
         # The obstacle FIELD, live. This is the only account of where anything
         # is: they are not Gazebo bodies, because two scenarios move theirs
         # along cubics and three switch them off partway through.
@@ -262,6 +266,22 @@ def _clearance_of(m):
         "hits": [
             {"pos": [p.x, p.y, p.z], "with": w, "t": t, "depth_m": d}
             for p, w, t, d in zip(m.hit_positions, m.hit_with, m.hit_times_s, m.hit_depths_m)
+        ],
+        # Line of sight, for a scenario with stations. An empty station list
+        # means visibility is not constrained, and los_margin_m is then +inf,
+        # which _finite_or_none turns into null -- the page shows "n/a" rather
+        # than a 0 that would read as "only just visible".
+        "stations": [[p.x, p.y, p.z] for p in m.stations],
+        "los_margin_m": _finite_or_none(m.los_margin_m),
+        "los_blocker": m.los_blocker,
+        "los_station": m.los_station,
+        "min_los_margin_m": _finite_or_none(m.min_los_margin_m),
+        "blackouts": [
+            {"pos": [p.x, p.y, p.z], "station": st, "with": w,
+             "t": t, "duration_s": d, "depth_m": dep}
+            for p, st, w, t, d, dep in zip(
+                m.dark_positions, m.dark_station, m.dark_blocker,
+                m.dark_times_s, m.dark_durations_s, m.dark_depths_m)
         ],
     }
 

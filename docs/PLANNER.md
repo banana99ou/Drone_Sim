@@ -226,6 +226,64 @@ the list the page built its dropdown from. A solved plan is preferred over the
 straight seed, because the seed exists to be flown *into* an obstacle. See
 [VIEWER.md](VIEWER.md#the-scenario-dropdown).
 
+## Line of sight
+
+A scenario may name `stations`: fixed ground points the vehicle has to stay
+visible from. Only `loiter` has one, at the origin, and its four orbiting
+bodies are what can get in the way.
+
+The referee measures the margin directly:
+
+```
+distance( obstacle centre at t, segment[station, vehicle] )  -  radius
+```
+
+positive exactly when the sight line clears the body, because a sphere blocks
+a segment precisely when the segment passes within `radius` of its centre. The
+foot of the perpendicular is **clamped to the segment** — a body behind the
+station, or beyond the vehicle, is not between them and blocks nothing. An
+obstacle outside its active window blocks nothing either, and a scenario with
+no stations reports `+inf`, not `0`.
+
+This is deliberately a second implementation of the planner's `los_margin_at()`
+rather than a call into it. The solver never measures the sight line: it builds
+a **convex occlusion relaxation** and certifies that. So there are three
+things, not two — the certificate, the planner's own sampled measurement, and
+the referee's — and `check_planner.py` holds the two measurements against each
+other over the flown run. Measured on `loiter`: **2.13e-14 m over 728
+instants**, which is float noise, against a 1e-6 bound.
+
+That check earns its keep. It failed twice while being built, and both were
+real defects in the referee:
+
+* the report stamped `scenario_time_s` from the publish instant while the
+  margins came from the last ground-truth sample. Two different instants, which
+  only shows at a window boundary — the referee said "unconstrained at t=0"
+  while the planner, asked about t=0, said +49.76 m. The report now describes
+  one instant, and carries the position it was measured at;
+* comparing against the viewer's pose instead of the referee's own sample read
+  as 2.5 cm of disagreement at loiter's 3.4 m/s, which is about 7 ms of flight.
+
+Losing sight is recorded the way a collision is: edge-triggered, one
+**blackout** per excursion, carrying which station lost it, to which obstacle,
+where the vehicle was, for how long, and how far the sight line went into the
+body. The viewer draws the station and the sight lines, red when blocked.
+
+The gate grades against what the solver actually claimed. `occlusion_certified`
+alone is not the claim — the builder **drops** occlusion planes when a station
+lies inside the hull it is cutting from, and a dropped plane is not a satisfied
+one, so all three of `occlusion_certified`, `occlusion_planes_dropped == 0` and
+`occlusion_violation == 0` have to hold before a blackout counts as a failure.
+Without them the run is reported and not graded, the same rule the clearance
+check uses for a plan the optimiser could not certify.
+
+**Not implemented: line of sight past a `column`.** The planner treats every
+obstacle as a ball for occlusion, so there is no arithmetic on that side to
+check a column against, and a number with nothing to check it against is worse
+than no number. A scenario with both a column and a station is refused at load
+with a message saying what would have to be built first. No 2D scenario has
+stations today, so nothing hits it.
+
 ## The opening transient, measured
 
 Every plan opens with a velocity STEP, because the optimiser pins endpoint
@@ -273,10 +331,7 @@ under 2.1° of commanded tilt and 1 cm of travel in the first 2.5 s.
   the 0.9 m/s seed, 92 cm for a 3.0 m/s optimised plan. The cruise figure --
   the last 40% of the plan, allowed 50 ms of lag at the plan's top speed -- is
   the one that says anything about tracking.
-* Nothing checks line of sight. `loiter` carries `stations` and the optimiser
-  can add occlusion rows for them, but the referee has no LOS measure at all,
-  so an occlusion-constrained plan is certified by the solver and **unchecked**
-  here.
+* Line of sight IS checked now. See below.
 * The estimator is a LOW-ALTITUDE one. Its only velocity aiding is optical
   flow, which needs the ground between 0.1 and 3 m, plus a rangefinder good to
   4 m. `loiter` flies at 62.5 m: measured 48 m of tracking error on

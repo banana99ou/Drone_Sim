@@ -515,8 +515,12 @@ def scene_json():
         # off, and a second copy in a static file would be a second opinion.
         # What is here is what the referee does not send -- colours, the plan's
         # endpoints, and enough to aim the camera.
+        # The bare world has no plan and no obstacles, so its extent is a
+        # choice rather than a measurement: enough ground for the built-in
+        # circle (2 m radius) and a step's worth of room around it.
         "worlds": {"empty": {"title": "Bare world", "spatial_dim": 3,
-                             "colors": {}, "start": None, "end": None}},
+                             "colors": {}, "start": None, "end": None,
+                             "bounds": [[-8.0, -8.0], [8.0, 8.0]]}},
     }
     for path in SCENARIOS:
         sc = load_scenario(path)
@@ -582,6 +586,16 @@ def scenario_obstacle_yaml(sc):
         lines += [f"      {o['name']}:", f'        type: "{o["type"]}"',
                   f"        radius: {float(o['radius'])}",
                   f"        control_points: [{flat}]"]
+    # Stations, flattened the same way: fixed ground points the vehicle must
+    # stay VISIBLE from. Only a scenario that constrains line of sight has any,
+    # and the key is emitted only then -- an empty list and an absent one mean
+    # the same thing to the referee, but writing `stations: []` into every
+    # scenario would suggest the constraint exists and is satisfied.
+    stations = sc.get("stations") or []
+    if stations:
+        flat = ", ".join(str(round(float(c), 9)) for st in stations
+                         for c in (list(st) + [0.0, 0.0, 0.0])[:3])
+        lines += [f"    stations: [{flat}]"]
     return "\n".join(lines) + "\n"
 
 
@@ -661,6 +675,30 @@ def seed_expectation(sc, P):
     return {"first_hit": first} if first else {}
 
 
+def scenario_bounds(sc):
+    """The ground extent the scenario actually occupies, as [[x0,y0],[x1,y1]].
+
+    Every obstacle control point as well as the plan's endpoints, because the
+    viewer draws its ground grid over this and a grid sized from the endpoints
+    alone would stop short of the obstacles beside them. The origin is always
+    included: the world frame's axes are worth being able to see, and every
+    scenario out of the planner starts near (0, 0) anyway.
+
+    Not padded here. Padding is a drawing decision and belongs in the page.
+    """
+    xs, ys = [0.0], [0.0]
+    for o in sc["obstacles"]:
+        for cp in o["control_points"]:
+            xs.append(float(cp[0]))
+            ys.append(float(cp[1]))
+    for key in ("start", "end"):
+        point = sc.get(key)
+        if point:
+            xs.append(float(point[0]))
+            ys.append(float(point[1]))
+    return [[min(xs), min(ys)], [max(xs), max(ys)]]
+
+
 def scenario_scene_entry(sc):
     """What the viewer needs that the referee's report does not carry: the
     colours, the plan's endpoints, and where the camera should look."""
@@ -670,6 +708,7 @@ def scenario_scene_entry(sc):
         "colors": {o["name"]: o.get("color", "#e67e22") for o in sc["obstacles"]},
         "start": [float(v) for v in sc["start"]],
         "end": [float(v) for v in sc["end"]],
+        "bounds": scenario_bounds(sc),
         "duration_s": float(sc["T"]),
     }
 

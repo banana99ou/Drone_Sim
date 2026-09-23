@@ -382,6 +382,19 @@ ros2 launch dsim_bringup viz.launch.py bind:=100.64.0.1
 BIND=100.64.0.1 bash scripts/run_sim.sh      # the same thing, both launches
 ```
 
+## Line of sight
+
+For a scenario with stations (only `loiter` today) the viewer draws the station
+as a small pad-and-mast and a line from it to the vehicle: green while the
+station can see the drone, red while an obstacle is between them. The HUD gains
+two rows — the current margin with the obstacle responsible, and the last time
+sight was lost.
+
+It is worth its own picture because it is the one failure a drawing of
+clearances cannot show: the vehicle can be far from every obstacle and still be
+behind one. See [PLANNER.md](PLANNER.md#line-of-sight) for the arithmetic and
+what checks it.
+
 ## Two launches, and why
 
 The viewer is `viz.launch.py`. The simulator is `sim.launch.py`. They are

@@ -27,6 +27,19 @@ std_msgs/Header header
 
 float64 scenario_time_s          # sim time minus scenario.start_s; negative before the plan starts
 
+# The vehicle position every number below was measured at, and the instant is
+# scenario_time_s above. The report describes ONE instant: the obstacle
+# positions, the clearance and the sight-line margins are all evaluated here,
+# not at the moment of publishing.
+#
+# It is in the message because a cross-check that fetches the pose from
+# somewhere else is comparing two different samples. At loiter's 3.4 m/s, the
+# few milliseconds between the referee's last odometry and the viewer's showed
+# up as 2.5 cm of "disagreement" between two implementations that agree
+# exactly.
+geometry_msgs/Point sample_position
+bool sample_valid                # false before any state has arrived
+
 # --- the obstacles NOW, in world ENU, one entry each ------------------------
 # `active` is false outside an obstacle's window, and then it is ABSENT, not
 # far away: `positions` still carries the clamped endpoint so a viewer has
@@ -49,6 +62,34 @@ geometry_msgs/Point[] hit_positions   # vehicle position at the moment of entry
 string[] hit_with
 float64[] hit_times_s                 # on the scenario clock
 float64[] hit_depths_m                # deepest penetration during that entry
+
+# --- line of sight, for scenarios that have stations -------------------------
+# A station is a fixed ground point the vehicle is meant to stay visible from.
+# The margin is the distance from an obstacle's centre to the SEGMENT between
+# station and vehicle, less its radius, minimised over the obstacles active
+# then and over every station: positive means every station can see the
+# vehicle, negative means at least one cannot, by that much.
+#
+# This is the same arithmetic as the planner's los_margin_at(), written out
+# independently on this side; scripts/check_planner.py holds the two against
+# each other, which is the only way to find out whether the solver's convex
+# occlusion certificate means what it claims.
+#
+# Empty stations means the scenario does not constrain visibility, and then
+# los_margin_m is +inf -- not zero, which would read as "just barely visible".
+geometry_msgs/Point[] stations
+float64 los_margin_m             # signed; +inf with no stations or nothing in the way
+string los_blocker               # the obstacle responsible, "" when nothing is
+string los_station               # the station with the worst view, "" with none
+float64 min_los_margin_m         # worst so far this run
+
+# --- every loss of sight this run, edge-triggered on the margin going negative
+geometry_msgs/Point[] dark_positions   # vehicle position at the moment sight was lost
+string[] dark_station
+string[] dark_blocker
+float64[] dark_times_s                 # on the scenario clock
+float64[] dark_durations_s             # how long sight stayed lost
+float64[] dark_depths_m                # deepest the sight line went into the body
 
 # --- the scenario this is scoring against ------------------------------------
 string scenario                  # empty for a world with no scenario

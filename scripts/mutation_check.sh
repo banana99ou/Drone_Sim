@@ -76,12 +76,24 @@ mutate() {          # $1 = name, $2 = file, $3 = from, $4 = to
     echo "  [SKIP]     $name  (pattern not found -- code changed, update this script)"
     return 1
   fi
-  python3 - "$WORK/src/$file" "$from" "$to" <<'PY'
+  if ! python3 - "$WORK/src/$file" "$from" "$to" <<'PY'
 import sys
 p, a, b = sys.argv[1], sys.argv[2], sys.argv[3]
 t = open(p).read()
-open(p, "w").write(t.replace(a, b, 1))
+n = t.replace(a, b, 1)
+# The REAL guard on whether the mutation applied. `grep -F` with a multi-line
+# pattern matches each LINE separately, so a pattern whose lines all exist
+# while the block does not passed the check above, this replace then did
+# nothing, and the UNMUTATED code was reported as SURVIVED -- a false alarm
+# that reads exactly like a hole in the test suite. Two of them did.
+if n == t:
+    sys.exit(3)
+open(p, "w").write(n)
 PY
+  then
+    echo "  [SKIP]     $name  (pattern matched line by line but not as a block -- fix this script)"
+    return 1
+  fi
   local result; result="$(build_and_run "$WORK/src" "$TEST" "$PKG")"
   if [ "$result" = "SOME_FAIL" ]; then
     local caught; caught="$(grep '^\[  FAILED  \] [A-Za-z]' "$WORK/run.log" | sed 's/ ([0-9]* ms)$//' | sort -u | wc -l)"
@@ -355,8 +367,82 @@ run_mutation "leaving an obstacle never clears the inside flag (no re-entry)" \
 run_mutation "reset keeps the old hits" \
   "include/dsim_eval/obstacle.hpp" \
   "    hits_.clear();
-    std::fill(inside_.begin(), inside_.end(), false);" \
-  "    std::fill(inside_.begin(), inside_.end(), false);"
+    blackouts_.clear();" \
+  "    blackouts_.clear();"
+
+# ---------------------------------------------------------------------------
+# Line of sight. A second thing an obstacle takes away, and one the vehicle can
+# lose while nowhere near anything -- so none of the clearance mutations above
+# would notice any of these.
+# ---------------------------------------------------------------------------
+
+run_mutation "the sight line measured to the infinite line, not the segment" \
+  "include/dsim_eval/obstacle.hpp" \
+  "      u = std::min(1.0, std::max(0.0, u));" \
+  "      u = u;"
+
+run_mutation "the sight line clamped at the far end only" \
+  "include/dsim_eval/obstacle.hpp" \
+  "      u = std::min(1.0, std::max(0.0, u));" \
+  "      u = std::min(1.0, u);"
+
+run_mutation "an absent obstacle still blocks the view" \
+  "include/dsim_eval/obstacle.hpp" \
+  "    if (!activeAt(t)) {return std::numeric_limits<double>::infinity();}
+    const auto c = centreAt(t);
+    const double sx = px - station[0]" \
+  "    if (false) {return std::numeric_limits<double>::infinity();}
+    const auto c = centreAt(t);
+    const double sx = px - station[0]"
+
+run_mutation "the obstacle radius left out of the sight margin" \
+  "include/dsim_eval/obstacle.hpp" \
+  "    return std::sqrt(fx * fx + fy * fy + fz * fz) - radius;" \
+  "    return std::sqrt(fx * fx + fy * fy + fz * fz);"
+
+run_mutation "the sight line frozen at the obstacle's starting position" \
+  "include/dsim_eval/obstacle.hpp" \
+  "    if (!activeAt(t)) {return std::numeric_limits<double>::infinity();}
+    const auto c = centreAt(t);
+    const double sx" \
+  "    if (!activeAt(t)) {return std::numeric_limits<double>::infinity();}
+    const auto c = centreAt(tStart());
+    const double sx"
+
+run_mutation "no stations reported as zero margin, not unconstrained" \
+  "include/dsim_eval/obstacle.hpp" \
+  "    double los_margin{std::numeric_limits<double>::infinity()};" \
+  "    double los_margin{0.0};"
+
+run_mutation "the best station reported instead of the worst" \
+  "include/dsim_eval/obstacle.hpp" \
+  "      if (worst < s.los_margin) {" \
+  "      if (worst > s.los_margin) {"
+
+run_mutation "a blackout recorded on every sample, not once per excursion" \
+  "include/dsim_eval/obstacle.hpp" \
+  "        if (!dark_[k]) {" \
+  "        if (true) {"
+
+run_mutation "regaining sight never clears the blackout flag" \
+  "include/dsim_eval/obstacle.hpp" \
+  "      } else {
+        dark_[k] = false;
+      }" \
+  "      } else {
+      }"
+
+run_mutation "reset keeps the old blackouts" \
+  "include/dsim_eval/obstacle.hpp" \
+  "    blackouts_.clear();" \
+  "    if (false) blackouts_.clear();"
+
+run_mutation "a column with stations measured anyway, against nothing" \
+  "include/dsim_eval/obstacle.hpp" \
+  "        if (o.type == \"column\") {
+          throw std::runtime_error(" \
+  "        if (false) {
+          throw std::runtime_error("
 
 PKG=dsim_control
 TEST=test/test_control.cpp
@@ -376,12 +462,23 @@ mutate_py() {       # $1 = name, $2 = from, $3 = to
     echo "  [SKIP]     $name  (pattern not found -- code changed, update this script)"
     return 1
   fi
-  python3 -c '
+  if ! python3 -c '
 import sys
 p, a, b = sys.argv[1], sys.argv[2], sys.argv[3]
 t = open(p).read()
-open(p, "w").write(t.replace(a, b, 1))
-' "$target" "$from" "$to"
+n = t.replace(a, b, 1)
+# The REAL guard on whether the mutation applied. `grep -F` with a multi-line
+# pattern matches each LINE separately, so a pattern whose lines all exist
+# while the block does not passed the check above, this replace then did
+# nothing, and the UNMUTATED code was reported as SURVIVED -- a false alarm
+# that reads exactly like a hole in the test suite. Two of them did.
+if n == t:
+    sys.exit(3)
+open(p, "w").write(n)
+' "$target" "$from" "$to"; then
+    echo "  [SKIP]     $name  (pattern matched line by line but not as a block -- fix this script)"
+    return 1
+  fi
   if PYTHONPATH="$WORK/viz" python3 -m pytest -x -q "$WORK/viz/test/test_overlay.py" \
        >"$WORK/py.log" 2>&1; then
     echo "  [SURVIVED] $name  <-- BUG: this error would pass the test suite"
@@ -411,12 +508,23 @@ mutate_planner() {  # $1 = name, $2 = from, $3 = to  (spacetime.py)
     echo "  [SKIP]     $name  (pattern not found -- code changed, update this script)"
     return 1
   fi
-  python3 -c '
+  if ! python3 -c '
 import sys
 p, a, b = sys.argv[1], sys.argv[2], sys.argv[3]
 t = open(p).read()
-open(p, "w").write(t.replace(a, b, 1))
-' "$target" "$from" "$to"
+n = t.replace(a, b, 1)
+# The REAL guard on whether the mutation applied. `grep -F` with a multi-line
+# pattern matches each LINE separately, so a pattern whose lines all exist
+# while the block does not passed the check above, this replace then did
+# nothing, and the UNMUTATED code was reported as SURVIVED -- a false alarm
+# that reads exactly like a hole in the test suite. Two of them did.
+if n == t:
+    sys.exit(3)
+open(p, "w").write(n)
+' "$target" "$from" "$to"; then
+    echo "  [SKIP]     $name  (pattern matched line by line but not as a block -- fix this script)"
+    return 1
+  fi
   if PYTHONPATH="$WORK/planner" python3 -m pytest -x -q "$WORK/planner/test/test_spacetime.py" \
        >"$WORK/py.log" 2>&1; then
     echo "  [SURVIVED] $name  <-- BUG: this error would pass the test suite"
@@ -591,12 +699,23 @@ mutate_solver() {   # $1 = name, $2 = from, $3 = to
     echo "  [SKIP]     $name  (pattern not found -- code changed, update this script)"
     return 1
   fi
-  python3 -c '
+  if ! python3 -c '
 import sys
 p, a, b = sys.argv[1], sys.argv[2], sys.argv[3]
 t = open(p).read()
-open(p, "w").write(t.replace(a, b, 1))
-' "$target" "$from" "$to"
+n = t.replace(a, b, 1)
+# The REAL guard on whether the mutation applied. `grep -F` with a multi-line
+# pattern matches each LINE separately, so a pattern whose lines all exist
+# while the block does not passed the check above, this replace then did
+# nothing, and the UNMUTATED code was reported as SURVIVED -- a false alarm
+# that reads exactly like a hole in the test suite. Two of them did.
+if n == t:
+    sys.exit(3)
+open(p, "w").write(n)
+' "$target" "$from" "$to"; then
+    echo "  [SKIP]     $name  (pattern matched line by line but not as a block -- fix this script)"
+    return 1
+  fi
   if PYTHONPATH="$WORK/viz" python3 -m pytest -x -q "$WORK/viz/test/test_solver.py" \
        >"$WORK/py.log" 2>&1; then
     echo "  [SURVIVED] $name  <-- BUG: this error would pass the test suite"
@@ -705,12 +824,23 @@ mutate_sensors() {  # $1 = name, $2 = file (relative), $3 = from, $4 = to
     echo "  [SKIP]     $name  (pattern not found -- code changed, update this script)"
     return 1
   fi
-  python3 -c '
+  if ! python3 -c '
 import sys
 p, a, b = sys.argv[1], sys.argv[2], sys.argv[3]
 t = open(p).read()
-open(p, "w").write(t.replace(a, b, 1))
-' "$WORK/sens/$file" "$from" "$to"
+n = t.replace(a, b, 1)
+# The REAL guard on whether the mutation applied. `grep -F` with a multi-line
+# pattern matches each LINE separately, so a pattern whose lines all exist
+# while the block does not passed the check above, this replace then did
+# nothing, and the UNMUTATED code was reported as SURVIVED -- a false alarm
+# that reads exactly like a hole in the test suite. Two of them did.
+if n == t:
+    sys.exit(3)
+open(p, "w").write(n)
+' "$WORK/sens/$file" "$from" "$to"; then
+    echo "  [SKIP]     $name  (pattern matched line by line but not as a block -- fix this script)"
+    return 1
+  fi
   local result; result="$(build_and_run_sensors "$WORK/sens")"
   if [ "$result" = "SOME_FAIL" ]; then
     local caught; caught="$(grep '^\[  FAILED  \] [A-Za-z]' "$WORK/run.log" | sed 's/ ([0-9]* ms)$//' | sort -u | wc -l)"
@@ -956,12 +1086,23 @@ mutate_launcher() { # $1 = name, $2 = from, $3 = to
     echo "  [SKIP]     $name  (pattern not found -- code changed, update this script)"
     return 1
   fi
-  python3 -c '
+  if ! python3 -c '
 import sys
 p, a, b = sys.argv[1], sys.argv[2], sys.argv[3]
 t = open(p).read()
-open(p, "w").write(t.replace(a, b, 1))
-' "$target" "$from" "$to"
+n = t.replace(a, b, 1)
+# The REAL guard on whether the mutation applied. `grep -F` with a multi-line
+# pattern matches each LINE separately, so a pattern whose lines all exist
+# while the block does not passed the check above, this replace then did
+# nothing, and the UNMUTATED code was reported as SURVIVED -- a false alarm
+# that reads exactly like a hole in the test suite. Two of them did.
+if n == t:
+    sys.exit(3)
+open(p, "w").write(n)
+' "$target" "$from" "$to"; then
+    echo "  [SKIP]     $name  (pattern matched line by line but not as a block -- fix this script)"
+    return 1
+  fi
   if PYTHONPATH="$WORK/viz" python3 -m pytest -x -q "$WORK/viz/test/test_launcher.py" \
        >"$WORK/py.log" 2>&1; then
     echo "  [SURVIVED] $name  <-- BUG: this error would pass the test suite"
