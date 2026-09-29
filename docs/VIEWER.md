@@ -46,9 +46,10 @@ From any tailnet device:
 http://your-sim-host.your-tailnet.ts.net:8080
 ```
 
-or by IP, `http://100.64.0.1:8080`. MagicDNS is enabled on this tailnet, so
-the hostname works from the Macs (`your-macbook`, `your-laptop`) without
-remembering the address.
+or by IP, `http://100.64.0.1:8080`. Both are placeholders: `scripts/run_sim.sh`
+prints the real URL when it starts, and `tailscale ip -4` gives you the address
+on its own. With MagicDNS enabled the hostname works from any device on the
+tailnet without remembering the address at all.
 
 The page derives its WebSocket endpoint from whatever URL you loaded, so the
 hostname, the IP and a proxied name all work with no config.

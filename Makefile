@@ -2,12 +2,19 @@
 COMPOSE := docker compose -f docker/compose.yaml
 export UID := $(shell id -u)
 export GID := $(shell id -g)
+# Machine-specific settings -- the host your planner worktree lives on, and
+# anything else that is true of YOUR setup and nobody else's. Untracked and
+# gitignored; copy .env.local.example to .env.local and fill it in. The leading
+# dash means "carry on if it is not there", so a fresh clone still builds and
+# tests; only `make planner-sync` needs it.
+-include .env.local
+
 # The space-time planner's working copy, mounted at /ws/planner_src. This is
-# a SYNC of the MacBook's ~/code/bezier-trajectory-merge worktree (rsync, see
-# `make planner-sync`), not a git checkout: the worktree's .git is a pointer
-# into the MacBook's main repo and means nothing here.
+# a SYNC of a worktree on another machine (rsync, see `make planner-sync`), not
+# a git checkout: the worktree's .git is a pointer into that machine's main
+# repo and means nothing here.
 export PLANNER_REPO ?= $(HOME)/code/bezier-trajectory-merge-sync
-PLANNER_HOST ?= you@your-macbook.your-tailnet.ts.net
+PLANNER_HOST ?=
 PLANNER_PATH ?= code/bezier-trajectory-merge
 
 .PHONY: help setup build up down shell sim viz stop status test test-overlay \
@@ -105,6 +112,14 @@ plan:
 # extension against the container's Python and checks the import; `solve`
 # runs it on a scenario and writes plans/<scenario>_N<N>_seg<NSEG>.json.
 planner-sync:
+# Refuse with instructions rather than run rsync against an empty host, which
+# fails as `rsync: :code/...: No such file or directory` and says nothing about
+# the actual cause.
+	@test -n "$(PLANNER_HOST)" || { \
+	  echo "PLANNER_HOST is not set."; \
+	  echo "  cp .env.local.example .env.local   and put your planner host in it,"; \
+	  echo "  or:  make planner-sync PLANNER_HOST=user@host"; \
+	  exit 1; }
 	rsync -az --delete --stats \
 	  --exclude .git --exclude .venv --exclude .claude --exclude .cursor --exclude .specstory \
 	  --exclude rust_optimizer/target --exclude __pycache__ --exclude .pytest_cache \
